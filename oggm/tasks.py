@@ -33,8 +33,11 @@ from oggm.core.flowline import run_random_climate
 from oggm.core.flowline import run_from_climate_data
 from oggm.core.flowline import run_constant_climate
 from oggm.utils import copy_to_basedir
+from oggm.core.flowline import run_from_gcm_eqm
+from oggm.core.climate import process_gcm_data
 
 # Global tasks
+from oggm.core.climate import process_histalp_nonparallel
 from oggm.core.climate import compute_ref_t_stars
 from oggm.core.climate import distribute_t_stars
 from oggm.core.climate import crossval_t_stars

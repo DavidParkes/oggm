@@ -21,6 +21,62 @@ from oggm import entity_task, global_task
 # Module logger
 log = logging.getLogger(__name__)
 
+@global_task
+def process_histalp_nonparallel(gdirs, fpath=None):
+    """This is the way OGGM used to do it (deprecated).
+
+    It requires an input file with a specific format, and uses lazy
+    optimisation (computing time dependant gradients can be slow)
+    """
+
+    # Did the user specify a specific climate data file?
+    if fpath is None:
+        if 'climate_file' in cfg.PATHS:
+            fpath = cfg.PATHS['climate_file']
+
+    if not os.path.exists(fpath):
+        raise IOError('Custom climate file not found')
+
+    log.info('process_histalp_nonparallel')
+
+    # read the file and data entirely (faster than many I/O)
+    with netCDF4.Dataset(fpath, mode='r') as nc:
+        lon = nc.variables['lon'][:]
+        lat = nc.variables['lat'][:]
+
+        # Time
+        time = nc.variables['time']
+        time = netCDF4.num2date(time[:], time.units)
+        ny, r = divmod(len(time), 12)
+        if r != 0:
+            raise ValueError('Climate data should be N full years exclusively')
+        y0, y1 = time[0].year, time[-1].year
+
+        # Units
+        assert nc.variables['hgt'].units == 'm'
+        assert nc.variables['temp'].units == 'degC'
+        assert nc.variables['prcp'].units == 'kg m-2'
+
+    # Gradient defaults
+    use_grad = cfg.PARAMS['temp_use_local_gradient']
+    def_grad = cfg.PARAMS['temp_default_gradient']
+    g_minmax = cfg.PARAMS['temp_local_gradient_bounds']
+
+    for gdir in gdirs:
+        ilon = np.argmin(np.abs(lon - gdir.cenlon))
+        ilat = np.argmin(np.abs(lat - gdir.cenlat))
+        ref_pix_lon = lon[ilon]
+        ref_pix_lat = lat[ilat]
+        iprcp, itemp, igrad, ihgt = utils.joblib_read_climate(fpath, ilon,
+                                                              ilat, def_grad,
+                                                              g_minmax,
+                                                              use_grad)
+        gdir.write_monthly_climate_file(time, iprcp, itemp, igrad, ihgt,
+                                        ref_pix_lon, ref_pix_lat)
+        # metadata
+        out = {'climate_source': fpath,
+               'hydro_yr_0': y0+1, 'hydro_yr_1': y1}
+        gdir.write_pickle(out, 'climate_info')
 
 @entity_task(log, writes=['climate_monthly'])
 def process_custom_climate_data(gdir):
@@ -1297,3 +1353,142 @@ def quick_crossval_t_stars(gdirs):
     # write
     file = os.path.join(cfg.PATHS['working_dir'], 'crossval_tstars.csv')
     full_ref_df.to_csv(file)
+
+@entity_task(log, writes=['cesm_data'])
+def process_gcm_data(gdir, filesuffix='', fpath_temp=None, fpath_precp=None, scalendar='360_day'):
+    """Processes and writes the climate data for this glacier.
+
+    This function is made for interpolating GCM climate simulations,
+    to the high-resolution CL2 climatologies
+    (provided with OGGM) and writes everything to a NetCDF file.
+
+    Parameters
+    ----------
+    filesuffix : str
+        append a suffix to the filename (useful for ensemble experiments).
+    fpath_temp : str
+        path to the temp file (default: cfg.PATHS['gcm_temp_file'])
+    fpath_precp : str
+        path to the precp file (default: cfg.PATHS['gcm_precp_file'])
+
+    """
+
+    # GCM temperature and precipitation data
+    if fpath_temp is None:
+        if not ('gcm_temp_file' in cfg.PATHS):
+            raise ValueError("Need to set cfg.PATHS['gcm_temp_file']")
+        fpath_temp = cfg.PATHS['gcm_temp_file']
+    if fpath_precp is None:
+        if not ('gcm_precp_file' in cfg.PATHS):
+            raise ValueError("Need to set cfg.PATHS['gcm_precp_file']")
+        fpath_precp = cfg.PATHS['gcm_precp_file']
+
+
+    # read the files
+    with warnings.catch_warnings():
+        # Long time series are currently a pain pandas
+        warnings.filterwarnings("ignore", message='Unable to decode time axis')
+        tempds = xr.open_dataset(fpath_temp)
+    precpds = xr.open_dataset(fpath_precp, decode_times=False)
+
+
+    # select for location
+    lon = gdir.cenlon
+    lat = gdir.cenlat
+
+    # CESM files are in 0-360
+    if lon <= 0:
+        lon += 360
+
+    # take the closest
+    # TODO: consider GCM interpolation?
+    temp = tempds.TREFHT.sel(lat=lat, lon=lon, method='nearest')
+    precp = precpds.PREC.sel(lat=lat, lon=lon, method='nearest')
+
+    # from normal years to hydrological years
+    sm = cfg.PARAMS['hydro_month_' + gdir.hemisphere]
+    em = sm - 1 if (sm > 1) else 12
+    # TODO: we don't check if the files actually start in January but we should
+    precp = precp[sm-1:sm-13].load()
+    temp = temp[sm-1:sm-13].load()
+    y0 = int(temp.time.values[0].strftime('%Y'))
+    y1 = int(temp.time.values[-1].strftime('%Y'))
+    time = pd.period_range('{}-{:02d}'.format(y0, sm),
+                           '{}-{:02d}'.format(y1, em), freq='M')
+    temp['time'] = time
+    precp['time'] = time
+    # Workaround for https://github.com/pydata/xarray/issues/1565
+    temp['month'] = ('time', time.month)
+    precp['month'] = ('time', time.month)
+    temp['year'] = ('time', time.year)
+    precp['year'] = ('time', time.year)
+    ny, r = divmod(len(time), 12)
+    assert r == 0
+
+    # Convert m s-1 to mm mth-1
+    ndays = np.tile(np.roll(cfg.DAYS_IN_MONTH, 13-sm), y1 - y0)
+    precp = precp * ndays * (60 * 60 * 24 * 1000)
+
+    # compute monthly anomalies
+    # of temp
+    ts_tmp_avg = temp.sel(time=(temp.year >= 1961) & (temp.year <= 1990))
+    ts_tmp_avg = ts_tmp_avg.groupby(ts_tmp_avg.month).mean(dim='time')
+    ts_tmp = temp.groupby(temp.month) - ts_tmp_avg
+    # of precip -- scaled anomalies
+    ts_pre_avg = precp.isel(time=(precp.year >= 1961) & (precp.year <= 1990))
+    ts_pre_avg = ts_pre_avg.groupby(ts_pre_avg.month).mean(dim='time')
+    ts_pre_ano = precp.groupby(precp.month) - ts_pre_avg
+    # scaled anomalies is the default. Standard anomalies above
+    # are used later for where ts_pre_avg == 0
+    ts_pre = precp.groupby(precp.month) / ts_pre_avg
+
+    # Get CRU to apply the anomaly to
+    fpath = gdir.get_filepath('climate_monthly')
+    ds_cru = xr.open_dataset(fpath)
+
+    # Here we assume the gradient is a monthly average
+    ts_grad = np.tile(ds_cru.grad[0:12], ny)
+
+    # Add climate anomaly to CRU clim
+    dscru = ds_cru.sel(time=slice('1961', '1990'))
+    # for temp
+    loc_tmp = dscru.temp.groupby('time.month').mean()
+    ts_tmp = ts_tmp.groupby(ts_tmp.month) + loc_tmp
+    # for prcp
+    loc_pre = dscru.prcp.groupby('time.month').mean()
+    # scaled anomalies
+    ts_pre = ts_pre.groupby(ts_pre.month) * loc_pre
+    # standard anomalies
+    ts_pre_ano = ts_pre_ano.groupby(ts_pre_ano.month) + loc_pre
+    # Correct infinite values with standard anomalies
+    ts_pre.values = np.where(np.isfinite(ts_pre.values),
+                             ts_pre.values,
+                             ts_pre_ano.values)
+    # The last step might create negative values (unlikely). Clip them
+    ts_pre.values = ts_pre.values.clip(0)
+
+    # load dates in right format to save
+    dsindex = salem.GeoNetcdf(fpath_temp, monthbegin=True)
+    time1 = dsindex.variables['time']
+    time2 = time1[sm-1:sm-13] - ndays  # to hydrological years
+    time2 = netCDF4.num2date(time2, time1.units, calendar=scalendar)
+
+    assert np.all(np.isfinite(ts_pre.values))
+    assert np.all(np.isfinite(ts_tmp.values))
+    assert np.all(np.isfinite(ts_grad))
+
+    # back to -180 - 180
+    loc_lon = precp.lon if precp.lon <= 180 else precp.lon - 360
+
+    print('time1.units', time1.units)
+    gdir.write_monthly_climate_file(time2, ts_pre.values, ts_tmp.values,
+                                    ts_grad, float(dscru.ref_hgt),
+                                    loc_lon, precp.lat.values,
+                                    time_unit=time1.units,
+                                    file_name='cesm_data',
+                                    filesuffix=filesuffix)
+
+    dsindex._nc.close()
+    tempds.close()
+    precpds.close()
+    ds_cru.close()

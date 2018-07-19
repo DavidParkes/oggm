@@ -1766,3 +1766,81 @@ def run_from_climate_data(gdir, ys=None, ye=None,
                             init_model_fls=init_model_fls,
                             zero_initial_glacier=zero_initial_glacier,
                             **kwargs)
+
+@entity_task(log)
+def run_from_gcm_eqm(gdir, filename='cesm_data', 
+                    input_filesuffix='', filesuffix='', **kwargs):
+    """Random glacier dynamics for benchmarking purposes.
+    This runs the random mass-balance model for a certain number of years.
+
+    Parameters
+    ----------
+    nyears : length of the simulation
+    y0 : central year of the random climate period
+    filesuffix : for the output file
+    kwargs : kwargs to pass to the FluxBasedModel instance
+    """
+
+    if cfg.PARAMS['use_optimized_inversion_params']:
+        d = gdir.read_pickle('inversion_params')
+        fs = d['fs']
+        glen_a = d['glen_a']
+    else:
+        fs = cfg.PARAMS['flowline_fs']
+        glen_a = cfg.PARAMS['flowline_glen_a']
+
+    kwargs.setdefault('fs', fs)
+    kwargs.setdefault('glen_a', glen_a)
+
+    ys = cfg.PARAMS['ys']
+    years_init = np.arange(301) + ys
+    #volume_init = np.array([])
+    #area_init = ([])
+    #length_init = np.array([])
+    #ela_init = ([])
+    loops = np.arange(10)
+
+    mb = mbmods.RandomMassBalance(gdir, filename=filename,
+                                  input_filesuffix=input_filesuffix)
+
+    steps = ['default', 'conservative', 'ultra-conservative']
+    for step in steps:
+        log.info('(%s) trying %s time stepping scheme.', gdir.rgi_id, step)
+        fls = gdir.read_pickle('model_flowlines')
+        for lo in loops:
+            model = FluxBasedModel(fls, mb_model=mb, y0=ys,
+                                   time_stepping=step,
+                                   is_tidewater=gdir.is_tidewater,
+                                   **kwargs)
+            for y in years_init:
+                ye = y
+                try:
+                    model.run_until(y)
+                    #model.run_until_equilibrium()
+                except (RuntimeError, FloatingPointError):
+                    if step == 'ultra-conservative':
+                        raise
+                    continue
+                #volume_init = np.append(volume_init, model.volume_km3)
+                #area_init = np.append(area_init, model.area_km2)
+                #length_init = np.append(length_init, model.length_m)
+                #ela_init = np.append(ela_init, model.ela_m)
+            fls = model.fls
+
+        # If we get here we good
+        log.info('(%s) %s time stepping was successful!', gdir.rgi_id, step)
+        break
+
+    ye = cfg.PARAMS['ye']
+
+    mb = mbmods.PastMassBalance(gdir, filename=filename,
+                                input_filesuffix=input_filesuffix)
+
+    #tmp_mod = FileModel(
+    #    gdir.get_filepath('model_run', filesuffix=filesuffix))
+    #tmp_mod.run_until(ys+400)
+    #model_fls = tmp_mod.fls
+    filesuffix = filesuffix + '_eqm'
+
+    return _run_with_numerical_tests(gdir, filesuffix, mb, ys, ye, kwargs,
+                                     init_model_fls=fls)
