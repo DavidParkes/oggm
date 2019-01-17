@@ -50,26 +50,37 @@ this downscaling to add any new information than already available at the
 original resolution, but this allows us to have an elevation-dependent dataset
 based on a presumably better climatology. The monthly anomalies are computed
 following [Harris_etal_2010]_ : we use standard anomalies for temperature and
-scaled (fractional) anomalies for precipitation. At the locations where the
-monthly precipitation climatology is 0 we fall back to the standard anomalies.
+scaled (fractional) anomalies for precipitation.
 
 .. _CRU faq: https://crudata.uea.ac.uk/~timm/grid/faq.html
 
+HISTALP
+~~~~~~~
 
-User-provided dataset
-~~~~~~~~~~~~~~~~~~~~~
+If required by the user, OGGM can also automatically
+download and use the data from the `HISTALP`_ dataset.
 
-You can provide any other dataset to OGGM by setting the ``climate_file``
-parameter in ``params.cfg``. See the HISTALP data file in the `sample-data`_
-folder for an example.
+.. _HISTALP: http://www.zamg.ac.at/histalp/
 
-.. _sample-data: https://github.com/OGGM/oggm-sample-data/tree/master/test-workflow
-
+The data is available at 5' resolution (about 0.0833°) from 1801 to 2014.
+However, the data is considered spurious before 1850. Therefore, we
+recommend to use data from 1850 onwards. This can be done by setting
+``cfg.PARAMS['baseline_y0'] = 1850``.
 
 .. ipython:: python
 
     @savefig plot_temp_ts.png width=100%
     example_plot_temp_ts()  # the code for these examples is posted below
+
+
+
+User-provided dataset
+~~~~~~~~~~~~~~~~~~~~~
+
+You can provide any other dataset to OGGM. See the `HISTALP_oetztal.nc` data
+file in the OGGM `sample-data`_ folder for an example format.
+
+.. _sample-data: https://github.com/OGGM/oggm-sample-data/tree/master/test-workflow
 
 
 GCM data
@@ -84,25 +95,20 @@ period (currently: 1961-1990). This method is often called the
 Currently we can process data from the
 `CESM Last Millenium Ensemble <http://www.cesm.ucar.edu/projects/community-projects/LME/>`_
 project (see :py:func:`tasks.process_cesm_data`) only, but adding other models
-should be relatively easy.
+will be available `soon <https://github.com/OGGM/oggm/issues/469>`_.
 
 
 Elevation dependency
 ~~~~~~~~~~~~~~~~~~~~
 
-OGGM finally needs to compute the temperature and precipitation at the altitude
+OGGM needs to compute the temperature and precipitation at the altitude
 of the glacier grid points. The default is to use a fixed gradient of
 -6.5K km :math:`^{-1}` and no gradient for precipitation. However, OGGM
-implements a module which computes the local gradient by linear
+also implements an optional algorithm which computes the local gradient by linear
 regression of the 9 surrounding grid points. This method requires that the
 near-surface temperature lapse-rates provided by the climate dataset are good
-(in most of the cases you should probably use a fixed gradient).
-The default config parameters are:
-
-.. ipython:: python
-
-    cfg.PARAMS['temp_use_local_gradient']  # use the regression method?
-    cfg.PARAMS['temp_default_gradient']  # constant gradiant
+(i.e.: in most of the cases, you should probably use the simple fixed gradient
+instead).
 
 
 Temperature index model
@@ -181,12 +187,14 @@ with the expected mass-balance and compute the model bias:
     example_plot_bias_ts()  # the code for these examples is posted below
 
 The bias is positive when :math:`\mu` is too low, and negative when :math:`\mu`
-is too high. The vertical dashed lines mark the times where the bias is
-closest to zero. They all correspond to approximately the same :math:`\mu` (but
-not exactly, as precipitation and temperature both influence :math:`\mu`).
+is too high. Here, the bias crosses the zero line twice. All dates
+correspond to approximately the same :math:`\mu` (but not exactly,
+as precipitation and temperature both have an influence on it).
 These dates at which the :math:`\mu` candidates
-are close to the real :math:`\mu` are called :math:`t^*` (the associated sensitivities
-:math:`\mu (t^*)` are called :math:`\mu^*`).
+are close to the real :math:`\mu` are called :math:`t^*`
+(the associated sensitivities :math:`\mu (t^*)` are called :math:`\mu^*`).
+For the next step, one :math:`t^*` is sufficient: we pick the one which
+corresponds to the smallest absolute bias.
 
 At the glaciers where observations are available, this detour via the :math:`\mu`
 candidates is not necessary to find the correct :math:`\mu^*`. Indeed, the goal
@@ -196,7 +204,7 @@ value to be interpolated to glaciers where no observations are available**.
 The benefit of this approach is best shown with the results of a cross-validation
 study realized by `Marzeion et al., (2012)`_ (and confirmed by OGGM):
 
-.. figure:: _static/mb_crossval.png
+.. figure:: _static/mb_crossval_panel.png
     :width: 100%
 
     Benefit of spatially interpolating :math:`t^{*}` instead of :math:`\mu ^{*}` as shown
@@ -264,7 +272,7 @@ Here are some more details:
   OGGM compute the mass-balance for you is to use the
   :py:class:`core.massbalance.PastMassBalance`.
 - the interpolation of :math:`t^*` is done with an inverse distance weighting
-  algorithm (see :py:func:`tasks.distribute_t_stars`)
+  algorithm (see :py:func:`tasks.local_t_star`)
 - if more than one :math:`t^*` is found for some reference glaciers, than the
   glaciers with only one :math:`t^*` will determine the most likely :math:`t^*`
   for the other glaciers (see :py:func:`tasks.compute_ref_t_stars`)
@@ -272,10 +280,6 @@ Here are some more details:
   an influence on the results, but it is small since any change will automatically
   be compensated by :math:`\mu^*`. We are currently quantifying these effects
   more precisely.
-- the cross-validation procedure is done systematically
-  (:py:func:`tasks.crossval_t_stars`). Currently, this cross-validation is done
-  with fixed geometry (it will be extended to a full validation
-  with the dynamical model at a later stage).
 
 Code used to generate these examples:
 

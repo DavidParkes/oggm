@@ -1,10 +1,5 @@
-from os import path
 import warnings
-
-import oggm
-import oggm.utils
-
-warnings.filterwarnings("once", category=DeprecationWarning)
+warnings.filterwarnings("once", category=DeprecationWarning)  # noqa: E402
 
 import unittest
 import os
@@ -21,29 +16,27 @@ import xarray as xr
 import rasterio
 
 # Local imports
-from oggm.core import (gis, inversion, climate, centerlines, flowline,
-                       massbalance)
+import oggm
+from oggm.core import (gis, inversion, gcm_climate, climate, centerlines,
+                       flowline, massbalance)
 import oggm.cfg as cfg
 from oggm import utils
+from oggm.exceptions import MassBalanceCalibrationError
 from oggm.utils import get_demo_file, tuple2int
-from oggm.tests import is_slow, RUN_PREPRO_TESTS
 from oggm.tests.funcs import get_test_dir, patch_url_retrieve_github
 from oggm import workflow
 
-# do we event want to run the tests?
-if not RUN_PREPRO_TESTS:
-    raise unittest.SkipTest('Skipping all prepro tests.')
-
+pytestmark = pytest.mark.test_env("prepro")
 _url_retrieve = None
 
 
 def setup_module(module):
-    module._url_retrieve = utils._urlretrieve
-    utils._urlretrieve = patch_url_retrieve_github
+    module._url_retrieve = utils.oggm_urlretrieve
+    oggm.utils._downloads.oggm_urlretrieve = patch_url_retrieve_github
 
 
 def teardown_module(module):
-    utils._urlretrieve = module._url_retrieve
+    oggm.utils._downloads.oggm_urlretrieve = module._url_retrieve
 
 
 def read_svgcoords(svg_file):
@@ -52,13 +45,14 @@ def read_svgcoords(svg_file):
     from xml.dom import minidom
     doc = minidom.parse(svg_file)
     coords = [path.getAttribute('d') for path
-                    in doc.getElementsByTagName('path')]
+              in doc.getElementsByTagName('path')]
     doc.unlink()
     _, _, coords = coords[0].partition('C')
     x = []
     y = []
     for c in coords.split(' '):
-        if c == '': continue
+        if c == '':
+            continue
         c = c.split(',')
         x.append(np.float(c[0]))
         y.append(np.float(c[1]))
@@ -102,10 +96,10 @@ class TestGIS(unittest.TestCase):
         gis.define_glacier_region(gdir, entity=entity)
         extent = gdir.extent_ll
 
-        tdf = gpd.read_file(gdir.get_filepath('outlines'))
+        tdf = gdir.read_shapefile('outlines')
         myarea = tdf.geometry.area * 10**-6
         np.testing.assert_allclose(myarea, np.float(tdf['Area']), rtol=1e-2)
-        self.assertTrue(os.path.exists(gdir.get_filepath('intersects')))
+        self.assertTrue(gdir.has_file('intersects'))
 
         # From string
         gdir = oggm.GlacierDirectory(gdir.rgi_id, base_dir=self.testdir)
@@ -204,7 +198,7 @@ class TestGIS(unittest.TestCase):
         gis.define_glacier_region(gdir, entity=entity)
 
         # this should simply run
-        mygdir = oggm.GlacierDirectory(entity.RGIId, base_dir=self.testdir)
+        oggm.GlacierDirectory(entity.RGIId, base_dir=self.testdir)
 
     def test_glacier_masks(self):
 
@@ -259,7 +253,7 @@ class TestGIS(unittest.TestCase):
                                        np.max(dem[ext.astype(bool)]),
                                        atol=10)
 
-        df = utils.glacier_characteristics([gdir], path=False)
+        df = utils.compile_glacier_statistics([gdir], path=False)
         np.testing.assert_allclose(df['dem_max_elev_on_ext'],
                                    df['dem_max_elev'],
                                    atol=10)
@@ -328,7 +322,7 @@ class TestGIS(unittest.TestCase):
         entity = gpd.read_file(hef_file).iloc[0]
         gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
         gis.define_glacier_region(gdir, entity=entity)
-        self.assertTrue(os.path.exists(gdir.get_filepath('intersects')))
+        self.assertTrue(gdir.has_file('intersects'))
 
 
 class TestCenterlines(unittest.TestCase):
@@ -371,11 +365,12 @@ class TestCenterlines(unittest.TestCase):
 
         _heads, _ = centerlines._filter_heads(heads, heads_height, radius,
                                               polygon)
-        _headsi, _ = centerlines._filter_heads(heads[::-1], heads_height[
-                                                            ::-1], radius, polygon)
+        _headsi, _ = centerlines._filter_heads(heads[::-1],
+                                               heads_height[::-1],
+                                               radius, polygon)
 
         self.assertEqual(_heads, _headsi[::-1])
-        self.assertEqual(_heads, [heads[h] for h in [2,5,6,7]])
+        self.assertEqual(_heads, [heads[h] for h in [2, 5, 6, 7]])
 
     def test_mask_to_polygon(self):
         from oggm.core.centerlines import _mask_to_polygon
@@ -434,6 +429,8 @@ class TestCenterlines(unittest.TestCase):
 
         self.assertEqual(len(cls), 3)
 
+        self.assertEqual(set(cls), set(centerlines.line_inflows(cls[-1])))
+
     def test_downstream(self):
 
         hef_file = get_demo_file('Hintereisferner_RGI5.shp')
@@ -485,11 +482,11 @@ class TestCenterlines(unittest.TestCase):
             i0 = int(i0)
             cur = c.line.coords[i0]
             n1, n2 = c.normals[i0]
-            l = shpg.LineString([shpg.Point(cur + wi / 2. * n1),
-                                 shpg.Point(cur + wi / 2. * n2)])
+            line = shpg.LineString([shpg.Point(cur + wi / 2. * n1),
+                                    shpg.Point(cur + wi / 2. * n2)])
             from oggm.core.centerlines import line_interpol
             from scipy.interpolate import RegularGridInterpolator
-            points = line_interpol(l, 0.5)
+            points = line_interpol(line, 0.5)
             with utils.ncDataset(gdir.get_filepath('gridded_data')) as nc:
                 topo = nc.variables['topo_smoothed'][:]
                 x = nc.variables['x'][:]
@@ -508,7 +505,7 @@ class TestCenterlines(unittest.TestCase):
 
         cfg.PARAMS['border'] = default_b
 
-    @is_slow
+    @pytest.mark.slow
     def test_baltoro_centerlines(self):
 
         cfg.PARAMS['border'] = 2
@@ -541,10 +538,21 @@ class TestCenterlines(unittest.TestCase):
 
         my_mask = np.zeros((gdir.grid.ny, gdir.grid.nx), dtype=np.uint8)
         cls = gdir.read_pickle('centerlines')
+
+        sub = centerlines.line_inflows(cls[-1])
+        self.assertEqual(set(cls), set(sub))
+        assert sub[-1] is cls[-1]
+
+        sub = centerlines.line_inflows(cls[-2])
+        assert set(sub).issubset(set(cls))
+        np.testing.assert_equal(np.unique(sorted([cl.order for cl in sub])),
+                                np.arange(cls[-2].order+1))
+        assert sub[-1] is cls[-2]
+
+        # Mask
         for cl in cls:
             x, y = tuple2int(cl.line.xy)
             my_mask[y, x] = 1
-
         # Transform
         kien_mask = np.zeros((gdir.grid.ny, gdir.grid.nx), dtype=np.uint8)
         from shapely.ops import transform
@@ -566,8 +574,9 @@ class TestCenterlines(unittest.TestCase):
             kgm = transform(proj, kgm)
 
             # Rounded nearest pix
-            project = lambda x, y: (np.rint(x).astype(np.int64),
-                            np.rint(y).astype(np.int64))
+            def project(x, y):
+                return (np.rint(x).astype(np.int64),
+                        np.rint(y).astype(np.int64))
 
             kgm = transform(project, kgm)
 
@@ -626,7 +635,7 @@ class TestGeometry(unittest.TestCase):
         centerlines.compute_centerlines(gdir)
         centerlines.catchment_area(gdir)
 
-        cis = gdir.read_pickle('catchment_indices')
+        cis = gdir.read_pickle('geometries')['catchment_indices']
 
         # The catchment area must be as big as expected
         with utils.ncDataset(gdir.get_filepath('gridded_data')) as nc:
@@ -670,7 +679,7 @@ class TestGeometry(unittest.TestCase):
         d = gdir.get_diagnostics()
         assert d['perc_invalid_flowline'] > 0.1
 
-        df = utils.glacier_characteristics([gdir], path=False)
+        df = utils.compile_glacier_statistics([gdir], path=False)
         assert np.all(df['dem_source'] == 'USER')
         assert np.all(df['perc_invalid_flowline'] > 0.1)
         assert np.all(df['dem_perc_area_above_max_elev_on_ext'] < 0.1)
@@ -721,7 +730,7 @@ class TestGeometry(unittest.TestCase):
             topo = nc.variables['topo_smoothed'][:]
         rhgt = topo[np.where(mask)][:]
 
-        tdf = gpd.read_file(gdir.get_filepath('outlines'))
+        tdf = gdir.read_shapefile('outlines')
         np.testing.assert_allclose(area, otherarea, rtol=0.1)
         area *= (gdir.grid.dx) ** 2
         otherarea *= (gdir.grid.dx) ** 2
@@ -788,6 +797,7 @@ class TestClimate(unittest.TestCase):
         cfg.PATHS['climate_file'] = get_demo_file('histalp_merged_hef.nc')
         cfg.PARAMS['border'] = 10
         cfg.PARAMS['run_mb_calibration'] = True
+        cfg.PARAMS['baseline_climate'] = ''
 
     def tearDown(self):
         self.rm_dir()
@@ -812,15 +822,16 @@ class TestClimate(unittest.TestCase):
         climate.process_custom_climate_data(gdir)
 
         ci = gdir.read_pickle('climate_info')
-        self.assertEqual(ci['hydro_yr_0'], 1802)
-        self.assertEqual(ci['hydro_yr_1'], 2003)
+        self.assertEqual(ci['baseline_hydro_yr_0'], 1802)
+        self.assertEqual(ci['baseline_hydro_yr_1'], 2003)
 
         with utils.ncDataset(get_demo_file('histalp_merged_hef.nc')) as nc_r:
             ref_h = nc_r.variables['hgt'][1, 1]
             ref_p = nc_r.variables['prcp'][:, 1, 1]
             ref_t = nc_r.variables['temp'][:, 1, 1]
 
-        with utils.ncDataset(os.path.join(gdir.dir, 'climate_monthly.nc')) as nc_r:
+        f = os.path.join(gdir.dir, 'climate_monthly.nc')
+        with utils.ncDataset(f) as nc_r:
             self.assertTrue(ref_h == nc_r.ref_hgt)
             np.testing.assert_allclose(ref_t, nc_r.variables['temp'][:])
             np.testing.assert_allclose(ref_p, nc_r.variables['prcp'][:])
@@ -836,13 +847,15 @@ class TestClimate(unittest.TestCase):
         climate.process_custom_climate_data(gdir)
 
         ci = gdir.read_pickle('climate_info')
-        self.assertEqual(ci['hydro_yr_0'], 1802)
-        self.assertEqual(ci['hydro_yr_1'], 2003)
+        self.assertEqual(ci['baseline_hydro_yr_0'], 1802)
+        self.assertEqual(ci['baseline_hydro_yr_1'], 2003)
 
-        with utils.ncDataset(gdir.get_filepath('climate_monthly')) as nc_r:
-            grad = nc_r.variables['grad'][:]
-            assert np.std(grad) > 0.0001
-
+        with xr.open_dataset(gdir.get_filepath('climate_monthly')) as ds:
+            grad = ds['gradient'].data
+            try:
+                assert np.std(grad) > 0.0001
+            except TypeError:
+                pass
         cfg.PARAMS['temp_use_local_gradient'] = False
 
     def test_distribute_climate_parallel(self):
@@ -855,15 +868,16 @@ class TestClimate(unittest.TestCase):
         climate.process_custom_climate_data(gdir)
 
         ci = gdir.read_pickle('climate_info')
-        self.assertEqual(ci['hydro_yr_0'], 1802)
-        self.assertEqual(ci['hydro_yr_1'], 2003)
+        self.assertEqual(ci['baseline_hydro_yr_0'], 1802)
+        self.assertEqual(ci['baseline_hydro_yr_1'], 2003)
 
         with utils.ncDataset(get_demo_file('histalp_merged_hef.nc')) as nc_r:
             ref_h = nc_r.variables['hgt'][1, 1]
             ref_p = nc_r.variables['prcp'][:, 1, 1]
             ref_t = nc_r.variables['temp'][:, 1, 1]
 
-        with utils.ncDataset(os.path.join(gdir.dir, 'climate_monthly.nc')) as nc_r:
+        f = os.path.join(gdir.dir, 'climate_monthly.nc')
+        with utils.ncDataset(f) as nc_r:
             self.assertTrue(ref_h == nc_r.ref_hgt)
             np.testing.assert_allclose(ref_t, nc_r.variables['temp'][:])
             np.testing.assert_allclose(ref_p, nc_r.variables['prcp'][:])
@@ -887,26 +901,124 @@ class TestClimate(unittest.TestCase):
         cru_dir = os.path.dirname(cru_dir)
         cfg.PATHS['climate_file'] = ''
         cfg.PATHS['cru_dir'] = cru_dir
+        cfg.PARAMS['baseline_climate'] = 'CRU'
         climate.process_cru_data(gdirs[1])
         cfg.PATHS['cru_dir'] = ''
         cfg.PATHS['climate_file'] = get_demo_file('histalp_merged_hef.nc')
 
         ci = gdir.read_pickle('climate_info')
-        self.assertEqual(ci['hydro_yr_0'], 1902)
-        self.assertEqual(ci['hydro_yr_1'], 2014)
+        self.assertEqual(ci['baseline_hydro_yr_0'], 1902)
+        self.assertEqual(ci['baseline_hydro_yr_1'], 2014)
 
         gdh = gdirs[0]
         gdc = gdirs[1]
-        with xr.open_dataset(os.path.join(gdh.dir, 'climate_monthly.nc')) as nc_h:
-            with xr.open_dataset(os.path.join(gdc.dir, 'climate_monthly.nc')) as nc_c:
+        f1 = os.path.join(gdh.dir, 'climate_monthly.nc')
+        f2 = os.path.join(gdc.dir, 'climate_monthly.nc')
+        with xr.open_dataset(f1) as nc_h:
+            with xr.open_dataset(f2) as nc_c:
                 # put on the same altitude
                 # (using default gradient because better)
-                temp_cor = nc_c.temp -0.0065 * (nc_h.ref_hgt - nc_c.ref_hgt)
+                temp_cor = nc_c.temp - 0.0065 * (nc_h.ref_hgt - nc_c.ref_hgt)
                 totest = temp_cor - nc_h.temp
                 self.assertTrue(totest.mean() < 0.5)
                 # precip
                 totest = nc_c.prcp - nc_h.prcp
                 self.assertTrue(totest.mean() < 100)
+
+    def test_distribute_climate_dummy(self):
+
+        hef_file = get_demo_file('Hintereisferner_RGI5.shp')
+        entity = gpd.read_file(hef_file).iloc[0]
+
+        gdirs = []
+
+        gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
+        gis.define_glacier_region(gdir, entity=entity)
+        gdirs.append(gdir)
+        gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir_cru)
+        gis.define_glacier_region(gdir, entity=entity)
+        gdirs.append(gdir)
+
+        climate.process_dummy_cru_file(gdirs[0], seed=0)
+        cru_dir = get_demo_file('cru_ts3.23.1901.2014.tmp.dat.nc')
+        cru_dir = os.path.dirname(cru_dir)
+        cfg.PATHS['climate_file'] = ''
+        cfg.PATHS['cru_dir'] = cru_dir
+        cfg.PARAMS['baseline_climate'] = 'CRU'
+        climate.process_cru_data(gdirs[1])
+        cfg.PATHS['cru_dir'] = ''
+        cfg.PATHS['climate_file'] = get_demo_file('histalp_merged_hef.nc')
+
+        ci = gdir.read_pickle('climate_info')
+        self.assertEqual(ci['baseline_hydro_yr_0'], 1902)
+        self.assertEqual(ci['baseline_hydro_yr_1'], 2014)
+
+        gdh = gdirs[0]
+        gdc = gdirs[1]
+        f1 = os.path.join(gdh.dir, 'climate_monthly.nc')
+        f2 = os.path.join(gdc.dir, 'climate_monthly.nc')
+        with xr.open_dataset(f1) as nc_d:
+            with xr.open_dataset(f2) as nc_c:
+                # same altitude
+                assert nc_d.ref_hgt == nc_c.ref_hgt
+                np.testing.assert_allclose(nc_d.temp.mean(), nc_c.temp.mean(),
+                                           atol=0.2)
+                np.testing.assert_allclose(nc_d.temp.mean(), nc_c.temp.mean(),
+                                           rtol=0.1)
+
+                an1 = nc_d.temp.groupby('time.month').mean()
+                an2 = nc_c.temp.groupby('time.month').mean()
+                np.testing.assert_allclose(an1, an2, atol=1)
+
+                an1 = nc_d.prcp.groupby('time.month').mean()
+                an2 = nc_c.prcp.groupby('time.month').mean()
+                np.testing.assert_allclose(an1, an2, rtol=0.2)
+
+    def test_distribute_climate_histalp_new(self):
+
+        hef_file = get_demo_file('Hintereisferner_RGI5.shp')
+        entity = gpd.read_file(hef_file).iloc[0]
+
+        gdirs = []
+
+        gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
+        gis.define_glacier_region(gdir, entity=entity)
+        gdirs.append(gdir)
+        gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir_cru)
+        gis.define_glacier_region(gdir, entity=entity)
+        gdirs.append(gdir)
+
+        climate.process_custom_climate_data(gdirs[0])
+        cru_dir = get_demo_file('HISTALP_precipitation_all_abs_1801-2014.nc')
+        cru_dir = os.path.dirname(cru_dir)
+        cfg.PATHS['climate_file'] = ''
+        cfg.PATHS['cru_dir'] = cru_dir
+        cfg.PARAMS['baseline_climate'] = 'HISTALP'
+        cfg.PARAMS['baseline_y0'] = 1850
+        cfg.PARAMS['baseline_y1'] = 2003
+        climate.process_histalp_data(gdirs[1])
+        cfg.PATHS['cru_dir'] = ''
+        cfg.PATHS['climate_file'] = get_demo_file('histalp_merged_hef.nc')
+
+        ci = gdir.read_pickle('climate_info')
+        self.assertEqual(ci['baseline_hydro_yr_0'], 1851)
+        self.assertEqual(ci['baseline_hydro_yr_1'], 2003)
+
+        gdh = gdirs[0]
+        gdc = gdirs[1]
+        f1 = os.path.join(gdh.dir, 'climate_monthly.nc')
+        f2 = os.path.join(gdc.dir, 'climate_monthly.nc')
+        with xr.open_dataset(f1) as nc_h:
+            with xr.open_dataset(f2) as nc_c:
+                nc_hi = nc_h.isel(time=slice(49*12, 2424))
+                np.testing.assert_allclose(nc_hi['temp'], nc_c['temp'])
+                # for precip the data changed in between versions, we
+                # can't test for absolute equality
+                np.testing.assert_allclose(nc_hi['prcp'].mean(),
+                                           nc_c['prcp'].mean(),
+                                           atol=1)
+                np.testing.assert_allclose(nc_hi.ref_pix_dis,
+                                           nc_c.ref_pix_dis)
 
     def test_sh(self):
 
@@ -934,23 +1046,23 @@ class TestClimate(unittest.TestCase):
         gdir.hemisphere = 'sh'
         gis.define_glacier_region(gdir, entity=entity)
         gdirs.append(gdir)
-
         climate.process_custom_climate_data(gdirs[0])
         ci = gdirs[0].read_pickle('climate_info')
-        self.assertEqual(ci['hydro_yr_0'], 1803)
-        self.assertEqual(ci['hydro_yr_1'], 2002)
+        self.assertEqual(ci['baseline_hydro_yr_0'], 1803)
+        self.assertEqual(ci['baseline_hydro_yr_1'], 2002)
 
         cru_dir = get_demo_file('cru_ts3.23.1901.2014.tmp.dat.nc')
         cru_dir = os.path.dirname(cru_dir)
         cfg.PATHS['climate_file'] = ''
         cfg.PATHS['cru_dir'] = cru_dir
+        cfg.PARAMS['baseline_climate'] = 'CRU'
         climate.process_cru_data(gdirs[1])
         cfg.PATHS['cru_dir'] = ''
         cfg.PATHS['climate_file'] = get_demo_file('histalp_merged_hef.nc')
 
         ci = gdir.read_pickle('climate_info')
-        self.assertEqual(ci['hydro_yr_0'], 1902)
-        self.assertEqual(ci['hydro_yr_1'], 2014)
+        self.assertEqual(ci['baseline_hydro_yr_0'], 1902)
+        self.assertEqual(ci['baseline_hydro_yr_1'], 2014)
 
         gdh = gdirs[0]
         gdc = gdirs[1]
@@ -996,7 +1108,8 @@ class TestClimate(unittest.TestCase):
                              ref_t - cfg.PARAMS['temp_melt'])
 
         hgts = np.array([ref_h, ref_h, -8000, 8000])
-        time, temp, prcp = climate.mb_climate_on_height(gdir, hgts, 1.)
+        time, temp, prcp = climate.mb_climate_on_height(gdir, hgts)
+        prcp /= cfg.PARAMS['prcp_scaling_factor']
 
         ref_nt = 202*12
         self.assertTrue(len(time) == ref_nt)
@@ -1010,8 +1123,9 @@ class TestClimate(unittest.TestCase):
         np.testing.assert_allclose(temp[3, :], ref_p*0)
 
         yr = [1802, 1802]
-        time, temp, prcp = climate.mb_climate_on_height(gdir, hgts, 1.,
+        time, temp, prcp = climate.mb_climate_on_height(gdir, hgts,
                                                         year_range=yr)
+        prcp /= cfg.PARAMS['prcp_scaling_factor']
         ref_nt = 1*12
         self.assertTrue(len(time) == ref_nt)
         self.assertTrue(temp.shape == (4, ref_nt))
@@ -1024,8 +1138,9 @@ class TestClimate(unittest.TestCase):
         np.testing.assert_allclose(temp[3, :], ref_p[0:12]*0)
 
         yr = [1803, 1804]
-        time, temp, prcp = climate.mb_climate_on_height(gdir, hgts, 1.,
+        time, temp, prcp = climate.mb_climate_on_height(gdir, hgts,
                                                         year_range=yr)
+        prcp /= cfg.PARAMS['prcp_scaling_factor']
         ref_nt = 2*12
         self.assertTrue(len(time) == ref_nt)
         self.assertTrue(temp.shape == (4, ref_nt))
@@ -1038,6 +1153,8 @@ class TestClimate(unittest.TestCase):
         np.testing.assert_allclose(temp[3, :], ref_p[12:36]*0)
 
     def test_yearly_mb_climate(self):
+
+        cfg.PARAMS['prcp_scaling_factor'] = 1
 
         hef_file = get_demo_file('Hintereisferner_RGI5.shp')
         entity = gpd.read_file(hef_file).iloc[0]
@@ -1055,7 +1172,7 @@ class TestClimate(unittest.TestCase):
 
         # NORMAL --------------------------------------------------------------
         hgts = np.array([ref_h, ref_h, -8000, 8000])
-        years, temp, prcp = climate.mb_yearly_climate_on_height(gdir, hgts, 1)
+        years, temp, prcp = climate.mb_yearly_climate_on_height(gdir, hgts)
 
         ref_nt = 202
         self.assertTrue(len(years) == ref_nt)
@@ -1063,7 +1180,7 @@ class TestClimate(unittest.TestCase):
         self.assertTrue(prcp.shape == (4, ref_nt))
 
         yr = [1802, 1802]
-        years, temp, prcp = climate.mb_yearly_climate_on_height(gdir, hgts, 1,
+        years, temp, prcp = climate.mb_yearly_climate_on_height(gdir, hgts,
                                                                 year_range=yr)
         ref_nt = 1
         self.assertTrue(len(years) == ref_nt)
@@ -1078,7 +1195,7 @@ class TestClimate(unittest.TestCase):
         np.testing.assert_allclose(temp[3, :], np.sum(ref_p[0:12])*0)
 
         yr = [1803, 1804]
-        years, temp, prcp = climate.mb_yearly_climate_on_height(gdir, hgts, 1,
+        years, temp, prcp = climate.mb_yearly_climate_on_height(gdir, hgts,
                                                                 year_range=yr)
         ref_nt = 2
         self.assertTrue(len(years) == ref_nt)
@@ -1090,7 +1207,7 @@ class TestClimate(unittest.TestCase):
 
         # FLATTEN -------------------------------------------------------------
         hgts = np.array([ref_h, ref_h, -8000, 8000])
-        years, temp, prcp = climate.mb_yearly_climate_on_height(gdir, hgts, 1,
+        years, temp, prcp = climate.mb_yearly_climate_on_height(gdir, hgts,
                                                                 flatten=True)
 
         ref_nt = 202
@@ -1100,7 +1217,7 @@ class TestClimate(unittest.TestCase):
 
         yr = [1802, 1802]
         hgts = np.array([ref_h])
-        years, temp, prcp = climate.mb_yearly_climate_on_height(gdir, hgts, 1,
+        years, temp, prcp = climate.mb_yearly_climate_on_height(gdir, hgts,
                                                                 year_range=yr,
                                                                 flatten=True)
         ref_nt = 1
@@ -1112,7 +1229,7 @@ class TestClimate(unittest.TestCase):
 
         yr = [1802, 1802]
         hgts = np.array([8000])
-        years, temp, prcp = climate.mb_yearly_climate_on_height(gdir, hgts, 1,
+        years, temp, prcp = climate.mb_yearly_climate_on_height(gdir, hgts,
                                                                 year_range=yr,
                                                                 flatten=True)
         np.testing.assert_allclose(prcp[:], np.sum(ref_p[0:12]))
@@ -1131,9 +1248,9 @@ class TestClimate(unittest.TestCase):
         centerlines.catchment_width_geom(gdir)
         centerlines.catchment_width_correction(gdir)
         climate.process_custom_climate_data(gdir)
-        climate.mu_candidates(gdir)
+        climate.glacier_mu_candidates(gdir)
 
-        se = gdir.read_pickle('mu_candidates')[2.5]
+        se = gdir.read_pickle('climate_info')['mu_candidates_glacierwide']
         self.assertTrue(se.index[0] == 1802)
         self.assertTrue(se.index[-1] == 2003)
 
@@ -1164,140 +1281,59 @@ class TestClimate(unittest.TestCase):
         centerlines.catchment_width_geom(gdir)
         centerlines.catchment_width_correction(gdir)
         climate.process_custom_climate_data(gdir)
-        climate.mu_candidates(gdir)
+        climate.glacier_mu_candidates(gdir)
 
         mbdf = gdir.get_ref_mb_data()['ANNUAL_BALANCE']
-        res = climate.t_star_from_refmb(gdir, mbdf)
-        t_stars, bias, prcp_fac = res['t_star'], res['bias'], res['prcp_fac']
-        self.assertEqual(prcp_fac, 2.5)
-        y, t, p = climate.mb_yearly_climate_on_glacier(gdir, prcp_fac)
+
+        res = climate.t_star_from_refmb(gdir, mbdf=mbdf, glacierwide=True,
+                                        write_diagnostics=True)
+
+        t_star, bias = res['t_star'], res['bias']
+        y, t, p = climate.mb_yearly_climate_on_glacier(gdir)
 
         # which years to look at
         selind = np.searchsorted(y, mbdf.index)
         t = t[selind]
         p = p[selind]
 
-        mu_yr_clim = gdir.read_pickle('mu_candidates')[prcp_fac]
-        for t_s, rmd in zip(t_stars, bias):
-            mb_per_mu = p - mu_yr_clim.loc[t_s] * t
-            md = utils.md(mbdf, mb_per_mu)
-            np.testing.assert_allclose(md, rmd, rtol=1e-5)
-            self.assertTrue(np.abs(md/np.mean(mbdf)) < 0.1)
-            r = utils.corrcoef(mbdf, mb_per_mu)
-            self.assertTrue(r > 0.8)
+        ci = gdir.read_pickle('climate_info')
+        mu_yr_clim = ci['mu_candidates_glacierwide']
 
-        _t_s = t_s
-        _rmd = rmd
+        mb_per_mu = p - mu_yr_clim.loc[t_star] * t
+        md = utils.md(mbdf, mb_per_mu)
+        self.assertTrue(np.abs(md/np.mean(mbdf)) < 0.1)
+        r = utils.corrcoef(mbdf, mb_per_mu)
+        self.assertTrue(r > 0.8)
 
         # test crop years
         cfg.PARAMS['tstar_search_window'] = [1902, 0]
-        climate.mu_candidates(gdir)
-        res = climate.t_star_from_refmb(gdir, mbdf)
-        t_stars, bias, prcp_fac = res['t_star'], res['bias'], res['prcp_fac']
-        self.assertEqual(prcp_fac, 2.5)
-        for t_s, rmd in zip(t_stars, bias):
-            mb_per_mu = p - mu_yr_clim.loc[t_s] * t
-            md = utils.md(mbdf, mb_per_mu)
-            np.testing.assert_allclose(md, rmd, rtol=1e-5)
-            self.assertTrue(np.abs(md/np.mean(mbdf)) < 0.1)
-            r = utils.corrcoef(mbdf, mb_per_mu)
-            self.assertTrue(r > 0.8)
-            self.assertTrue(t_s >= 1902)
-            self.assertEqual(t_s, _t_s)
-            self.assertEqual(rmd, _rmd)
+        res = climate.t_star_from_refmb(gdir, mbdf=mbdf)
+
+        t_star, bias = res['t_star'], res['bias']
+        mb_per_mu = p - mu_yr_clim.loc[t_star] * t
+        md = utils.md(mbdf, mb_per_mu)
+        self.assertTrue(np.abs(md/np.mean(mbdf)) < 0.1)
+        r = utils.corrcoef(mbdf, mb_per_mu)
+        self.assertTrue(r > 0.8)
+        self.assertTrue(t_star >= 1902)
 
         # test distribute
         climate.compute_ref_t_stars([gdir])
-        climate.distribute_t_stars([gdir])
+        climate.local_t_star(gdir)
         cfg.PARAMS['tstar_search_window'] = [0, 0]
 
-        df = pd.read_csv(gdir.get_filepath('local_mustar'))
-        np.testing.assert_allclose(df['t_star'], _t_s)
-        np.testing.assert_allclose(df['bias'], _rmd)
-        np.testing.assert_allclose(df['prcp_fac'], 2.5)
+        df = gdir.read_json('local_mustar')
+        np.testing.assert_allclose(df['t_star'], t_star)
+        np.testing.assert_allclose(df['bias'], bias)
 
-    def test_find_tstars_stddev_perglacier_prcp_fac(self):
+    @pytest.mark.slow
+    def test_find_tstars_multiple_mus(self):
+
+        cfg.PARAMS['baseline_y0'] = 1940
+        cfg.PARAMS['baseline_y1'] = 2000
 
         hef_file = get_demo_file('Hintereisferner_RGI5.shp')
         entity = gpd.read_file(hef_file).iloc[0]
-
-        cfg.PARAMS['prcp_scaling_factor'] = 'stddev_perglacier'
-
-        gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
-        gis.define_glacier_region(gdir, entity=entity)
-        gis.glacier_masks(gdir)
-        centerlines.compute_centerlines(gdir)
-        centerlines.initialize_flowlines(gdir)
-        centerlines.catchment_area(gdir)
-        centerlines.catchment_width_geom(gdir)
-        centerlines.catchment_width_correction(gdir)
-        climate.process_custom_climate_data(gdir)
-        climate.mu_candidates(gdir)
-
-        mbdf = gdir.get_ref_mb_data()['ANNUAL_BALANCE']
-        res = climate.t_star_from_refmb(gdir, mbdf)
-        t_stars, bias, prcp_fac = res['t_star'], res['bias'], res['prcp_fac']
-
-        y, t, p = climate.mb_yearly_climate_on_glacier(gdir, prcp_fac)
-
-        # which years to look at
-        selind = np.searchsorted(y, mbdf.index)
-        t = t[selind]
-        p = p[selind]
-
-        dffac = gdir.read_pickle('prcp_fac_optim').loc[prcp_fac]
-        np.testing.assert_allclose(dffac['avg_bias'], np.mean(bias))
-        mu_yr_clim = gdir.read_pickle('mu_candidates')[prcp_fac]
-        std_bias = []
-        for t_s, rmd in zip(t_stars, bias):
-            mb_per_mu = p - mu_yr_clim.loc[t_s] * t
-            md = utils.md(mbdf, mb_per_mu)
-            np.testing.assert_allclose(md, rmd, rtol=1e-4)
-            self.assertTrue(np.abs(md / np.mean(mbdf)) < 0.1)
-            r = utils.corrcoef(mbdf, mb_per_mu)
-            self.assertTrue(r > 0.8)
-            std_bias.append(np.std(mb_per_mu) - np.std(mbdf))
-
-        np.testing.assert_allclose(dffac['avg_std_bias'], np.mean(std_bias),
-                                   rtol=1e-4)
-
-        # test crop years
-        cfg.PARAMS['tstar_search_window'] = [1902, 0]
-        climate.mu_candidates(gdir)
-        res = climate.t_star_from_refmb(gdir, mbdf)
-        t_stars, bias, prcp_fac = res['t_star'], res['bias'], res['prcp_fac']
-        mu_yr_clim = gdir.read_pickle('mu_candidates')[prcp_fac]
-        y, t, p = climate.mb_yearly_climate_on_glacier(gdir, prcp_fac)
-        selind = np.searchsorted(y, mbdf.index)
-        t = t[selind]
-        p = p[selind]
-        for t_s, rmd in zip(t_stars, bias):
-            mb_per_mu = p - mu_yr_clim.loc[t_s] * t
-            md = utils.md(mbdf, mb_per_mu)
-            np.testing.assert_allclose(md, rmd, rtol=1e-4)
-            self.assertTrue(np.abs(md / np.mean(mbdf)) < 0.1)
-            r = utils.corrcoef(mbdf, mb_per_mu)
-            self.assertTrue(r > 0.8)
-            self.assertTrue(t_s >= 1902)
-
-        # test distribute
-        climate.compute_ref_t_stars([gdir])
-        climate.distribute_t_stars([gdir])
-        cfg.PARAMS['tstar_search_window'] = [0, 0]
-
-        df = pd.read_csv(gdir.get_filepath('local_mustar'))
-        np.testing.assert_allclose(df['t_star'], t_s)
-        np.testing.assert_allclose(df['bias'], rmd)
-        np.testing.assert_allclose(df['prcp_fac'], prcp_fac)
-
-        cfg.PARAMS['prcp_scaling_factor'] = 2.5
-
-    def test_find_tstars_stddev_prcp_fac(self):
-
-        hef_file = get_demo_file('Hintereisferner_RGI5.shp')
-        entity = gpd.read_file(hef_file).iloc[0]
-
-        cfg.PARAMS['prcp_scaling_factor'] = 'stddev'
 
         gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
         gis.define_glacier_region(gdir, entity=entity)
@@ -1309,33 +1345,40 @@ class TestClimate(unittest.TestCase):
         centerlines.catchment_width_correction(gdir)
         climate.process_custom_climate_data(gdir)
 
-        # test distribute
-        climate.compute_ref_t_stars([gdir])
-        climate.distribute_t_stars([gdir])
         mbdf = gdir.get_ref_mb_data()['ANNUAL_BALANCE']
-        res = climate.t_star_from_refmb(gdir, mbdf)
-        bias_std, prcp_fac = res['std_bias'], res['prcp_fac']
 
-        # check that other prcp_factors are less good
-        cfg.PARAMS['prcp_scaling_factor'] = prcp_fac + 0.3
-        climate.compute_ref_t_stars([gdir])
-        climate.distribute_t_stars([gdir])
-        res = climate.t_star_from_refmb(gdir, mbdf)
-        bias_std_after, prcp_fac_after = res['std_bias'], res['prcp_fac']
-        self.assertLessEqual(np.abs(np.mean(bias_std)), np.abs(np.mean(bias_std_after)))
-        self.assertEqual(prcp_fac + 0.3, prcp_fac_after)
+        # Normal flowlines, i.e should be equivalent
+        res_new = climate.t_star_from_refmb(gdir, mbdf=mbdf, glacierwide=False,
+                                            write_diagnostics=True)
+        mb_new = gdir.read_pickle('climate_info')['avg_mb_per_mu']
+        res = climate.t_star_from_refmb(gdir, mbdf=mbdf, glacierwide=True,
+                                        write_diagnostics=True)
+        mb = gdir.read_pickle('climate_info')['avg_mb_per_mu']
 
-        cfg.PARAMS['prcp_scaling_factor'] = prcp_fac - 0.3
-        climate.compute_ref_t_stars([gdir])
-        climate.distribute_t_stars([gdir])
-        res = climate.t_star_from_refmb(gdir, mbdf)
-        bias_std_after, prcp_fac_after = res['std_bias'], res['prcp_fac']
-        self.assertLessEqual(np.abs(np.mean(bias_std)), np.abs(np.mean(bias_std_after)))
-        self.assertEqual(prcp_fac - 0.3, prcp_fac_after)
+        np.testing.assert_allclose(res['t_star'], res_new['t_star'])
+        np.testing.assert_allclose(res['bias'], res_new['bias'], atol=1e-3)
+        np.testing.assert_allclose(mb, mb_new, atol=1e-3)
 
-        cfg.PARAMS['prcp_scaling_factor'] = 2.5
+        # Artificially make some arms even lower to have multiple branches
+        # This is not equivalent any more
+        fls = gdir.read_pickle('inversion_flowlines')
+        assert fls[0].flows_to is fls[-1]
+        assert fls[1].flows_to is fls[-1]
+        fls[0].surface_h -= 700
+        fls[1].surface_h -= 700
+        gdir.write_pickle(fls, 'inversion_flowlines')
 
-    def test_local_mustar(self):
+        res_new = climate.t_star_from_refmb(gdir, mbdf=mbdf, glacierwide=False,
+                                            write_diagnostics=True)
+        mb_new = gdir.read_pickle('climate_info')['avg_mb_per_mu']
+        res = climate.t_star_from_refmb(gdir, mbdf=mbdf, glacierwide=True,
+                                        write_diagnostics=True)
+        mb = gdir.read_pickle('climate_info')['avg_mb_per_mu']
+
+        np.testing.assert_allclose(res['bias'], res_new['bias'], atol=20)
+        np.testing.assert_allclose(mb, mb_new, rtol=2e-1, atol=20)
+
+    def test_local_t_star(self):
 
         hef_file = get_demo_file('Hintereisferner_RGI5.shp')
         entity = gpd.read_file(hef_file).iloc[0]
@@ -1351,32 +1394,34 @@ class TestClimate(unittest.TestCase):
         centerlines.catchment_width_geom(gdir)
         centerlines.catchment_width_correction(gdir)
         climate.process_custom_climate_data(gdir)
-        climate.mu_candidates(gdir)
+        climate.glacier_mu_candidates(gdir)
         mbdf = gdir.get_ref_mb_data()
-        res = climate.t_star_from_refmb(gdir, mbdf['ANNUAL_BALANCE'])
-        t_star, bias, prcp_fac = res['t_star'], res['bias'],  res['prcp_fac']
-        self.assertEqual(prcp_fac, 2.9)
+        res = climate.t_star_from_refmb(gdir, mbdf=mbdf['ANNUAL_BALANCE'])
+        t_star, bias = res['t_star'], res['bias']
 
-        t_star = t_star[-1]
-        bias = bias[-1]
+        climate.local_t_star(gdir, tstar=t_star, bias=bias)
+        climate.mu_star_calibration(gdir)
 
-        climate.local_mustar(gdir, tstar=t_star, bias=bias, prcp_fac=prcp_fac)
-        climate.apparent_mb(gdir)
-
-        df = pd.read_csv(gdir.get_filepath('local_mustar'))
-        mu_ref = gdir.read_pickle('mu_candidates')
-        mu_ref = mu_ref[prcp_fac].loc[t_star]
-        np.testing.assert_allclose(mu_ref, df['mu_star'][0], atol=1e-3)
+        ci = gdir.read_pickle('climate_info')
+        mu_ref = ci['mu_candidates_glacierwide'].loc[t_star]
 
         # Check for apparent mb to be zeros
         fls = gdir.read_pickle('inversion_flowlines')
         tmb = 0.
         for fl in fls:
             self.assertTrue(fl.apparent_mb.shape == fl.widths.shape)
+            np.testing.assert_allclose(mu_ref, fl.mu_star, atol=1e-3)
             tmb += np.sum(fl.apparent_mb * fl.widths)
-            assert not fl.flux_needed_correction
+            assert not fl.flux_needs_correction
         np.testing.assert_allclose(tmb, 0., atol=0.01)
         np.testing.assert_allclose(fls[-1].flux[-1], 0., atol=0.01)
+
+        df = gdir.read_json('local_mustar')
+        assert df['mu_star_allsame']
+        np.testing.assert_allclose(mu_ref, df['mu_star_flowline_avg'],
+                                   atol=1e-3)
+        np.testing.assert_allclose(mu_ref, df['mu_star_glacierwide'],
+                                   atol=1e-3)
 
         # ------ Look for gradient
         # which years to look at
@@ -1384,8 +1429,7 @@ class TestClimate(unittest.TestCase):
         mb_on_h = np.array([])
         h = np.array([])
         for fl in fls:
-            y, t, p = climate.mb_yearly_climate_on_height(gdir, fl.surface_h,
-                                                          prcp_fac)
+            y, t, p = climate.mb_yearly_climate_on_height(gdir, fl.surface_h)
             selind = np.searchsorted(y, mbdf.index)
             t = np.mean(t[:, selind], axis=1)
             p = np.mean(p[:, selind], axis=1)
@@ -1404,6 +1448,49 @@ class TestClimate(unittest.TestCase):
 
         cfg.PARAMS['prcp_scaling_factor'] = 2.5
 
+    def test_local_t_star_fallback(self):
+
+        hef_file = get_demo_file('Hintereisferner_RGI5.shp')
+        entity = gpd.read_file(hef_file).iloc[0]
+
+        _prcp_sf = cfg.PARAMS['prcp_scaling_factor']
+        # small scaling factor will force small mu* to compensate lack of PRCP
+        cfg.PARAMS['prcp_scaling_factor'] = 1e-3
+        cfg.PARAMS['continue_on_error'] = True
+
+        gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
+        gis.define_glacier_region(gdir, entity=entity)
+        gis.glacier_masks(gdir)
+        centerlines.compute_centerlines(gdir)
+        centerlines.initialize_flowlines(gdir)
+        centerlines.catchment_area(gdir)
+        centerlines.catchment_width_geom(gdir)
+        centerlines.catchment_width_correction(gdir)
+        climate.process_custom_climate_data(gdir)
+        climate.glacier_mu_candidates(gdir)
+        mbdf = gdir.get_ref_mb_data()
+        res = climate.t_star_from_refmb(gdir, mbdf=mbdf['ANNUAL_BALANCE'])
+        t_star, bias = res['t_star'], res['bias']
+
+        # here, an error should occur as mu* < cfg.PARAMS['min_mu_star']
+        climate.local_t_star(gdir, tstar=t_star, bias=bias)
+        # check if file has been written
+        assert os.path.isfile(gdir.get_filepath('local_mustar'))
+
+        climate.mu_star_calibration(gdir)
+
+        df = gdir.read_json('local_mustar')
+        assert np.isnan(df['bias'])
+        assert np.isnan(df['t_star'])
+        assert np.isnan(df['mu_star_glacierwide'])
+        assert np.isnan(df['mu_star_flowline_avg'])
+        assert np.isnan(df['mu_star_allsame'])
+        assert np.isnan(df['mu_star_per_flowline']).all()
+        assert df['rgi_id'] == gdir.rgi_id
+
+        cfg.PARAMS['prcp_scaling_factor'] = _prcp_sf
+        cfg.PARAMS['continue_on_error'] = False
+
     def test_automated_workflow(self):
 
         cfg.PARAMS['run_mb_calibration'] = False
@@ -1411,6 +1498,7 @@ class TestClimate(unittest.TestCase):
         cru_dir = os.path.dirname(cru_dir)
         cfg.PATHS['climate_file'] = ''
         cfg.PATHS['cru_dir'] = cru_dir
+        cfg.PARAMS['baseline_climate'] = 'CRU'
 
         hef_file = get_demo_file('Hintereisferner_RGI5.shp')
         entity = gpd.read_file(hef_file).iloc[0]
@@ -1446,6 +1534,7 @@ class TestFilterNegFlux(unittest.TestCase):
         cfg.PATHS['working_dir'] = self.testdir
         cfg.PATHS['dem_file'] = get_demo_file('srtm_oetztal.tif')
         cfg.PATHS['climate_file'] = get_demo_file('HISTALP_oetztal.nc')
+        cfg.PARAMS['baseline_climate'] = ''
         cfg.PARAMS['border'] = 10
 
     def tearDown(self):
@@ -1463,7 +1552,7 @@ class TestFilterNegFlux(unittest.TestCase):
         entity = gpd.read_file(get_demo_file('rgi_oetztal.shp'))
         entity = entity.loc[entity.RGIId == 'RGI50-11.00666'].iloc[0]
 
-        cfg.PARAMS['filter_for_neg_flux'] = False
+        cfg.PARAMS['correct_for_neg_flux'] = False
 
         gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
         gis.define_glacier_region(gdir, entity=entity)
@@ -1474,18 +1563,137 @@ class TestFilterNegFlux(unittest.TestCase):
         centerlines.catchment_width_geom(gdir)
         centerlines.catchment_width_correction(gdir)
         climate.process_custom_climate_data(gdir)
-        climate.local_mustar(gdir, tstar=1931, bias=0, prcp_fac=2.5)
-        climate.apparent_mb(gdir)
+        climate.local_t_star(gdir, tstar=1931, bias=0)
+        climate.mu_star_calibration(gdir)
 
         fls1 = gdir.read_pickle('inversion_flowlines')
-        assert np.any([fl.flux_needed_correction for fl in fls1])
+        assert np.any([fl.flux_needs_correction for fl in fls1])
 
         cfg.PARAMS['filter_for_neg_flux'] = True
-        climate.apparent_mb(gdir)
+        climate.mu_star_calibration(gdir)
 
         fls = gdir.read_pickle('inversion_flowlines')
         assert len(fls) < len(fls1)
-        assert not np.any([fl.flux_needed_correction for fl in fls])
+        assert not np.any([fl.flux_needs_correction for fl in fls])
+
+    def test_correct(self):
+
+        entity = gpd.read_file(get_demo_file('rgi_oetztal.shp'))
+        entity = entity.loc[entity.RGIId == 'RGI50-11.00666'].iloc[0]
+
+        cfg.PARAMS['correct_for_neg_flux'] = False
+
+        gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
+        gis.define_glacier_region(gdir, entity=entity)
+        gis.glacier_masks(gdir)
+        centerlines.compute_centerlines(gdir)
+        centerlines.initialize_flowlines(gdir)
+        centerlines.catchment_area(gdir)
+        centerlines.catchment_width_geom(gdir)
+        centerlines.catchment_width_correction(gdir)
+        climate.process_custom_climate_data(gdir)
+
+        # Artificially make some arms even lower to have multiple branches
+        fls = gdir.read_pickle('inversion_flowlines')
+        assert fls[2].flows_to is fls[3]
+        assert fls[1].flows_to is fls[-1]
+        fls[1].surface_h -= 500
+        fls[2].surface_h -= 500
+        fls[3].surface_h -= 500
+        gdir.write_pickle(fls, 'inversion_flowlines')
+
+        climate.local_t_star(gdir, tstar=1931, bias=0)
+        climate.mu_star_calibration(gdir)
+
+        fls1 = gdir.read_pickle('inversion_flowlines')
+        assert np.sum([fl.flux_needs_correction for fl in fls1]) == 3
+
+        cfg.PARAMS['correct_for_neg_flux'] = True
+        climate.mu_star_calibration(gdir)
+
+        fls = gdir.read_pickle('inversion_flowlines')
+        assert len(fls) == len(fls1)
+        assert not np.any([fl.flux_needs_correction for fl in fls])
+        assert np.all([fl.mu_star_is_valid for fl in fls])
+        mus = np.array([fl.mu_star for fl in fls])
+        assert np.max(mus[[1, 2, 3]]) < (np.max(mus[[0, -1]]) / 2)
+
+        df = gdir.read_json('local_mustar')
+        mu_star_gw = df['mu_star_glacierwide']
+
+        assert np.max(mus[[1, 2, 3]]) < mu_star_gw
+        assert np.min(mus[[0, -1]]) > mu_star_gw
+
+        bias = df['bias']
+        np.testing.assert_allclose(bias, 0)
+
+        from oggm.core.massbalance import (MultipleFlowlineMassBalance,
+                                           ConstantMassBalance)
+        mb_mod = MultipleFlowlineMassBalance(gdir, fls=fls, bias=0,
+                                             mb_model_class=ConstantMassBalance
+                                             )
+
+        for mb, fl in zip(mb_mod.flowline_mb_models[1:4], fls[1:4]):
+            mbs = mb.get_specific_mb(fl.surface_h, fl.widths)
+            np.testing.assert_allclose(mbs, 0, atol=1e-1)
+
+        np.testing.assert_allclose(mb_mod.get_specific_mb(), 0, atol=1e-1)
+
+    def test_and_compare_two_methods(self):
+
+        entity = gpd.read_file(get_demo_file('rgi_oetztal.shp'))
+        entity = entity.loc[entity.RGIId == 'RGI50-11.00666'].iloc[0]
+
+        gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
+        gis.define_glacier_region(gdir, entity=entity)
+        gis.glacier_masks(gdir)
+        centerlines.compute_centerlines(gdir)
+        centerlines.initialize_flowlines(gdir)
+        centerlines.catchment_area(gdir)
+        centerlines.catchment_width_geom(gdir)
+        centerlines.catchment_width_correction(gdir)
+        climate.process_custom_climate_data(gdir)
+
+        # Artificially make some arms even lower to have multiple branches
+        fls = gdir.read_pickle('inversion_flowlines')
+        assert fls[2].flows_to is fls[3]
+        assert fls[1].flows_to is fls[-1]
+        fls[1].surface_h -= 500
+        fls[2].surface_h -= 500
+        fls[3].surface_h -= 500
+        gdir.write_pickle(fls, 'inversion_flowlines')
+
+        climate.local_t_star(gdir, tstar=1931, bias=0)
+        climate.mu_star_calibration(gdir)
+
+        fls = gdir.read_pickle('inversion_flowlines')
+
+        # These are the params:
+        # rgi_id                RGI50-11.00666
+        # t_star                          1931
+        # bias                               0
+        # mu_star_glacierwide          133.235
+        # mustar_flowline_001          165.673
+        # mustar_flowline_002           46.728
+        # mustar_flowline_003           63.759
+        # mustar_flowline_004          66.3795
+        # mustar_flowline_005          165.673
+        # mu_star_flowline_avg         146.924
+        # mu_star_allsame                False
+
+        from oggm.core.massbalance import (MultipleFlowlineMassBalance,
+                                           PastMassBalance)
+
+        mb_mod_1 = PastMassBalance(gdir, check_calib_params=False)
+        mb_mod_2 = MultipleFlowlineMassBalance(gdir, fls=fls)
+
+        years = np.arange(1951, 2000)
+        mbs1 = mb_mod_1.get_specific_mb(fls=fls, year=years)
+        mbs2 = mb_mod_2.get_specific_mb(fls=fls, year=years)
+
+        # The two are NOT equivalent because of non-linear effects,
+        # but they are close:
+        assert utils.rmsd(mbs1, mbs2) < 50
 
 
 class TestInversion(unittest.TestCase):
@@ -1504,6 +1712,7 @@ class TestInversion(unittest.TestCase):
         cfg.PATHS['working_dir'] = self.testdir
         cfg.PATHS['dem_file'] = get_demo_file('hef_srtm.tif')
         cfg.PATHS['climate_file'] = get_demo_file('histalp_merged_hef.nc')
+        cfg.PARAMS['baseline_climate'] = ''
         cfg.PARAMS['border'] = 10
 
     def tearDown(self):
@@ -1530,13 +1739,11 @@ class TestInversion(unittest.TestCase):
         centerlines.catchment_width_geom(gdir)
         centerlines.catchment_width_correction(gdir)
         climate.process_custom_climate_data(gdir)
-        climate.mu_candidates(gdir)
         mbdf = gdir.get_ref_mb_data()
-        res = climate.t_star_from_refmb(gdir, mbdf['ANNUAL_BALANCE'])
-        t_star, bias, prcp_fac = res['t_star'],  res['bias'],  res['prcp_fac']
-        t_star = t_star[-1]
-        climate.local_mustar(gdir, tstar=t_star, bias=bias, prcp_fac=prcp_fac)
-        climate.apparent_mb(gdir)
+        res = climate.t_star_from_refmb(gdir, mbdf=mbdf['ANNUAL_BALANCE'])
+        t_star, bias = res['t_star'], res['bias']
+        climate.local_t_star(gdir, tstar=t_star, bias=bias)
+        climate.mu_star_calibration(gdir)
 
         # OK. Values from Fischer and Kuhn 2013
         # Area: 8.55
@@ -1552,7 +1759,7 @@ class TestInversion(unittest.TestCase):
         for cl in cls:
             # Clip slope to avoid negative and small slopes
             slope = cl['slope_angle']
-            nm = np.where(slope <  np.deg2rad(2.))
+            nm = np.where(slope < np.deg2rad(2.))
             nabove += len(nm[0])
             npoints += len(slope)
             _max = np.max(slope)
@@ -1566,11 +1773,12 @@ class TestInversion(unittest.TestCase):
 
         ref_v = 0.573 * 1e9
 
+        glen_a = 2.4e-24
+        fs = 5.7e-20
+
         def to_optimize(x):
-            glen_a = cfg.A * x[0]
-            fs = cfg.FS * x[1]
-            v, _ = inversion.mass_conservation_inversion(gdir, fs=fs,
-                                                         glen_a=glen_a)
+            v, _ = inversion.mass_conservation_inversion(gdir, fs=fs * x[1],
+                                                         glen_a=glen_a * x[0])
             return (v - ref_v)**2
 
         import scipy.optimize as optimization
@@ -1581,8 +1789,8 @@ class TestInversion(unittest.TestCase):
         self.assertTrue(out[1] > 0.1)
         self.assertTrue(out[0] < 1.1)
         self.assertTrue(out[1] < 1.1)
-        glen_a = cfg.A * out[0]
-        fs = cfg.FS * out[1]
+        glen_a = glen_a * out[0]
+        fs = fs * out[1]
         v, _ = inversion.mass_conservation_inversion(gdir, fs=fs,
                                                      glen_a=glen_a,
                                                      write=True)
@@ -1616,6 +1824,21 @@ class TestInversion(unittest.TestCase):
         np.testing.assert_allclose(242, maxs, atol=10)
         np.testing.assert_allclose(ref_v, v)
 
+        # Sanity check - velocities
+        inv = gdir.read_pickle('inversion_output')[-1]
+
+        # vol in m3 and dx in m -> section in m2
+        section = inv['volume'] / inv['dx']
+
+        # Flux in m3 s-1 -> convert to velocity m s-1
+        velocity = inv['flux'] / section
+
+        # Then in m yr-1
+        velocity *= cfg.SEC_IN_YEAR
+
+        # Some reference value I just computed - see if other computers agree
+        np.testing.assert_allclose(np.mean(velocity), 37, atol=5)
+
     def test_invert_hef_from_linear_mb(self):
 
         hef_file = get_demo_file('Hintereisferner_RGI5.shp')
@@ -1646,7 +1869,7 @@ class TestInversion(unittest.TestCase):
         for cl in cls:
             # Clip slope to avoid negative and small slopes
             slope = cl['slope_angle']
-            nm = np.where(slope <  np.deg2rad(2.))
+            nm = np.where(slope < np.deg2rad(2.))
             nabove += len(nm[0])
             npoints += len(slope)
             _max = np.max(slope)
@@ -1660,11 +1883,12 @@ class TestInversion(unittest.TestCase):
 
         ref_v = 0.573 * 1e9
 
+        glen_a = 2.4e-24
+        fs = 5.7e-20
+
         def to_optimize(x):
-            glen_a = cfg.A * x[0]
-            fs = cfg.FS * x[1]
-            v, _ = inversion.mass_conservation_inversion(gdir, fs=fs,
-                                                         glen_a=glen_a)
+            v, _ = inversion.mass_conservation_inversion(gdir, fs=fs * x[1],
+                                                         glen_a=glen_a * x[0])
             return (v - ref_v)**2
 
         import scipy.optimize as optimization
@@ -1675,8 +1899,8 @@ class TestInversion(unittest.TestCase):
         self.assertTrue(out[1] > 0.1)
         self.assertTrue(out[0] < 1.1)
         self.assertTrue(out[1] < 1.1)
-        glen_a = cfg.A * out[0]
-        fs = cfg.FS * out[1]
+        glen_a = glen_a * out[0]
+        fs = fs * out[1]
         v, _ = inversion.mass_conservation_inversion(gdir, fs=fs,
                                                      glen_a=glen_a,
                                                      write=True)
@@ -1724,14 +1948,11 @@ class TestInversion(unittest.TestCase):
         centerlines.catchment_width_geom(gdir)
         centerlines.catchment_width_correction(gdir)
         climate.process_custom_climate_data(gdir)
-        climate.mu_candidates(gdir)
         mbdf = gdir.get_ref_mb_data()
-        res = climate.t_star_from_refmb(gdir, mbdf['ANNUAL_BALANCE'])
-        t_star, bias, prcp_fac = res['t_star'], res['bias'], res['prcp_fac']
-        t_star = t_star[-1]
-        bias = bias[-1]
-        climate.local_mustar(gdir, tstar=t_star, bias=bias, prcp_fac=prcp_fac)
-        climate.apparent_mb(gdir)
+        res = climate.t_star_from_refmb(gdir, mbdf=mbdf['ANNUAL_BALANCE'])
+        t_star, bias = res['t_star'], res['bias']
+        climate.local_t_star(gdir, tstar=t_star, bias=bias)
+        climate.mu_star_calibration(gdir)
 
         # OK. Values from Fischer and Kuhn 2013
         # Area: 8.55
@@ -1741,9 +1962,10 @@ class TestInversion(unittest.TestCase):
         inversion.prepare_for_inversion(gdir)
 
         ref_v = 0.573 * 1e9
+
         def to_optimize(x):
-            glen_a = cfg.A * x[0]
-            fs = cfg.FS * x[1]
+            glen_a = cfg.PARAMS['inversion_glen_a'] * x[0]
+            fs = cfg.PARAMS['inversion_fs'] * x[1]
             v, _ = inversion.mass_conservation_inversion(gdir, fs=fs,
                                                          glen_a=glen_a)
             return (v - ref_v)**2
@@ -1751,8 +1973,8 @@ class TestInversion(unittest.TestCase):
         out = optimization.minimize(to_optimize, [1, 1],
                                     bounds=((0.01, 10), (0.01, 10)),
                                     tol=1e-1)['x']
-        glen_a = cfg.A * out[0]
-        fs = cfg.FS * out[1]
+        glen_a = cfg.PARAMS['inversion_glen_a'] * out[0]
+        fs = cfg.PARAMS['inversion_fs'] * out[1]
         v, _ = inversion.mass_conservation_inversion(gdir, fs=fs,
                                                      glen_a=glen_a,
                                                      write=True)
@@ -1772,7 +1994,7 @@ class TestInversion(unittest.TestCase):
 
         np.testing.assert_allclose(np.nansum(t1), np.nansum(t2))
 
-    @is_slow
+    @pytest.mark.slow
     def test_invert_hef_nofs(self):
 
         hef_file = get_demo_file('Hintereisferner_RGI5.shp')
@@ -1787,14 +2009,11 @@ class TestInversion(unittest.TestCase):
         centerlines.catchment_width_geom(gdir)
         centerlines.catchment_width_correction(gdir)
         climate.process_custom_climate_data(gdir)
-        climate.mu_candidates(gdir)
         mbdf = gdir.get_ref_mb_data()
-        res = climate.t_star_from_refmb(gdir, mbdf['ANNUAL_BALANCE'])
-        t_star, bias, prcp_fac = res['t_star'], res['bias'], res['prcp_fac']
-        t_star = t_star[-1]
-        bias = bias[-1]
-        climate.local_mustar(gdir, tstar=t_star, bias=bias, prcp_fac=prcp_fac)
-        climate.apparent_mb(gdir)
+        res = climate.t_star_from_refmb(gdir, mbdf=mbdf['ANNUAL_BALANCE'])
+        t_star, bias = res['t_star'], res['bias']
+        climate.local_t_star(gdir, tstar=t_star, bias=bias)
+        climate.mu_star_calibration(gdir)
 
         # OK. Values from Fischer and Kuhn 2013
         # Area: 8.55
@@ -1807,7 +2026,7 @@ class TestInversion(unittest.TestCase):
         ref_v = 0.573 * 1e9
 
         def to_optimize(x):
-            glen_a = cfg.A * x[0]
+            glen_a = cfg.PARAMS['inversion_glen_a'] * x[0]
             fs = 0.
             v, _ = inversion.mass_conservation_inversion(gdir, fs=fs,
                                                          glen_a=glen_a)
@@ -1821,7 +2040,7 @@ class TestInversion(unittest.TestCase):
         self.assertTrue(out[0] > 0.1)
         self.assertTrue(out[0] < 10)
 
-        glen_a = cfg.A * out[0]
+        glen_a = cfg.PARAMS['inversion_glen_a'] * out[0]
         fs = 0.
         v, _ = inversion.mass_conservation_inversion(gdir, fs=fs,
                                                      glen_a=glen_a,
@@ -1846,14 +2065,11 @@ class TestInversion(unittest.TestCase):
         centerlines.catchment_width_geom(gdir)
         centerlines.catchment_width_correction(gdir)
         climate.process_custom_climate_data(gdir)
-        climate.mu_candidates(gdir)
         mbdf = gdir.get_ref_mb_data()['ANNUAL_BALANCE']
-        res = climate.t_star_from_refmb(gdir, mbdf)
-        t_star, bias, prcp_fac = res['t_star'], res['bias'], res['prcp_fac']
-        t_star = t_star[-1]
-        bias = bias[-1]
-        climate.local_mustar(gdir, tstar=t_star, bias=bias, prcp_fac=prcp_fac)
-        climate.apparent_mb(gdir)
+        res = climate.t_star_from_refmb(gdir, mbdf=mbdf)
+        t_star, bias = res['t_star'], res['bias']
+        climate.local_t_star(gdir, tstar=t_star, bias=bias)
+        climate.mu_star_calibration(gdir)
         inversion.prepare_for_inversion(gdir)
         v, _ = inversion.mass_conservation_inversion(gdir, fs=fs,
                                                      glen_a=glen_a,
@@ -1891,11 +2107,10 @@ class TestInversion(unittest.TestCase):
         centerlines.catchment_width_geom(gdir)
         centerlines.catchment_width_correction(gdir)
         climate.process_custom_climate_data(gdir)
-        climate.mu_candidates(gdir)
-        climate.local_mustar(gdir, tstar=1970, bias=0, prcp_fac=2.)
-        climate.apparent_mb(gdir)
+        climate.local_t_star(gdir, tstar=1970, bias=0, prcp_fac=2.)
+        climate.mu_star_calibration(gdir)
         inversion.prepare_for_inversion(gdir)
-        inversion.volume_inversion(gdir)
+        inversion.mass_conservation_inversion(gdir)
 
         rdir = os.path.join(self.testdir, 'RGI50-11', 'RGI50-11.fa',
                             'RGI50-11.fake')
@@ -1907,9 +2122,181 @@ class TestInversion(unittest.TestCase):
         cfg.PARAMS['continue_on_error'] = False
 
         # Test the glacier charac
-        dfc = utils.glacier_characteristics([gdir], path=False)
+        dfc = utils.compile_glacier_statistics([gdir], path=False)
         self.assertEqual(dfc.terminus_type.values[0], 'Land-terminating')
         self.assertFalse('tstar_avg_temp_mean_elev' in dfc)
+
+
+class TestCoxeCalvingInvert(unittest.TestCase):
+
+    def setUp(self):
+
+        # test directory
+        self.testdir = os.path.join(get_test_dir(), 'tmp_calving')
+
+        # Init
+        cfg.initialize()
+        cfg.PARAMS['use_intersects'] = False
+        cfg.PATHS['dem_file'] = get_demo_file('dem_RGI50-01.10299.tif')
+        cfg.PARAMS['border'] = 40
+
+    def tearDown(self):
+        self.rm_dir()
+
+    def rm_dir(self):
+        if os.path.exists(self.testdir):
+            shutil.rmtree(self.testdir)
+
+    def test_inversion_with_calving(self):
+
+        coxe_file = get_demo_file('rgi_RGI50-01.10299.shp')
+        entity = gpd.read_file(coxe_file).iloc[0]
+
+        gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
+        gis.define_glacier_region(gdir, entity=entity)
+        gis.glacier_masks(gdir)
+        centerlines.compute_centerlines(gdir)
+        centerlines.initialize_flowlines(gdir)
+        centerlines.compute_downstream_line(gdir)
+        centerlines.compute_downstream_bedshape(gdir)
+        centerlines.catchment_area(gdir)
+        centerlines.catchment_intersections(gdir)
+        centerlines.catchment_width_geom(gdir)
+        centerlines.catchment_width_correction(gdir)
+        climate.process_dummy_cru_file(gdir, seed=0)
+        climate.local_t_star(gdir)
+        climate.mu_star_calibration(gdir)
+        inversion.prepare_for_inversion(gdir)
+        v_ref, _ = inversion.mass_conservation_inversion(gdir)
+
+        fls1 = gdir.read_pickle('inversion_flowlines')
+
+        gdir.inversion_calving_rate = 0.01
+        climate.local_t_star(gdir)
+        climate.mu_star_calibration(gdir)
+        inversion.prepare_for_inversion(gdir)
+        v_a, _ = inversion.mass_conservation_inversion(gdir)
+        fls2 = gdir.read_pickle('inversion_flowlines')
+
+        # Calving increases the volume and reduces the mu
+        assert v_ref < 0.9*v_a
+        for fl1, fl2 in zip(fls1, fls2):
+            assert fl2.mu_star < fl1.mu_star
+
+
+class TestColumbiaCalvingLoop(unittest.TestCase):
+
+    def setUp(self):
+
+        # test directory
+        self.testdir = os.path.join(get_test_dir(), 'tmp_columbia')
+
+        # Init
+        cfg.initialize()
+        cfg.PATHS['working_dir'] = self.testdir
+        cfg.PARAMS['use_intersects'] = False
+        cfg.PATHS['dem_file'] = get_demo_file('dem_Columbia.tif')
+        cfg.PARAMS['border'] = 10
+
+    def tearDown(self):
+        self.rm_dir()
+
+    def rm_dir(self):
+        if os.path.exists(self.testdir):
+            shutil.rmtree(self.testdir)
+
+    @pytest.mark.slow
+    def test_calving_loop(self):
+
+        entity = gpd.read_file(get_demo_file('01_rgi60_Columbia.shp')).iloc[0]
+        gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
+
+        gis.define_glacier_region(gdir, entity=entity)
+        gis.glacier_masks(gdir)
+        centerlines.compute_centerlines(gdir)
+        centerlines.initialize_flowlines(gdir)
+        centerlines.compute_downstream_line(gdir)
+        centerlines.compute_downstream_bedshape(gdir)
+        centerlines.catchment_area(gdir)
+        centerlines.catchment_intersections(gdir)
+        centerlines.catchment_width_geom(gdir)
+        centerlines.catchment_width_correction(gdir)
+        climate.process_dummy_cru_file(gdir, seed=0)
+
+        rho = cfg.PARAMS['ice_density']
+        i = 0
+        calving_flux = []
+        mu_star = []
+        ite = []
+        cfg.PARAMS['clip_mu_star'] = False
+        cfg.PARAMS['min_mu_star'] = 0  # default is now 1
+        while i < 12:
+
+            # Calculates a calving flux from model output
+            if i == 0:
+                # First call we set to zero (not very necessary,
+                # this first loop could be removed)
+                f_calving = 0
+            elif i == 1:
+                # Second call we set a very small positive calving
+                f_calving = utils.calving_flux_from_depth(gdir, water_depth=1)
+            elif cfg.PARAMS['clip_mu_star']:
+                # If we have to clip mu the calving becomes the real flux
+                fl = gdir.read_pickle('inversion_flowlines')[-1]
+                f_calving = fl.flux[-1] * (gdir.grid.dx ** 2) * 1e-9 / rho
+            else:
+                # Otherwise it is parameterized
+                f_calving = utils.calving_flux_from_depth(gdir)
+
+            # Give it back to the inversion and recompute
+            gdir.inversion_calving_rate = f_calving
+
+            # At this step we might raise a MassBalanceCalibrationError
+            mu_is_zero = False
+            try:
+                climate.local_t_star(gdir)
+                df = gdir.read_json('local_mustar')
+            except MassBalanceCalibrationError as e:
+                assert 'mu* out of specified bounds' in str(e)
+                # When this happens we clip mu* to zero and store the
+                # bad value (just for plotting)
+                cfg.PARAMS['clip_mu_star'] = True
+                df = gdir.read_json('local_mustar')
+                df['mu_star_glacierwide'] = float(str(e).split(':')[-1])
+                climate.local_t_star(gdir)
+
+            climate.mu_star_calibration(gdir)
+            inversion.prepare_for_inversion(gdir, add_debug_var=True)
+            v_inv, _ = inversion.mass_conservation_inversion(gdir)
+
+            # Store the data
+            calving_flux = np.append(calving_flux, f_calving)
+            mu_star = np.append(mu_star, df['mu_star_glacierwide'])
+            ite = np.append(ite, i)
+
+            # Do we have to do another_loop?
+            if i > 0:
+                avg_one = np.mean(calving_flux[-4:])
+                avg_two = np.mean(calving_flux[-5:-1])
+                difference = abs(avg_two - avg_one)
+                conv = (difference < 0.05 * avg_two or
+                        calving_flux[-1] == 0 or
+                        calving_flux[-1] == calving_flux[-2])
+                if mu_is_zero or conv:
+                    break
+            i += 1
+
+        assert i < 8
+        assert calving_flux[-1] < np.max(calving_flux)
+        assert calving_flux[-1] > 2
+        assert mu_star[-1] == 0
+
+        mbmod = massbalance.MultipleFlowlineMassBalance
+        mb = mbmod(gdir, use_inversion_flowlines=True,
+                   mb_model_class=massbalance.ConstantMassBalance,
+                   bias=0)
+        flux_mb = (mb.get_specific_mb() * gdir.rgi_area_m2) * 1e-9 / rho
+        np.testing.assert_allclose(flux_mb, calving_flux[-1], atol=0.001)
 
 
 class TestGrindelInvert(unittest.TestCase):
@@ -1924,10 +2311,12 @@ class TestGrindelInvert(unittest.TestCase):
         cfg.initialize()
         cfg.set_intersects_db(get_demo_file('rgi_intersect_oetztal.shp'))
         cfg.PARAMS['use_multiple_flowlines'] = False
+        cfg.PARAMS['use_tar_shapefiles'] = False
         # not crop
         cfg.PARAMS['max_thick_to_width_ratio'] = 10
         cfg.PARAMS['max_shape_param'] = 10
         cfg.PARAMS['section_smoothing'] = 0.
+        cfg.PARAMS['prcp_scaling_factor'] = 1
 
     def tearDown(self):
         self.rm_dir()
@@ -1964,14 +2353,15 @@ class TestGrindelInvert(unittest.TestCase):
     def test_ideal_glacier(self):
 
         # we are making a
-        glen_a = cfg.A * 1
+        glen_a = cfg.PARAMS['inversion_glen_a'] * 1
         from oggm.core import flowline
 
         gdir = utils.GlacierDirectory(self.rgin, base_dir=self.testdir)
 
         fls = self._parabolic_bed()
         mbmod = massbalance.LinearMassBalance(2800.)
-        model = flowline.FluxBasedModel(fls, mb_model=mbmod, glen_a=glen_a)
+        model = flowline.FluxBasedModel(fls, mb_model=mbmod, glen_a=glen_a,
+                                        inplace=True)
         model.run_until_equilibrium()
 
         # from dummy bed
@@ -1985,10 +2375,11 @@ class TestGrindelInvert(unittest.TestCase):
             # Heights
             hgt = fl.surface_h
             # Flux
-            mb = mbmod.get_annual_mb(hgt) * cfg.SEC_IN_YEAR * cfg.RHO
+            rho = cfg.PARAMS['ice_density']
+            mb = mbmod.get_annual_mb(hgt) * cfg.SEC_IN_YEAR * rho
             fl.flux = np.zeros(len(fl.surface_h))
             fl.set_apparent_mb(mb)
-            flux = fl.flux * (map_dx**2) / cfg.SEC_IN_YEAR / cfg.RHO
+            flux = fl.flux * (map_dx**2) / cfg.SEC_IN_YEAR / rho
             pok = np.nonzero(widths > 10.)
             widths = widths[pok]
             hgt = hgt[pok]
@@ -2006,10 +2397,6 @@ class TestGrindelInvert(unittest.TestCase):
         # Write out
         gdir.write_pickle(towrite, 'inversion_input')
         v, a = inversion.mass_conservation_inversion(gdir, glen_a=glen_a)
-        v_km3 = v * 1e-9
-        a_km2 = np.sum(widths * dx) * 1e-6
-        v_vas = 0.034*(a_km2**1.375)
-
         np.testing.assert_allclose(v, model.volume_m3, rtol=0.01)
 
         cl = gdir.read_pickle('inversion_output')[0]
@@ -2020,7 +2407,7 @@ class TestGrindelInvert(unittest.TestCase):
 
         from oggm.core import flowline, massbalance
 
-        glen_a = cfg.A*2
+        glen_a = cfg.PARAMS['inversion_glen_a'] * 2
 
         gdir = utils.GlacierDirectory(self.rgin, base_dir=self.testdir)
         gis.glacier_masks(gdir)
@@ -2031,8 +2418,10 @@ class TestGrindelInvert(unittest.TestCase):
         centerlines.catchment_area(gdir)
         centerlines.catchment_width_geom(gdir)
         centerlines.catchment_width_correction(gdir)
-        climate.local_mustar(gdir, tstar=1975, bias=0., prcp_fac=1)
-        climate.apparent_mb(gdir)
+        # Trick
+        gdir.write_pickle({'source': 'HISTALP'}, 'climate_info')
+        climate.local_t_star(gdir, tstar=1975, bias=0.)
+        climate.mu_star_calibration(gdir)
         inversion.prepare_for_inversion(gdir)
         v, a = inversion.mass_conservation_inversion(gdir, glen_a=glen_a)
         inversion.filter_inversion_output(gdir)
@@ -2040,6 +2429,7 @@ class TestGrindelInvert(unittest.TestCase):
         mb_mod = massbalance.ConstantMassBalance(gdir)
         fls = gdir.read_pickle('model_flowlines')
         model = flowline.FluxBasedModel(fls, mb_model=mb_mod, y0=0.,
+                                        inplace=True,
                                         fs=0, glen_a=glen_a)
 
         ref_vol = model.volume_m3
@@ -2061,10 +2451,10 @@ class TestGrindelInvert(unittest.TestCase):
 
         # see that we have as many catchments as flowlines
         fls = gdir.read_pickle('inversion_flowlines')
-        gdfc = gpd.read_file(gdir.get_filepath('flowline_catchments'))
+        gdfc = gdir.read_shapefile('flowline_catchments')
         self.assertEqual(len(fls), len(gdfc))
         # and at least as many intersects
-        gdfc = gpd.read_file(gdir.get_filepath('catchments_intersects'))
+        gdfc = gdir.read_shapefile('catchments_intersects')
         self.assertGreaterEqual(len(gdfc), len(fls)-1)
 
         # check touch borders qualitatively
@@ -2112,67 +2502,54 @@ class TestGCMClimate(unittest.TestCase):
         climate.process_cru_data(gdir)
 
         ci = gdir.read_pickle('climate_info')
-        self.assertEqual(ci['hydro_yr_0'], 1902)
-        self.assertEqual(ci['hydro_yr_1'], 2014)
+        self.assertEqual(ci['baseline_hydro_yr_0'], 1902)
+        self.assertEqual(ci['baseline_hydro_yr_1'], 2014)
 
         f = get_demo_file('cesm.TREFHT.160001-200512.selection.nc')
-        cfg.PATHS['gcm_temp_file'] = f
+        cfg.PATHS['cesm_temp_file'] = f
         f = get_demo_file('cesm.PRECC.160001-200512.selection.nc')
-        cfg.PATHS['gcm_precc_file'] = f
+        cfg.PATHS['cesm_precc_file'] = f
         f = get_demo_file('cesm.PRECL.160001-200512.selection.nc')
-        cfg.PATHS['gcm_precl_file'] = f
-        climate.process_cesm_data(gdir)
-        with warnings.catch_warnings():
-            # Long time series are currently a pain pandas
-            warnings.filterwarnings("ignore",
-                                    message='Unable to decode time axis')
-            fh = gdir.get_filepath('climate_monthly')
-            fcesm = gdir.get_filepath('cesm_data')
-            with xr.open_dataset(fh) as cru, xr.open_dataset(fcesm) as cesm:
+        cfg.PATHS['cesm_precl_file'] = f
+        gcm_climate.process_cesm_data(gdir)
 
-                tv = cesm.time.values
-                time = pd.period_range(tv[0].strftime('%Y-%m-%d'),
-                                       tv[-1].strftime('%Y-%m-%d'),
-                                       freq='M')
-                cesm['time'] = time
-                cesm.coords['year'] = ('time', time.year)
-                cesm.coords['month'] = ('time', time.month)
+        fh = gdir.get_filepath('climate_monthly')
+        fcesm = gdir.get_filepath('gcm_data')
+        with xr.open_dataset(fh) as cru, xr.open_dataset(fcesm) as cesm:
 
-                # Let's do some basic checks
-                scru = cru.sel(time=slice('1961', '1990'))
-                scesm = cesm.load().isel(time=((cesm.year >= 1961) &
-                                               (cesm.year <= 1990)))
-                # Climate during the chosen period should be the same
-                np.testing.assert_allclose(scru.temp.mean(),
-                                           scesm.temp.mean(),
-                                           rtol=1e-3)
-                np.testing.assert_allclose(scru.prcp.mean(),
-                                           scesm.prcp.mean(),
-                                           rtol=1e-3)
-                np.testing.assert_allclose(scru.grad.mean(),
-                                           scesm.grad.mean())
-                # And also the anual cycle
-                scru = scru.groupby('time.month').mean()
-                scesm = scesm.groupby(scesm.month).mean()
-                np.testing.assert_allclose(scru.temp, scesm.temp, rtol=1e-3)
-                np.testing.assert_allclose(scru.prcp, scesm.prcp, rtol=1e-3)
-                np.testing.assert_allclose(scru.grad, scesm.grad)
+            # Let's do some basic checks
+            scru = cru.sel(time=slice('1961', '1990'))
+            scesm = cesm.load().isel(time=((cesm['time.year'] >= 1961) &
+                                           (cesm['time.year'] <= 1990)))
+            # Climate during the chosen period should be the same
+            np.testing.assert_allclose(scru.temp.mean(),
+                                       scesm.temp.mean(),
+                                       rtol=1e-3)
+            np.testing.assert_allclose(scru.prcp.mean(),
+                                       scesm.prcp.mean(),
+                                       rtol=1e-3)
 
-                # How did the annua cycle change with time?
-                scesm1 = cesm.isel(time=((cesm.year >= 1961) &
-                                         (cesm.year <= 1990)))
-                scesm2 = cesm.isel(time=((cesm.year >= 1661) &
-                                         (cesm.year <= 1690)))
-                scesm1 = scesm1.groupby(scesm1.month).mean()
-                scesm2 = scesm2.groupby(scesm2.month).mean()
-                # No more than one degree? (silly test)
-                np.testing.assert_allclose(scesm1.temp, scesm2.temp, atol=1)
-                # N more than 30%? (silly test)
-                np.testing.assert_allclose(scesm1.prcp, scesm2.prcp, rtol=0.3)
+            # And also the annual cycle
+            scru = scru.groupby('time.month').mean(dim='time')
+            scesm = scesm.groupby('time.month').mean(dim='time')
+            np.testing.assert_allclose(scru.temp, scesm.temp, rtol=1e-3)
+            np.testing.assert_allclose(scru.prcp, scesm.prcp, rtol=1e-3)
+
+            # How did the annua cycle change with time?
+            scesm1 = cesm.isel(time=((cesm['time.year'] >= 1961) &
+                                     (cesm['time.year'] <= 1990)))
+            scesm2 = cesm.isel(time=((cesm['time.year'] >= 1661) &
+                                     (cesm['time.year'] <= 1690)))
+            scesm1 = scesm1.groupby('time.month').mean(dim='time')
+            scesm2 = scesm2.groupby('time.month').mean(dim='time')
+            # No more than one degree? (silly test)
+            np.testing.assert_allclose(scesm1.temp, scesm2.temp, atol=1)
+            # N more than 30%? (silly test)
+            np.testing.assert_allclose(scesm1.prcp, scesm2.prcp, rtol=0.3)
 
     def test_compile_climate_input(self):
 
-        filename = 'cesm_data'
+        filename = 'gcm_data'
         filesuffix = '_cesm'
 
         hef_file = get_demo_file('Hintereisferner_RGI5.shp')
@@ -2185,58 +2562,53 @@ class TestGCMClimate(unittest.TestCase):
         utils.compile_climate_input([gdir])
 
         f = get_demo_file('cesm.TREFHT.160001-200512.selection.nc')
-        cfg.PATHS['gcm_temp_file'] = f
+        cfg.PATHS['cesm_temp_file'] = f
         f = get_demo_file('cesm.PRECC.160001-200512.selection.nc')
-        cfg.PATHS['gcm_precc_file'] = f
+        cfg.PATHS['cesm_precc_file'] = f
         f = get_demo_file('cesm.PRECL.160001-200512.selection.nc')
-        cfg.PATHS['gcm_precl_file'] = f
-        climate.process_cesm_data(gdir, filesuffix=filesuffix)
+        cfg.PATHS['cesm_precl_file'] = f
+        gcm_climate.process_cesm_data(gdir, filesuffix=filesuffix)
         utils.compile_climate_input([gdir], filename=filename,
                                     filesuffix=filesuffix)
 
-        with warnings.catch_warnings():
-            # Long time series are currently a pain pandas
-            warnings.filterwarnings("ignore", message='Unable to decode')
+        # CRU
+        f1 = os.path.join(cfg.PATHS['working_dir'], 'climate_input.nc')
+        f2 = gdir.get_filepath(filename='climate_monthly')
+        with xr.open_dataset(f1) as clim_cru1, \
+                xr.open_dataset(f2) as clim_cru2:
+            np.testing.assert_allclose(np.squeeze(clim_cru1.prcp),
+                                       clim_cru2.prcp)
+            np.testing.assert_allclose(np.squeeze(clim_cru1.temp),
+                                       clim_cru2.temp)
+            np.testing.assert_allclose(np.squeeze(clim_cru1.ref_hgt),
+                                       clim_cru2.ref_hgt)
+            np.testing.assert_allclose(np.squeeze(clim_cru1.ref_pix_lat),
+                                       clim_cru2.ref_pix_lat)
+            np.testing.assert_allclose(np.squeeze(clim_cru1.ref_pix_lon),
+                                       clim_cru2.ref_pix_lon)
+            np.testing.assert_allclose(clim_cru1.calendar_month,
+                                       clim_cru2['time.month'])
+            np.testing.assert_allclose(clim_cru1.calendar_year,
+                                       clim_cru2['time.year'])
+            np.testing.assert_allclose(clim_cru1.hydro_month[[0, -1]],
+                                       [1, 12])
 
-            # CRU
-            f1 = path.join(cfg.PATHS['working_dir'], 'climate_input.nc')
-            f2 = gdir.get_filepath(filename='climate_monthly')
-            with xr.open_dataset(f1) as clim_cru1, xr.open_dataset(f2) as clim_cru2:
-                np.testing.assert_allclose(np.squeeze(clim_cru1.prcp),
-                                           clim_cru2.prcp)
-                np.testing.assert_allclose(np.squeeze(clim_cru1.temp),
-                                           clim_cru2.temp)
-                np.testing.assert_allclose(np.squeeze(clim_cru1.grad),
-                                           clim_cru2.grad)
-                np.testing.assert_allclose(np.squeeze(clim_cru1.ref_hgt),
-                                           clim_cru2.ref_hgt)
-                np.testing.assert_allclose(np.squeeze(clim_cru1.ref_pix_lat),
-                                           clim_cru2.ref_pix_lat)
-                np.testing.assert_allclose(np.squeeze(clim_cru1.ref_pix_lon),
-                                           clim_cru2.ref_pix_lon)
-                np.testing.assert_allclose(clim_cru1.calendar_month,
-                                           clim_cru2['time.month'])
-                np.testing.assert_allclose(clim_cru1.calendar_year,
-                                           clim_cru2['time.year'])
-                np.testing.assert_allclose(clim_cru1.hydro_month[[0, -1]],
-                                           [1, 12])
-
-            # CESM
-            f1 = path.join(cfg.PATHS['working_dir'], 'climate_input_cesm.nc')
-            f2 = gdir.get_filepath(filename=filename, filesuffix=filesuffix)
-            with xr.open_dataset(f1) as clim_cesm1, xr.open_dataset(f2) as clim_cesm2:
-                np.testing.assert_allclose(np.squeeze(clim_cesm1.prcp),
-                                           clim_cesm2.prcp)
-                np.testing.assert_allclose(np.squeeze(clim_cesm1.temp),
-                                           clim_cesm2.temp)
-                np.testing.assert_allclose(np.squeeze(clim_cesm1.grad),
-                                           clim_cesm2.grad)
-                np.testing.assert_allclose(np.squeeze(clim_cesm1.ref_hgt),
-                                           clim_cesm2.ref_hgt)
-                np.testing.assert_allclose(np.squeeze(clim_cesm1.ref_pix_lat),
-                                           clim_cesm2.ref_pix_lat)
-                np.testing.assert_allclose(np.squeeze(clim_cesm1.ref_pix_lon),
-                                           clim_cesm2.ref_pix_lon)
+        # CESM
+        f1 = os.path.join(cfg.PATHS['working_dir'],
+                          'climate_input_cesm.nc')
+        f2 = gdir.get_filepath(filename=filename, filesuffix=filesuffix)
+        with xr.open_dataset(f1) as clim_cesm1, \
+                xr.open_dataset(f2) as clim_cesm2:
+            np.testing.assert_allclose(np.squeeze(clim_cesm1.prcp),
+                                       clim_cesm2.prcp)
+            np.testing.assert_allclose(np.squeeze(clim_cesm1.temp),
+                                       clim_cesm2.temp)
+            np.testing.assert_allclose(np.squeeze(clim_cesm1.ref_hgt),
+                                       clim_cesm2.ref_hgt)
+            np.testing.assert_allclose(np.squeeze(clim_cesm1.ref_pix_lat),
+                                       clim_cesm2.ref_pix_lat)
+            np.testing.assert_allclose(np.squeeze(clim_cesm1.ref_pix_lon),
+                                       clim_cesm2.ref_pix_lon)
 
 
 class TestIdealizedGdir(unittest.TestCase):
@@ -2255,6 +2627,7 @@ class TestIdealizedGdir(unittest.TestCase):
         cfg.PATHS['climate_file'] = get_demo_file('histalp_merged_hef.nc')
         cfg.PATHS['dem_file'] = get_demo_file('hef_srtm.tif')
         cfg.PARAMS['use_intersects'] = False
+        cfg.PARAMS['use_tar_shapefiles'] = False
         cfg.PARAMS['use_multiple_flowlines'] = False
 
     def tearDown(self):
@@ -2282,7 +2655,7 @@ class TestIdealizedGdir(unittest.TestCase):
         centerlines.catchment_width_correction(gdir)
         climate.apparent_mb_from_linear_mb(gdir)
         inversion.prepare_for_inversion(gdir, invert_all_rectangular=True)
-        v1, _ = inversion.mass_conservation_inversion(gdir, fs=0, glen_a=cfg.A)
+        v1, _ = inversion.mass_conservation_inversion(gdir)
         tt1 = gdir.read_pickle('inversion_input')[0]
         gdir1 = gdir
 
@@ -2295,7 +2668,7 @@ class TestIdealizedGdir(unittest.TestCase):
                                     base_dir=self.testdir)
         climate.apparent_mb_from_linear_mb(gdir)
         inversion.prepare_for_inversion(gdir, invert_all_rectangular=True)
-        v2, _ = inversion.mass_conservation_inversion(gdir, fs=0, glen_a=cfg.A)
+        v2, _ = inversion.mass_conservation_inversion(gdir)
 
         tt2 = gdir.read_pickle('inversion_input')[0]
         np.testing.assert_allclose(tt1['width'], tt2['width'])
@@ -2312,7 +2685,6 @@ class TestCatching(unittest.TestCase):
 
         # test directory
         self.testdir = os.path.join(get_test_dir(), 'tmp_errors')
-
 
         # Init
         cfg.initialize()
@@ -2349,7 +2721,7 @@ class TestCatching(unittest.TestCase):
         # This will "run" but log an error
         from oggm.tasks import run_random_climate
         workflow.execute_entity_task(run_random_climate,
-                                     [(gdir, {'filesuffix':'_testme'})])
+                                     [(gdir, {'filesuffix': '_testme'})])
 
         tfile = os.path.join(self.log_dir, 'RGI50-11.00897.ERROR')
         assert os.path.exists(tfile)
@@ -2374,11 +2746,14 @@ class TestCatching(unittest.TestCase):
                          'SUCCESS')
         self.assertIsNone(gdir.get_task_status(
             centerlines.compute_centerlines.__name__))
+        self.assertIsNone(gdir.get_error_log())
 
         centerlines.compute_downstream_bedshape(gdir)
 
-        s = gdir.get_task_status(centerlines.compute_downstream_bedshape.__name__)
+        s = gdir.get_task_status(
+            centerlines.compute_downstream_bedshape.__name__)
         assert 'FileNotFoundError' in s
+        assert 'FileNotFoundError' in gdir.get_error_log()
 
         # Try overwrite
         cfg.PARAMS['auto_skip_task'] = True
@@ -2388,6 +2763,7 @@ class TestCatching(unittest.TestCase):
             lines = logfile.readlines()
         isrun = ['glacier_masks' in l for l in lines]
         assert np.sum(isrun) == 1
+        assert 'FileNotFoundError' in gdir.get_error_log()
 
         cfg.PARAMS['auto_skip_task'] = False
         gis.glacier_masks(gdir)
@@ -2420,3 +2796,7 @@ class TestCatching(unittest.TestCase):
         assert df['compute_centerlines'] == 'SUCCESS'
         assert df['compute_downstream_bedshape'] != 'SUCCESS'
         assert not np.isfinite(df['not_a_task'])
+
+        # Glacier stats
+        df = utils.compile_glacier_statistics([gdir])
+        assert 'error_task' in df.columns
