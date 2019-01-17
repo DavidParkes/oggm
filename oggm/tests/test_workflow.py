@@ -1,13 +1,11 @@
 import warnings
-
-warnings.filterwarnings("once", category=DeprecationWarning)
+warnings.filterwarnings("once", category=DeprecationWarning)  # noqa: E402
 
 import os
 import shutil
 import unittest
 import pickle
 import pytest
-import pandas as pd
 import geopandas as gpd
 import numpy as np
 import xarray as xr
@@ -17,22 +15,19 @@ import salem
 from oggm import graphics
 
 # Locals
+import oggm
 import oggm.cfg as cfg
 from oggm import workflow
-from oggm.utils import get_demo_file, rmsd, write_centerlines_to_shape
-from oggm.tests import is_slow, RUN_WORKFLOW_TESTS
-from oggm.tests import is_graphic_test, BASELINE_DIR
+from oggm.utils import get_demo_file, write_centerlines_to_shape
+from oggm.tests import mpl_image_compare
 from oggm.tests.funcs import (get_test_dir, use_multiprocessing,
                               patch_url_retrieve_github)
-from oggm.core import flowline, massbalance
+from oggm.core import flowline
 from oggm import tasks
 from oggm import utils
 
-# do we event want to run the tests?
-if not RUN_WORKFLOW_TESTS:
-    raise unittest.SkipTest('Skipping all workflow tests.')
-
 # Globals
+pytestmark = pytest.mark.test_env("workflow")
 TEST_DIR = os.path.join(get_test_dir(), 'tmp_workflow')
 CLI_LOGF = os.path.join(TEST_DIR, 'clilog.pkl')
 
@@ -40,12 +35,12 @@ _url_retrieve = None
 
 
 def setup_module(module):
-    module._url_retrieve = utils._urlretrieve
-    utils._urlretrieve = patch_url_retrieve_github
+    module._url_retrieve = utils.oggm_urlretrieve
+    oggm.utils._downloads.oggm_urlretrieve = patch_url_retrieve_github
 
 
 def teardown_module(module):
-    utils._urlretrieve = module._url_retrieve
+    oggm.utils._downloads.oggm_urlretrieve = module._url_retrieve
 
 
 def clean_dir(testdir):
@@ -82,12 +77,10 @@ def up_to_climate(reset=False):
     rgidf = gpd.read_file(rgi_file)
 
     # Be sure data is downloaded
-    cl = utils.get_cru_cl_file()
+    utils.get_cru_cl_file()
 
     # Params
     cfg.PARAMS['border'] = 70
-    cfg.PARAMS['optimize_inversion_params'] = True
-    cfg.PARAMS['use_optimized_inversion_params'] = True
     cfg.PARAMS['tstar_search_window'] = [1902, 0]
     cfg.PARAMS['run_mb_calibration'] = True
 
@@ -125,8 +118,9 @@ def up_to_inversion(reset=False):
     if reset:
         # Use histalp for the actual inversion test
         cfg.PARAMS['temp_use_local_gradient'] = True
-        cfg.PATHS['climate_file'] = get_demo_file('HISTALP_oetztal.nc')
-        cfg.PATHS['cru_dir'] = ''
+        cfg.PARAMS['baseline_climate'] = 'HISTALP'
+        cru_dir = get_demo_file('HISTALP_precipitation_all_abs_1801-2014.nc')
+        cfg.PATHS['cru_dir'] = os.path.dirname(cru_dir)
         workflow.climate_tasks(gdirs)
         with open(CLI_LOGF, 'wb') as f:
             pickle.dump('histalp', f)
@@ -157,7 +151,7 @@ def up_to_distrib(reset=False):
         # Use CRU
         cfg.PARAMS['prcp_scaling_factor'] = 2.5
         cfg.PARAMS['temp_use_local_gradient'] = False
-        cfg.PATHS['climate_file'] = ''
+        cfg.PARAMS['baseline_climate'] = 'CRU'
         cru_dir = get_demo_file('cru_ts3.23.1901.2014.tmp.dat.nc')
         cfg.PATHS['cru_dir'] = os.path.dirname(cru_dir)
         with warnings.catch_warnings():
@@ -165,8 +159,8 @@ def up_to_distrib(reset=False):
             warnings.simplefilter("ignore")
             workflow.execute_entity_task(tasks.process_cru_data, gdirs)
         tasks.compute_ref_t_stars(gdirs)
-        tasks.distribute_t_stars(gdirs)
-        workflow.execute_entity_task(tasks.apparent_mb, gdirs)
+        workflow.execute_entity_task(tasks.local_t_star, gdirs)
+        workflow.execute_entity_task(tasks.mu_star_calibration, gdirs)
         with open(CLI_LOGF, 'wb') as f:
             pickle.dump('cru', f)
 
@@ -189,133 +183,24 @@ def random_for_plot():
     return gdirs
 
 
-class TestWorkflow(unittest.TestCase):
+class TestFullRun(unittest.TestCase):
 
-    @is_slow
-    def test_init_present_time_glacier(self):
+    @pytest.mark.slow
+    def test_some_characs(self):
 
         gdirs = up_to_inversion()
 
-        # Inversion Results
-        cfg.PARAMS['invert_with_sliding'] = True
-        cfg.PARAMS['optimize_thick'] = True
-        workflow.inversion_tasks(gdirs)
-
-        fpath = os.path.join(cfg.PATHS['working_dir'],
-                             'inversion_optim_results.csv')
-        df = pd.read_csv(fpath, index_col=0)
-        r1 = rmsd(df['ref_volume_km3'], df['oggm_volume_km3'])
-        assert r1 < 0.1
-
-        cfg.PARAMS['invert_with_sliding'] = False
-        cfg.PARAMS['optimize_thick'] = False
-        workflow.inversion_tasks(gdirs)
-
-        fpath = os.path.join(cfg.PATHS['working_dir'],
-                             'inversion_optim_results.csv')
-        df = pd.read_csv(fpath, index_col=0)
-        r1 = rmsd(df['ref_volume_km3'], df['oggm_volume_km3'])
-        assert r1 < 0.12
-
-        # Init glacier
-        d = gdirs[0].read_pickle('inversion_params')
-        fs = d['fs']
-        glen_a = d['glen_a']
-        for gdir in gdirs:
-            flowline.init_present_time_glacier(gdir)
-            mb_mod = massbalance.ConstantMassBalance(gdir)
-            fls = gdir.read_pickle('model_flowlines')
-            model = flowline.FluxBasedModel(fls, mb_model=mb_mod, y0=0.,
-                                            fs=fs, glen_a=glen_a)
-            _vol = model.volume_km3
-            _area = model.area_km2
-            if gdir.rgi_id in df.index:
-                gldf = df.loc[gdir.rgi_id]
-                assert_allclose(gldf['oggm_volume_km3'], _vol, rtol=0.05)
-                assert_allclose(gldf['ref_area_km2'], _area, rtol=0.05)
-                maxo = max([fl.order for fl in model.fls])
-                for fl in model.fls:
-                    if len(model.fls) > 1:
-                        if fl.order == (maxo-1):
-                            self.assertTrue(fl.flows_to is fls[-1])
-
         # Test the glacier charac
-        dfc = utils.glacier_characteristics(gdirs)
+        dfc = utils.compile_glacier_statistics(gdirs)
         self.assertTrue(np.all(dfc.terminus_type == 'Land-terminating'))
+        assert np.all(dfc.t_star > 1900)
+        dfc = utils.compile_climate_statistics(gdirs)
         cc = dfc[['flowline_mean_elev',
                   'tstar_avg_temp_mean_elev']].corr().values[0, 1]
         assert cc < -0.8
-        assert np.all(dfc.t_star > 1900)
         assert np.all(dfc.tstar_aar.mean() > 0.5)
 
-    @is_slow
-    def test_crossval(self):
-
-        gdirs = up_to_distrib()
-
-        # in case we ran crossval we need to rerun
-        tasks.compute_ref_t_stars(gdirs)
-        tasks.distribute_t_stars(gdirs)
-        workflow.execute_entity_task(tasks.apparent_mb, gdirs)
-
-        # before crossval
-        refmustars = []
-        for gdir in gdirs:
-            tdf = pd.read_csv(gdir.get_filepath('local_mustar'))
-            refmustars.append(tdf['mu_star'].values[0])
-
-        tasks.crossval_t_stars(gdirs)
-        file = os.path.join(cfg.PATHS['working_dir'], 'crossval_tstars.csv')
-        df = pd.read_csv(file, index_col=0)
-
-        # after crossval we need to rerun
-        tasks.compute_ref_t_stars(gdirs)
-        tasks.distribute_t_stars(gdirs)
-        workflow.execute_entity_task(tasks.apparent_mb, gdirs)
-
-        # Test if quicker crossval is also OK
-        tasks.quick_crossval_t_stars(gdirs)
-        file = os.path.join(cfg.PATHS['working_dir'], 'crossval_tstars.csv')
-        dfq = pd.read_csv(file, index_col=0)
-
-        # after crossval we need to rerun
-        tasks.compute_ref_t_stars(gdirs)
-        tasks.distribute_t_stars(gdirs)
-        workflow.execute_entity_task(tasks.apparent_mb, gdirs)
-        assert np.all(np.abs(df.cv_bias) < 50)
-        assert np.all(np.abs(dfq.cv_bias) < 50)
-        # The biases aren't entirely equivalent and its ok
-        np.testing.assert_allclose(df.cv_prcp_fac, dfq.cv_prcp_fac)
-
-        # see if the process didn't brake anything
-        mustars = []
-        for gdir in gdirs:
-            tdf = pd.read_csv(gdir.get_filepath('local_mustar'))
-            mustars.append(tdf['mu_star'].values[0])
-        np.testing.assert_allclose(refmustars, mustars)
-
-        # make some mb tests
-        from oggm.core.massbalance import PastMassBalance
-        for rid in df.index:
-            gdir = [g for g in gdirs if g.rgi_id == rid][0]
-            h, w = gdir.get_inversion_flowline_hw()
-            cfg.PARAMS['use_bias_for_run'] = False
-            mbmod = PastMassBalance(gdir)
-            mbdf = gdir.get_ref_mb_data()['ANNUAL_BALANCE'].to_frame(name='ref')
-            for yr in mbdf.index:
-                mbdf.loc[yr, 'mine'] = mbmod.get_specific_mb(h, w, year=yr)
-            mm = mbdf.mean()
-            np.testing.assert_allclose(df.loc[rid].bias,
-                                       mm['mine'] - mm['ref'], atol=1e-3)
-            cfg.PARAMS['use_bias_for_run'] = True
-            mbmod = PastMassBalance(gdir)
-            mbdf = gdir.get_ref_mb_data()['ANNUAL_BALANCE'].to_frame(name='ref')
-            for yr in mbdf.index:
-                mbdf.loc[yr, 'mine'] = mbmod.get_specific_mb(h, w, year=yr)
-            mm = mbdf.mean()
-            np.testing.assert_allclose(mm['mine'], mm['ref'], atol=1e-3)
-
-    @is_slow
+    @pytest.mark.slow
     def test_shapefile_output(self):
 
         # Just to increase coveralls, hehe
@@ -330,7 +215,7 @@ class TestWorkflow(unittest.TestCase):
         self.assertEqual(len(shp), 3)
         self.assertEqual(shp.loc[shp.LE_SEGMENT.idxmax()].MAIN, 1)
 
-    @is_slow
+    @pytest.mark.slow
     def test_random(self):
 
         # Fake Reset (all these tests are horribly coded)
@@ -382,28 +267,10 @@ class TestWorkflow(unittest.TestCase):
         df['RUN'] = ds_diag.volume_m3.to_series()
         assert_allclose(df.RUN, df.OUT)
 
-    @is_slow
-    def test_random_mb_seed(self):
-        gdirs = up_to_inversion()
-        seed = None
-        years = np.arange(1800, 2201)
-        odf = pd.DataFrame(index=years)
-        for gd in gdirs[:6]:
-            mb = massbalance.RandomMassBalance(gd, y0=1970, seed=seed)
-            h, w = gd.get_inversion_flowline_hw()
-            odf[gd.rgi_id] = mb.get_specific_mb(h, w, year=years)
-        self.assertLessEqual(odf.corr().mean().mean(), 0.5)
-        seed = 1
-        for gd in gdirs[:6]:
-            mb = massbalance.RandomMassBalance(gd, y0=1970, seed=seed)
-            h, w = gd.get_inversion_flowline_hw()
-            odf[gd.rgi_id] = mb.get_specific_mb(h, w, year=years)
-        self.assertGreaterEqual(odf.corr().mean().mean(), 0.9)
 
-
-@is_slow
-@is_graphic_test
-@pytest.mark.mpl_image_compare(baseline_dir=BASELINE_DIR, tolerance=25)
+@pytest.mark.slow
+@pytest.mark.graphic
+@mpl_image_compare(remove_text=True)
 def test_plot_region_inversion():
 
     gdirs = up_to_inversion()
@@ -424,9 +291,9 @@ def test_plot_region_inversion():
     return fig
 
 
-@is_slow
-@is_graphic_test
-@pytest.mark.mpl_image_compare(baseline_dir=BASELINE_DIR, tolerance=25)
+@pytest.mark.slow
+@pytest.mark.graphic
+@mpl_image_compare(remove_text=True)
 def test_plot_region_model():
 
     gdirs = random_for_plot()
