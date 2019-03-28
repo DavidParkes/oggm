@@ -7,6 +7,7 @@ import tempfile
 import gzip
 import json
 import time
+import random
 import shutil
 import tarfile
 import sys
@@ -42,6 +43,30 @@ from oggm.utils._funcs import (calendardate_to_hydrodate, date_to_floatyear,
 from oggm.utils._downloads import (get_demo_file, get_wgms_files,
                                    get_rgi_glacier_entities)
 from oggm import cfg
+from oggm.exceptions import InvalidParamsError
+
+
+# Default RGI date (median per region)
+RGI_DATE = {'01': 2009,
+            '02': 2004,
+            '03': 1999,
+            '04': 2001,
+            '05': 2001,
+            '06': 2000,
+            '07': 2008,
+            '08': 2002,
+            '09': 2001,
+            '10': 2011,
+            '11': 2003,
+            '12': 2001,
+            '13': 2006,
+            '14': 2001,
+            '15': 2001,
+            '16': 2000,
+            '17': 2000,
+            '18': 1978,
+            '19': 1989,
+            }
 
 # Module logger
 log = logging.getLogger('.'.join(__name__.split('.')[:-1]))
@@ -486,6 +511,32 @@ def write_centerlines_to_shape(gdirs, filesuffix='', path=True):
             c.write(feature(i, row))
 
 
+def demo_glacier_id(key):
+    """Get the RGI id of a glacier by name or key: None if not found."""
+
+    df = cfg.DEMO_GLACIERS
+
+    # Is the name in key?
+    s = df.loc[df.Key.str.lower() == key.lower()]
+    if len(s) == 1:
+        return s.index[0]
+
+    # Is the name in name?
+    s = df.loc[df.Name.str.lower() == key.lower()]
+    if len(s) == 1:
+        return s.index[0]
+
+    # Is the name in Ids?
+    try:
+        s = df.loc[[key]]
+        if len(s) == 1:
+            return s.index[0]
+    except KeyError:
+        pass
+
+    return None
+
+
 def compile_run_output(gdirs, path=True, filesuffix='', use_compression=True):
     """Merge the output of the model runs of several gdirs into one file.
 
@@ -525,7 +576,6 @@ def compile_run_output(gdirs, path=True, filesuffix='', use_compression=True):
             i += 1
 
     # OK found it, open it and prepare the output
-
     with xr.open_dataset(ppath) as ds_diag:
         time = ds_diag.time.values
         yrs = ds_diag.hydro_year.values
@@ -1195,25 +1245,45 @@ def idealized_gdir(surface_h, widths_m, map_dx, flowline_dx=1,
     return gdir
 
 
-def _robust_tar_extract(from_tar, to_dir, delete_tar=False):
+def _robust_extract(to_dir, *args, **kwargs):
     """For some obscure reason this operation randomly fails.
 
     Try to make it more robust.
     """
     count = 0
-    while count < 10:
+    while count < 5:
         try:
-            if os.path.exists(to_dir):
-                shutil.rmtree(to_dir)
             if count > 1:
-                time.sleep(0.1)
-            with tarfile.open(from_tar, 'r') as tf:
+                time.sleep(random.uniform(0.05, 0.1))
+            with tarfile.open(*args, **kwargs) as tf:
                 tf.extractall(os.path.dirname(to_dir))
             break
         except FileExistsError:
             count += 1
-            if count == 10:
+            if count == 5:
                 raise
+
+
+def robust_tar_extract(from_tar, to_dir, delete_tar=False):
+    """Extract a tar file - also checks for a "tar in tar" situation"""
+
+    if os.path.isfile(from_tar):
+        _robust_extract(to_dir, from_tar, 'r')
+    else:
+        # maybe a tar in tar
+        base_tar = os.path.dirname(from_tar) + '.tar'
+        if not os.path.isfile(base_tar):
+            raise FileNotFoundError('Could not find a tarfile with path: '
+                                    '{}'.format(from_tar))
+        if delete_tar:
+            raise InvalidParamsError('Cannot delete tar in tar.')
+        # Open the tar
+        bname = os.path.basename(from_tar)
+        dirbname = os.path.basename(os.path.dirname(from_tar))
+        with tarfile.open(base_tar, 'r') as tf:
+            i_from_tar = tf.getmember(os.path.join(dirbname, bname))
+            _robust_extract(to_dir, fileobj=tf.extractfile(i_from_tar))
+
     if delete_tar:
         os.remove(from_tar)
 
@@ -1243,9 +1313,9 @@ class GlacierDirectory(object):
         The glacier's RGI area (km2)
     cenlon, cenlat : float
         The glacier centerpoint's lon/lat
-    rgi_date : datetime
-        The RGI's BGNDATE attribute if available. Otherwise, defaults to
-        2003-01-01
+    rgi_date : int
+        The RGI's BGNDATE year attribute if available. Otherwise, defaults to
+        the median year for the RGI region
     rgi_region : str
         The RGI region name
     name : str
@@ -1294,9 +1364,9 @@ class GlacierDirectory(object):
             if from_tar:
                 _dir = os.path.join(base_dir, rgi_entity[:8], rgi_entity[:11],
                                     rgi_entity)
-                if not os.path.exists(str(from_tar)):
+                if from_tar is True:
                     from_tar = _dir + '.tar.gz'
-                _robust_tar_extract(from_tar, _dir, delete_tar=delete_tar)
+                robust_tar_extract(from_tar, _dir, delete_tar=delete_tar)
                 from_tar = False  # to not re-unpack later below
                 _shp = os.path.join(_dir, 'outlines.shp')
             else:
@@ -1399,11 +1469,9 @@ class GlacierDirectory(object):
         self.hemisphere = 'sh' if self.cenlat < 0 else 'nh'
 
         # convert the date
-        try:
-            rgi_date = pd.to_datetime(rgi_datestr[0:4],
-                                      errors='raise', format='%Y')
-        except BaseException:
-            rgi_date = None
+        rgi_date = int(rgi_datestr[0:4])
+        if rgi_date < 0:
+            rgi_date = RGI_DATE[self.rgi_region]
         self.rgi_date = rgi_date
 
         # Root directory
@@ -1414,12 +1482,16 @@ class GlacierDirectory(object):
         # Do we have to extract the files first?
         if (reset or from_tar) and os.path.exists(self.dir):
             shutil.rmtree(self.dir)
+
         if from_tar:
-            if not os.path.exists(str(from_tar)):
+            if from_tar is True:
                 from_tar = self.dir + '.tar.gz'
-            _robust_tar_extract(from_tar, self.dir, delete_tar=delete_tar)
+            robust_tar_extract(from_tar, self.dir, delete_tar=delete_tar)
         else:
             mkdir(self.dir)
+
+        if not os.path.isdir(self.dir):
+            raise RuntimeError('GlacierDirectory %s does not exist!' % self.dir)
 
         # logging file
         self.logfile = os.path.join(self.dir, 'log.txt')
@@ -1752,7 +1824,6 @@ class GlacierDirectory(object):
         nc.author_info = 'Open Global Glacier Model'
         nc.proj_srs = self.grid.proj.srs
 
-        lon, lat = self.grid.ll_coordinates
         x = self.grid.x0 + np.arange(self.grid.nx) * self.grid.dx
         y = self.grid.y0 + np.arange(self.grid.ny) * self.grid.dy
 
@@ -1768,24 +1839,12 @@ class GlacierDirectory(object):
         v.standard_name = 'projection_y_coordinate'
         v[:] = y
 
-        v = nc.createVariable('longitude', 'f4', ('y', 'x'), zlib=True)
-        v.units = 'degrees_east'
-        v.long_name = 'longitude coordinate'
-        v.standard_name = 'longitude'
-        v[:] = lon
-
-        v = nc.createVariable('latitude', 'f4', ('y', 'x'), zlib=True)
-        v.units = 'degrees_north'
-        v.long_name = 'latitude coordinate'
-        v.standard_name = 'latitude'
-        v[:] = lat
-
         return nc
 
     def write_monthly_climate_file(self, time, prcp, temp,
                                    ref_pix_hgt, ref_pix_lon, ref_pix_lat, *,
                                    gradient=None,
-                                   time_unit='days since 1801-01-01 00:00:00',
+                                   time_unit=None,
                                    calendar=None,
                                    file_name='climate_monthly',
                                    filesuffix=''):
@@ -1793,20 +1852,32 @@ class GlacierDirectory(object):
 
         Parameters
         ----------
-        time
-        prcp
-        temp
-        ref_pix_hgt
-        ref_pix_lon
-        ref_pix_lat
-        gradient
-        time_unit
-        file_name
-        filesuffix
-
-        Returns
-        -------
-
+        time : ndarray
+            the time array, in a format understood by netCDF4
+        prcp : ndarray
+            the precipitation array (unit: 'kg m-2 month-1')
+        temp : ndarray
+            the temperature array (unit: 'degC')
+        ref_pix_hgt : float
+            the elevation of the dataset's reference altitude
+            (for correction). In practice it is the same altitude as the
+            baseline climate.
+        ref_pix_lon : float
+            the location of the gridded data's grid point
+        ref_pix_lat : float
+            the location of the gridded data's grid point
+        gradient : ndarray, optional
+            whether to use a time varying gradient
+        time_unit : str
+            the reference time unit for your time array. This should be chosen
+            depending on the length of your data. The default is to choose
+            it ourselves based on the starting year.
+        calendar : str
+            If you use an exotic calendar (e.g. 'noleap')
+        file_name : str
+            How to name the file
+        filesuffix : str
+            Apply a suffix to the file
         """
 
         # overwrite as default
@@ -1815,6 +1886,17 @@ class GlacierDirectory(object):
             os.remove(fpath)
 
         zlib = cfg.PARAMS['compress_climate_netcdf']
+        
+        if time_unit is None:
+            # http://pandas.pydata.org/pandas-docs/stable/timeseries.html
+            # #timestamp-limitations
+            if time[0].year > 1800:
+                time_unit = 'days since 1801-01-01 00:00:00'
+            elif time[0].year >= 0:
+                time_unit = ('days since {:04d}-01-01 '
+                             '00:00:00'.format(time[0].year))
+            else:
+                raise InvalidParamsError('Time format not supported')
 
         with ncDataset(fpath, 'w', format='NETCDF4') as nc:
             nc.ref_hgt = ref_pix_hgt
@@ -1829,13 +1911,19 @@ class GlacierDirectory(object):
             nc.author_info = 'Open Global Glacier Model'
 
             timev = nc.createVariable('time', 'i4', ('time',))
+            
             tatts = {'units': time_unit}
-            if calendar is not None:
-                tatts['calendar'] = calendar
+            if calendar is None:
+                calendar = 'standard'
+
+            tatts['calendar'] = calendar
+            try:
                 numdate = netCDF4.date2num([t for t in time], time_unit,
                                            calendar=calendar)
-            else:
-                numdate = netCDF4.date2num([t for t in time], time_unit)
+            except TypeError:
+                # numpy's broken datetime only works for us precision
+                time = time.astype('M8[us]').astype(datetime.datetime)
+                numdate = netCDF4.date2num(time, time_unit, calendar=calendar)
 
             timev.setncatts(tatts)
             timev[:] = numdate
@@ -1991,8 +2079,21 @@ class GlacierDirectory(object):
             line += 'SUCCESS'
         else:
             line += err.__class__.__name__ + ': {}'.format(err)
-        with open(self.logfile, 'a') as logfile:
-            logfile.write(line + '\n')
+
+        count = 0
+        while count < 5:
+            try:
+                with open(self.logfile, 'a') as logfile:
+                    logfile.write(line + '\n')
+                break
+            except FileNotFoundError:
+                # I really don't know when this error happens
+                # In this case sleep and try again
+                time.sleep(0.05)
+                count += 1
+
+        if count == 5:
+            log.warning('Could not write to logfile: ' + line)
 
     def get_task_status(self, task_name):
         """Opens this directory's log file to see if a task was already run.
@@ -2029,7 +2130,7 @@ class GlacierDirectory(object):
 
         Returns
         -------
-        The first erros message in this log, None if all good
+        The first error message in this log, None if all good
         """
 
         if not os.path.isfile(self.logfile):
@@ -2266,3 +2367,36 @@ def gdir_to_tar(gdir, base_dir=None, delete=True):
         shutil.rmtree(source_dir)
 
     return opath
+
+
+def base_dir_to_tar(base_dir=None, delete=True):
+    """Merge the directories into 1000 bundles as tar files.
+
+    The tar file is located at the same location of the original directory.
+
+    Parameters
+    ----------
+    base_dir : str
+        path to the basedir to parse (defaults to the working directory)
+    to_base_dir : str
+        path to the basedir where to write the directory (defaults to the
+        same location of the original directory)
+    delete : bool
+        delete the original directory tars afterwards (default)
+    """
+
+    if base_dir is None:
+        if not cfg.PATHS.get('working_dir', None):
+            raise ValueError("Need a valid PATHS['working_dir']!")
+        base_dir = os.path.join(cfg.PATHS['working_dir'], 'per_glacier')
+
+    for dirname, subdirlist, filelist in os.walk(base_dir):
+        # RGI60-01.00
+        bname = os.path.basename(dirname)
+        if not (len(bname) == 11 and bname[-3] == '.'):
+            continue
+        opath = dirname + '.tar'
+        with tarfile.open(opath, 'w') as tar:
+            tar.add(dirname, arcname=os.path.basename(dirname))
+        if delete:
+            shutil.rmtree(dirname)

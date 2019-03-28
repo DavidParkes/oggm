@@ -106,8 +106,7 @@ class Centerline(object):
         if check_tail:
             # Project the point and Check that its not too close
             prdis = other.line.project(self.tail, normalized=False)
-            ind_closest = np.argmin(np.abs(other.dis_on_line - prdis))
-            ind_closest = np.asscalar(ind_closest)
+            ind_closest = np.argmin(np.abs(other.dis_on_line - prdis)).item()
             n = len(other.dis_on_line)
             if n >= 9:
                 ind_closest = np.clip(ind_closest, 4, n-5)
@@ -497,8 +496,7 @@ def _projection_point(centerline, point):
     (flow_point, ind_closest): Shapely Point and indice in the line
     """
     prdis = centerline.line.project(point, normalized=False)
-    ind_closest = np.argmin(np.abs(centerline.dis_on_line - prdis))
-    ind_closest = np.asscalar(ind_closest)
+    ind_closest = np.argmin(np.abs(centerline.dis_on_line - prdis)).item()
     flow_point = shpg.Point(centerline.line.coords[int(ind_closest)])
     return flow_point
 
@@ -806,7 +804,7 @@ def compute_centerlines(gdir, heads=None):
         glacier_mask = nc.variables['glacier_mask'][:]
         glacier_ext = nc.variables['glacier_ext'][:]
         topo = nc.variables['topo_smoothed'][:]
-        poly_pix = geom['polygon_pix']
+    poly_pix = geom['polygon_pix']
 
     # Find for local maximas on the outline
     x, y = tuple2int(poly_pix.exterior.xy)
@@ -872,18 +870,6 @@ def compute_centerlines(gdir, heads=None):
     if is_first_call:
         # For diagnostics of filtered centerlines
         gdir.add_to_diagnostics('n_orig_centerlines', len(cls))
-
-    # Netcdf
-    with utils.ncDataset(grids_file, 'a') as nc:
-        if 'cost_grid' in nc.variables:
-            # Overwrite
-            nc.variables['cost_grid'][:] = costgrid
-        else:
-            # Create
-            v = nc.createVariable('cost_grid', 'f4', ('y', 'x', ), zlib=True)
-            v.units = '-'
-            v.long_name = 'Centerlines cost grid'
-            v[:] = costgrid
 
 
 @entity_task(log, writes=['downstream_line'])
@@ -1404,16 +1390,20 @@ def catchment_area(gdir):
     glacier_pix = geom['polygon_pix']
     fpath = gdir.get_filepath('gridded_data')
     with utils.ncDataset(fpath) as nc:
-        costgrid = nc.variables['cost_grid'][:]
-        mask = nc.variables['glacier_mask'][:]
+        glacier_mask = nc.variables['glacier_mask'][:]
+        glacier_ext = nc.variables['glacier_ext'][:]
+        topo = nc.variables['topo_smoothed'][:]
 
     # If we have only one centerline this is going to be easy: take the
     # mask and return
     if len(cls) == 1:
-        cl_catchments = [np.array(np.nonzero(mask == 1)).T]
+        cl_catchments = [np.array(np.nonzero(glacier_mask == 1)).T]
         geom['catchment_indices'] = cl_catchments
         gdir.write_pickle(geom, 'geometries')
         return
+
+    # Cost array
+    costgrid = _make_costgrid(glacier_mask, glacier_ext, topo)
 
     # Initialise costgrid and the "catching" dict
     cost_factor = 0.  # Make it cheap
@@ -1426,11 +1416,11 @@ def catchment_area(gdir):
             dic_catch[(y, x)] = set([(y, x)])
 
     # It is much faster to make the array as small as possible. We trick:
-    pm = np.nonzero(mask == 1)
+    pm = np.nonzero(glacier_mask == 1)
     ymi, yma = np.min(pm[0])-1, np.max(pm[0])+2
     xmi, xma = np.min(pm[1])-1, np.max(pm[1])+2
     costgrid = costgrid[ymi:yma, xmi:xma]
-    mask = mask[ymi:yma, xmi:xma]
+    mask = glacier_mask[ymi:yma, xmi:xma]
 
     # Where did we compute the path already?
     computed = np.where(mask == 1, 0, np.nan)

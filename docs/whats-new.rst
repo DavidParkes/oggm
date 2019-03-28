@@ -4,8 +4,25 @@
 Version history
 ===============
 
-v1.X (unreleased)
+v1.1.x (unreleased)
+-------------------
+
+Breaking changes
+~~~~~~~~~~~~~~~~
+
+Enhancements
+~~~~~~~~~~~~
+
+Bug fixes
+~~~~~~~~~
+
+v1.1 (28.02.2019)
 -----------------
+
+This is a major new release of the OGGM model, with substantial improvements
+to version 1. We recommend to use this version from now on. It coincides
+with the publication of our publication in
+`Geoscientific Model Development <https://www.geosci-model-dev-discuss.net/gmd-2018-9/>`_.
 
 New contributors to the project:
 
@@ -175,10 +192,11 @@ Enhancements
   By `Fabien Maussion <https://github.com/fmaussion>`_.
 - The ``entity_task`` decorator now accepts a fallback-function which will be
   executed if a task fails and `cfg.PARAMS['continue_on_error'] = True`. So far
-  only one fallback function is implemented for ``climate.local_t_star`
+  only one fallback function is implemented for `climate.local_t_star`
   (:pull:`663`).
   By `Matthias Dusch <https://github.com/matthiasdusch>`_.
-
+- New `process_gcm_data` task to handle CMIP5 files.
+  By `Nicolas Champollion <https://github.com/nchampollion>`_.
 
 
 Bug fixes

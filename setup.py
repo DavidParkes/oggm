@@ -87,19 +87,19 @@ setup(
     python_requires='>=3.5',
     # Find packages automatically
     packages=find_packages(exclude=['docs']),
+    # Include package data
+    include_package_data=True,
     # Install dependencies
     install_requires=req_packages,
     # additional groups of dependencies here (e.g. development dependencies).
     extras_require={},
-    # data files that need to be installed
-    package_data={'oggm': ['params.cfg']},
-    # Old
-    data_files=[],
     # Executable scripts
     entry_points={
         'pytest11': ['pytest_oggm = oggm.pytest_plugin'],
         'console_scripts': [
             'oggm_prepro = oggm.cli.prepro_levels:main',
+            'oggm_benchmark = oggm.cli.benchmark:main',
+            'oggm_tdmdem90_login = oggm.cli.tdmdem90_login:main',
         ],
     },
 )

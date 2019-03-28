@@ -7,7 +7,9 @@ import shutil
 import time
 import gzip
 import bz2
+import hashlib
 import pytest
+from unittest import mock
 
 import salem
 import numpy as np
@@ -22,11 +24,15 @@ from oggm import cfg
 from oggm.tests.funcs import (get_test_dir, patch_url_retrieve_github,
                               init_hef, TempEnvironmentVariable)
 from oggm.utils import shape_factor_adhikari
-from oggm.exceptions import InvalidParamsError
+from oggm.exceptions import (InvalidParamsError,
+                             DownloadVerificationFailedException)
 
 
 pytestmark = pytest.mark.test_env("utils")
 _url_retrieve = None
+
+TEST_GDIR_URL = ('https://cluster.klima.uni-bremen.de/~fmaussion/'
+                 'test_gdirs/oggm_v1.1/')
 
 
 def setup_module(module):
@@ -300,24 +306,30 @@ class TestWorkflowTools(unittest.TestCase):
         np.testing.assert_allclose(df['1970-2000_avg_prcpsol_max_elev'],
                                    2811, atol=200)
 
+    def test_demo_glacier_id(self):
 
-class TestStartFromPrepro(unittest.TestCase):
+        cfg.initialize()
+        assert utils.demo_glacier_id('hef') == 'RGI60-11.00897'
+        assert utils.demo_glacier_id('HeF') == 'RGI60-11.00897'
+        assert utils.demo_glacier_id('HintereisFerner') == 'RGI60-11.00897'
+        assert utils.demo_glacier_id('Mer de Glace') == 'RGI60-11.03643'
+        assert utils.demo_glacier_id('RGI60-11.03643') == 'RGI60-11.03643'
+        assert utils.demo_glacier_id('Mer Glace') is None
+
+
+class TestStartFromTar(unittest.TestCase):
 
     def setUp(self):
         # test directory
-        self.testdir = os.path.join(get_test_dir(), 'tmp_workflow_tools')
-        self.dldir = os.path.join(get_test_dir(), 'dl_cache')
+        self.testdir = os.path.join(get_test_dir(), 'tmp_tar_tools')
 
         # Init
         cfg.initialize()
-        cfg.PATHS['dl_cache_dir'] = self.dldir
         cfg.set_intersects_db(utils.get_demo_file('rgi_intersect_oetztal.shp'))
 
         # Read in the RGI file
         rgi_file = utils.get_demo_file('rgi_oetztal.shp')
         self.rgidf = gpd.read_file(rgi_file)
-        self.rgidf['RGIId'] = [rid.replace('RGI50', 'RGI60')
-                               for rid in self.rgidf.RGIId]
         cfg.PARAMS['use_multiprocessing'] = False
         cfg.PATHS['dem_file'] = utils.get_demo_file('srtm_oetztal.tif')
         cfg.PATHS['working_dir'] = self.testdir
@@ -328,11 +340,9 @@ class TestStartFromPrepro(unittest.TestCase):
 
     def rm_dir(self):
         shutil.rmtree(self.testdir)
-        shutil.rmtree(self.dldir)
 
     def clean_dir(self):
         utils.mkdir(self.testdir, reset=True)
-        utils.mkdir(self.dldir, reset=True)
 
     def test_to_and_from_tar(self):
 
@@ -402,13 +412,47 @@ class TestStartFromPrepro(unittest.TestCase):
             assert new_gdir.rgi_area_km2 == gdir.rgi_area_km2
             assert new_base_dir in new_gdir.base_dir
 
+
+class TestStartFromOnlinePrepro(unittest.TestCase):
+
+    def setUp(self):
+        # test directory
+        self.testdir = os.path.join(get_test_dir(), 'tmp_prepro_tools')
+        self.dldir = os.path.join(get_test_dir(), 'dl_cache')
+
+        # Init
+        cfg.initialize()
+        cfg.PATHS['dl_cache_dir'] = self.dldir
+
+        # Read in the RGI file
+        rgi_file = utils.get_demo_file('rgi_oetztal.shp')
+        self.rgidf = gpd.read_file(rgi_file)
+        self.rgidf['RGIId'] = [rid.replace('RGI50', 'RGI60')
+                               for rid in self.rgidf.RGIId]
+        cfg.PARAMS['use_multiprocessing'] = False
+        cfg.PATHS['working_dir'] = self.testdir
+        self.clean_dir()
+
+    def tearDown(self):
+        self.rm_dir()
+
+    def rm_dir(self):
+        shutil.rmtree(self.testdir)
+        shutil.rmtree(self.dldir)
+
+    def clean_dir(self):
+        utils.mkdir(self.testdir, reset=True)
+        utils.mkdir(self.dldir, reset=True)
+
+    @mock.patch('oggm.utils._downloads.GDIR_URL', TEST_GDIR_URL)
     def test_start_from_level_1(self):
 
         # Go - initialize working directories
         gdirs = workflow.init_glacier_regions(self.rgidf.iloc[:2],
                                               from_prepro_level=1,
                                               prepro_rgi_version='61',
-                                              prepro_border=160)
+                                              prepro_border=20,
+                                              use_demo_glaciers=False)
         n_intersects = 0
         for gdir in gdirs:
             assert gdir.has_file('dem')
@@ -416,13 +460,15 @@ class TestStartFromPrepro(unittest.TestCase):
         assert n_intersects > 0
         workflow.execute_entity_task(tasks.glacier_masks, gdirs)
 
+    @mock.patch('oggm.utils._downloads.GDIR_URL', TEST_GDIR_URL)
     def test_start_from_level_1_str(self):
 
         # Go - initialize working directories
         entitites = self.rgidf.iloc[:2].RGIId
-        cfg.PARAMS['border'] = 10
+        cfg.PARAMS['border'] = 20
         gdirs = workflow.init_glacier_regions(entitites,
-                                              from_prepro_level=1)
+                                              from_prepro_level=1,
+                                              use_demo_glaciers=False)
         n_intersects = 0
         for gdir in gdirs:
             assert gdir.has_file('dem')
@@ -431,9 +477,10 @@ class TestStartFromPrepro(unittest.TestCase):
         workflow.execute_entity_task(tasks.glacier_masks, gdirs)
 
         # One string
-        cfg.PARAMS['border'] = 10
+        cfg.PARAMS['border'] = 20
         gdirs = workflow.init_glacier_regions('RGI60-11.00897',
-                                              from_prepro_level=1)
+                                              from_prepro_level=1,
+                                              use_demo_glaciers=False)
         n_intersects = 0
         for gdir in gdirs:
             assert gdir.has_file('dem')
@@ -441,28 +488,32 @@ class TestStartFromPrepro(unittest.TestCase):
         assert n_intersects > 0
         workflow.execute_entity_task(tasks.glacier_masks, gdirs)
 
+    @mock.patch('oggm.utils._downloads.GDIR_URL', TEST_GDIR_URL)
     def test_start_from_level_2(self):
 
         # Go - initialize working directories
         gdirs = workflow.init_glacier_regions(self.rgidf.iloc[:2],
                                               from_prepro_level=2,
                                               prepro_rgi_version='61',
-                                              prepro_border=160)
+                                              prepro_border=20,
+                                              use_demo_glaciers=False)
         n_intersects = 0
         for gdir in gdirs:
             assert gdir.has_file('dem')
-            assert gdir.has_file('gridded_data')
+            assert gdir.has_file('climate_monthly')
             n_intersects += gdir.has_file('intersects')
         assert n_intersects > 0
-        workflow.execute_entity_task(tasks.compute_centerlines, gdirs)
+        workflow.execute_entity_task(tasks.glacier_masks, gdirs)
 
+    @mock.patch('oggm.utils._downloads.GDIR_URL', TEST_GDIR_URL)
     def test_start_from_level_3(self):
 
         # Go - initialize working directories
         gdirs = workflow.init_glacier_regions(self.rgidf.iloc[:2],
                                               from_prepro_level=3,
                                               prepro_rgi_version='61',
-                                              prepro_border=160)
+                                              prepro_border=20,
+                                              use_demo_glaciers=False)
         n_intersects = 0
         for gdir in gdirs:
             assert gdir.has_file('dem')
@@ -470,14 +521,6 @@ class TestStartFromPrepro(unittest.TestCase):
             assert gdir.has_file('climate_monthly')
             n_intersects += gdir.has_file('intersects')
         assert n_intersects > 0
-
-    def test_start_from_level_4(self):
-
-        # Go - initialize working directories
-        gdirs = workflow.init_glacier_regions(self.rgidf.iloc[:2],
-                                              from_prepro_level=4,
-                                              prepro_rgi_version='61',
-                                              prepro_border=160)
 
         df = utils.compile_glacier_statistics(gdirs)
         assert 'dem_med_elev' in df
@@ -487,6 +530,55 @@ class TestStartFromPrepro(unittest.TestCase):
                                                                          2000])
         assert 'tstar_avg_temp_mean_elev' in df
         assert '1905-1935_avg_temp_mean_elev' in df
+
+        workflow.execute_entity_task(tasks.init_present_time_glacier, gdirs)
+
+    @mock.patch('oggm.utils._downloads.GDIR_URL', TEST_GDIR_URL)
+    def test_start_from_level_4(self):
+
+        # Go - initialize working directories
+        gdirs = workflow.init_glacier_regions(self.rgidf.iloc[:2],
+                                              from_prepro_level=4,
+                                              prepro_rgi_version='61',
+                                              prepro_border=20,
+                                              use_demo_glaciers=False)
+        workflow.execute_entity_task(tasks.run_random_climate, gdirs,
+                                     nyears=10)
+
+    def test_start_from_demo(self):
+
+        # Go - initialize working directories
+        gdirs = workflow.init_glacier_regions(['kwf', 'hef'],
+                                              from_prepro_level=4,
+                                              prepro_rgi_version='61',
+                                              prepro_border=10)
+        workflow.execute_entity_task(tasks.run_random_climate, gdirs,
+                                     nyears=10)
+
+    def test_corrupted_file(self):
+
+        # Go - initialize working directories
+        gdirs = workflow.init_glacier_regions(['hef'],
+                                              from_prepro_level=4,
+                                              prepro_rgi_version='61',
+                                              prepro_border=10)
+
+        cfile = utils.get_prepro_gdir('61', 'RGI60-11.00787', 10, 4,
+                                      demo_url=True)
+        assert 'cluster.klima.uni-bremen.de/~fmaussion/' in cfile
+
+        # Replace with a dummy file
+        os.remove(cfile)
+        with open(cfile, 'w') as f:
+            f.write('ups')
+
+        # This should retrigger a download and just work
+        gdirs = workflow.init_glacier_regions(['hef'],
+                                              from_prepro_level=4,
+                                              prepro_rgi_version='61',
+                                              prepro_border=10)
+        workflow.execute_entity_task(tasks.run_random_climate, gdirs,
+                                     nyears=10)
 
 
 class TestPreproCLI(unittest.TestCase):
@@ -537,6 +629,22 @@ class TestPreproCLI(unittest.TestCase):
 
         with pytest.raises(InvalidParamsError):
             prepro_levels.parse_args([])
+
+        kwargs = prepro_levels.parse_args(['--demo',
+                                           '--map-border', '160',
+                                           '--output', 'local/out',
+                                           '--working-dir', 'local/work',
+                                           ])
+
+        assert 'working_dir' in kwargs
+        assert 'output_folder' in kwargs
+        assert 'local' in kwargs['working_dir']
+        assert 'local' in kwargs['output_folder']
+        assert kwargs['rgi_version'] is None
+        assert kwargs['rgi_reg'] == '00'
+        assert kwargs['border'] == 160
+        assert not kwargs['is_test']
+        assert kwargs['demo']
 
         kwargs = prepro_levels.parse_args(['--rgi-reg', '1',
                                            '--map-border', '160',
@@ -617,6 +725,12 @@ class TestPreproCLI(unittest.TestCase):
         inter = gpd.read_file(utils.get_demo_file('rgi_intersect_oetztal.shp'))
         rgidf = gpd.read_file(utils.get_demo_file('rgi_oetztal.shp'))
 
+        rgidf['RGIId'] = [rid.replace('RGI50', 'RGI60') for rid in rgidf.RGIId]
+        inter['RGIId_1'] = [rid.replace('RGI50', 'RGI60')
+                            for rid in inter.RGIId_1]
+        inter['RGIId_2'] = [rid.replace('RGI50', 'RGI60')
+                            for rid in inter.RGIId_2]
+
         cru_file = utils.get_demo_file('cru_ts3.23.1901.2014.tmp.dat.nc')
 
         wdir = os.path.join(self.testdir, 'wd')
@@ -633,9 +747,13 @@ class TestPreproCLI(unittest.TestCase):
                                       'glacier_statistics_11.csv'))
         assert 'dem_source' in df
 
-        df = pd.read_csv(os.path.join(odir, 'RGI61', 'b_020', 'L4', 'summary',
+        df = pd.read_csv(os.path.join(odir, 'RGI61', 'b_020', 'L3', 'summary',
                                       'glacier_statistics_11.csv'))
         assert 'inv_volume_km3' in df
+
+        df = pd.read_csv(os.path.join(odir, 'RGI61', 'b_020', 'L3', 'summary',
+                                      'climate_statistics_11.csv'))
+        assert '1945-1975_avg_prcp' in df
 
         assert os.path.isfile(os.path.join(odir, 'RGI61', 'b_020',
                                            'package_versions.txt'))
@@ -643,22 +761,202 @@ class TestPreproCLI(unittest.TestCase):
         assert os.path.isdir(os.path.join(odir, 'RGI61', 'b_020', 'L2'))
         assert os.path.isdir(os.path.join(odir, 'RGI61', 'b_020', 'L3'))
         assert os.path.isdir(os.path.join(odir, 'RGI61', 'b_020', 'L4'))
-        assert os.path.isdir(os.path.join(odir, 'RGI61', 'b_020', 'L5'))
+        assert not os.path.isdir(os.path.join(odir, 'RGI61', 'b_020', 'L5'))
 
-        # See if we can start from lev 5
+        # See if we can start from all levs
+        from oggm import tasks
+        from oggm.core.flowline import FlowlineModel
+        cfg.PARAMS['continue_on_error'] = False
         rid = df.rgi_id.iloc[0]
         entity = rgidf.loc[rgidf.RGIId == rid].iloc[0]
 
-        tarf = os.path.join(odir, 'RGI61', 'b_020', 'L5',
+        # L1
+        tarf = os.path.join(odir, 'RGI61', 'b_020', 'L1',
                             rid[:8], rid[:11], rid + '.tar.gz')
-        assert os.path.isfile(tarf)
+        assert not os.path.isfile(tarf)
         gdir = oggm.GlacierDirectory(entity, from_tar=tarf)
+        tasks.glacier_masks(gdir)
+        with pytest.raises(FileNotFoundError):
+            tasks.init_present_time_glacier(gdir)
 
-        from oggm import tasks
-        cfg.PARAMS['contine_on_error'] = False
+        # L2
+        tarf = os.path.join(odir, 'RGI61', 'b_020', 'L2',
+                            rid[:8], rid[:11], rid + '.tar.gz')
+        assert not os.path.isfile(tarf)
+        gdir = oggm.GlacierDirectory(entity, from_tar=tarf)
+        tasks.glacier_masks(gdir)
+        with pytest.raises(FileNotFoundError):
+            tasks.init_present_time_glacier(gdir)
+
+        # L3
+        tarf = os.path.join(odir, 'RGI61', 'b_020', 'L3',
+                            rid[:8], rid[:11], rid + '.tar.gz')
+        assert not os.path.isfile(tarf)
+        gdir = oggm.GlacierDirectory(entity, from_tar=tarf)
+        tasks.init_present_time_glacier(gdir)
         model = tasks.run_random_climate(gdir, nyears=10)
-        from oggm.core.flowline import FlowlineModel
         assert isinstance(model, FlowlineModel)
+
+        # L4
+        tarf = os.path.join(odir, 'RGI61', 'b_020', 'L4',
+                            rid[:8], rid[:11], rid + '.tar.gz')
+        assert not os.path.isfile(tarf)
+        gdir = oggm.GlacierDirectory(entity, from_tar=tarf)
+        model = tasks.run_random_climate(gdir, nyears=10)
+        assert isinstance(model, FlowlineModel)
+        with pytest.raises(FileNotFoundError):
+            tasks.init_present_time_glacier(gdir)
+
+
+class TestBenchmarkCLI(unittest.TestCase):
+
+    def setUp(self):
+        self.testdir = os.path.join(get_test_dir(), 'tmp_benchmarks')
+        self.reset_dir()
+
+    def tearDown(self):
+        if os.path.exists(self.testdir):
+            shutil.rmtree(self.testdir)
+
+    def reset_dir(self):
+        utils.mkdir(self.testdir, reset=True)
+
+    def test_parse_args(self):
+
+        from oggm.cli import benchmark
+
+        kwargs = benchmark.parse_args(['--rgi-reg', '1',
+                                       '--map-border', '160'])
+
+        assert 'working_dir' in kwargs
+        assert 'output_folder' in kwargs
+        assert kwargs['rgi_version'] is None
+        assert kwargs['rgi_reg'] == '01'
+        assert kwargs['border'] == 160
+
+        with pytest.raises(InvalidParamsError):
+            benchmark.parse_args([])
+
+        with pytest.raises(InvalidParamsError):
+            benchmark.parse_args(['--rgi-reg', '1'])
+
+        with pytest.raises(InvalidParamsError):
+            benchmark.parse_args(['--map-border', '160'])
+
+        with TempEnvironmentVariable(OGGM_RGI_REG='1', OGGM_MAP_BORDER='160'):
+
+            kwargs = benchmark.parse_args([])
+
+            assert 'working_dir' in kwargs
+            assert 'output_folder' in kwargs
+            assert kwargs['rgi_version'] is None
+            assert kwargs['rgi_reg'] == '01'
+            assert kwargs['border'] == 160
+            assert not kwargs['is_test']
+
+        with pytest.raises(InvalidParamsError):
+            benchmark.parse_args([])
+
+        kwargs = benchmark.parse_args(['--rgi-reg', '1',
+                                       '--map-border', '160',
+                                       '--output', 'local/out',
+                                       '--working-dir', 'local/work',
+                                       ])
+
+        assert 'working_dir' in kwargs
+        assert 'output_folder' in kwargs
+        assert 'local' in kwargs['working_dir']
+        assert 'local' in kwargs['output_folder']
+        assert kwargs['rgi_version'] is None
+        assert kwargs['rgi_reg'] == '01'
+        assert kwargs['border'] == 160
+        assert not kwargs['is_test']
+
+        kwargs = benchmark.parse_args(['--rgi-reg', '1',
+                                       '--map-border', '160',
+                                       '--output', 'local/out',
+                                       '--working-dir', 'local/work',
+                                       '--test',
+                                       ])
+
+        assert 'local' in kwargs['working_dir']
+        assert 'local' in kwargs['output_folder']
+        assert kwargs['rgi_version'] is None
+        assert kwargs['rgi_reg'] == '01'
+        assert kwargs['border'] == 160
+        assert kwargs['is_test']
+
+        kwargs = benchmark.parse_args(['--rgi-reg', '1',
+                                       '--map-border', '160',
+                                       '--output', '/local/out',
+                                       '--working-dir', '/local/work',
+                                       ])
+
+        assert 'tests' not in kwargs['working_dir']
+        assert 'tests' not in kwargs['output_folder']
+        assert 'local' in kwargs['working_dir']
+        assert 'local' in kwargs['output_folder']
+        assert kwargs['rgi_version'] is None
+        assert kwargs['rgi_reg'] == '01'
+        assert kwargs['border'] == 160
+
+        with TempEnvironmentVariable(OGGM_RGI_REG='12',
+                                     OGGM_MAP_BORDER='120',
+                                     OGGM_OUTDIR='local/out',
+                                     OGGM_WORKDIR='local/work',
+                                     ):
+
+            kwargs = benchmark.parse_args([])
+
+            assert 'local' in kwargs['working_dir']
+            assert 'local' in kwargs['output_folder']
+            assert kwargs['rgi_version'] is None
+            assert kwargs['rgi_reg'] == '12'
+            assert kwargs['border'] == 120
+
+        with TempEnvironmentVariable(OGGM_RGI_REG='12',
+                                     OGGM_MAP_BORDER='120',
+                                     OGGM_OUTDIR='/local/out',
+                                     OGGM_WORKDIR='/local/work',
+                                     ):
+
+            kwargs = benchmark.parse_args([])
+
+            assert 'local' in kwargs['working_dir']
+            assert 'local' in kwargs['output_folder']
+            assert kwargs['rgi_version'] is None
+            assert kwargs['rgi_reg'] == '12'
+            assert kwargs['border'] == 120
+
+    def test_full_run(self):
+
+        from oggm.cli.benchmark import run_benchmark
+
+        # Read in the RGI file
+        inter = gpd.read_file(utils.get_demo_file('rgi_intersect_oetztal.shp'))
+        rgidf = gpd.read_file(utils.get_demo_file('rgi_oetztal.shp'))
+
+        rgidf['RGIId'] = [rid.replace('RGI50', 'RGI60') for rid in rgidf.RGIId]
+        inter['RGIId_1'] = [rid.replace('RGI50', 'RGI60')
+                            for rid in inter.RGIId_1]
+        inter['RGIId_2'] = [rid.replace('RGI50', 'RGI60')
+                            for rid in inter.RGIId_2]
+
+        cru_file = utils.get_demo_file('cru_ts3.23.1901.2014.tmp.dat.nc')
+
+        wdir = os.path.join(self.testdir, 'wd')
+        utils.mkdir(wdir)
+        odir = os.path.join(self.testdir, 'my_levs')
+        topof = utils.get_demo_file('srtm_oetztal.tif')
+        run_benchmark(rgi_version=None, rgi_reg='11', border=80,
+                      output_folder=odir, working_dir=wdir, is_test=True,
+                      test_rgidf=rgidf, test_intersects_file=inter,
+                      test_topofile=topof,
+                      test_crudir=os.path.dirname(cru_file))
+
+        df = pd.read_csv(os.path.join(odir, 'benchmarks_b080.csv'),
+                         index_col=0)
+        assert len(df) > 15
 
 
 def touch(path):
@@ -725,6 +1023,55 @@ class TestFakeDownloads(unittest.TestCase):
         utils.mkdir(cfg.PATHS['rgi_dir'])
         utils.mkdir(cfg.PATHS['cru_dir'])
 
+    def prepare_verify_test(self, valid_size=True, valid_crc32=True):
+        self.reset_dir()
+        cfg.PARAMS['dl_verify'] = True
+
+        tgt_path = os.path.join(cfg.PATHS['dl_cache_dir'], 'test.com',
+                                'test.txt')
+
+        file_size = 1024
+        file_data = os.urandom(file_size)
+        file_sha256 = hashlib.sha256()
+        file_sha256.update(file_data)
+
+        utils.mkdir(os.path.dirname(tgt_path))
+        with open(tgt_path, 'wb') as f:
+            f.write(file_data)
+
+        if not valid_size:
+            file_size += 1
+        if not valid_crc32:
+            file_sha256.update(b'1234ABCD')
+
+        file_sha256 = file_sha256.digest()
+
+        data = utils.get_dl_verify_data()
+        data['test.com/test.txt'] = (file_size, file_sha256)
+
+        return 'https://test.com/test.txt'
+
+    def test_dl_verify(self):
+        def fake_down(dl_func, cache_path):
+            assert False
+
+        with FakeDownloadManager('_call_dl_func', fake_down):
+            url = self.prepare_verify_test(True, True)
+            utils.oggm_urlretrieve(url)
+
+            url = self.prepare_verify_test(False, True)
+            with self.assertRaises(DownloadVerificationFailedException):
+                utils.oggm_urlretrieve(url)
+
+            url = self.prepare_verify_test(True, False)
+            with self.assertRaises(DownloadVerificationFailedException):
+                utils.oggm_urlretrieve(url)
+
+            url = self.prepare_verify_test(False, False)
+            with self.assertRaises(DownloadVerificationFailedException):
+                utils.oggm_urlretrieve(url)
+
+
     def test_github_no_internet(self):
         self.reset_dir()
         cache_dir = cfg.CACHE_DIR
@@ -754,7 +1101,7 @@ class TestFakeDownloads(unittest.TestCase):
                          fakefile='test.txt')
         rgi_f = make_fake_zipdir(rgi_dir, fakefile='000_rgi50_manifest.txt')
 
-        def down_check(url, cache_name=None, reset=False):
+        def down_check(url, cache_name=None, reset=False, auth=None):
             expected = 'http://www.glims.org/RGI/rgi50_files/rgi50.zip'
             self.assertEqual(url, expected)
             return rgi_f
@@ -773,7 +1120,7 @@ class TestFakeDownloads(unittest.TestCase):
                          fakefile='01_rgi60_Region.shp')
         rgi_f = make_fake_zipdir(rgi_dir, fakefile='000_rgi60_manifest.txt')
 
-        def down_check(url, cache_name=None, reset=False):
+        def down_check(url, cache_name=None, reset=False, auth=None):
             expected = 'http://www.glims.org/RGI/rgi60_files/00_rgi60.zip'
             self.assertEqual(url, expected)
             return rgi_f
@@ -805,7 +1152,7 @@ class TestFakeDownloads(unittest.TestCase):
                          fakefile='intersects_rgi50_AllRegs.shp')
         rgi_f = make_fake_zipdir(rgi_dir)
 
-        def down_check(url, cache_name=None, reset=False):
+        def down_check(url, cache_name=None, reset=False, auth=None):
             expected = ('https://cluster.klima.uni-bremen.de/data/rgi/' +
                         'RGI_V50_Intersects.zip')
             self.assertEqual(url, expected)
@@ -827,7 +1174,7 @@ class TestFakeDownloads(unittest.TestCase):
                          fakefile='Intersects_OGGM_Manifest.txt')
         rgi_f = make_fake_zipdir(rgi_dir)
 
-        def down_check(url, cache_name=None, reset=False):
+        def down_check(url, cache_name=None, reset=False, auth=None):
             expected = ('https://cluster.klima.uni-bremen.de/data/rgi/' +
                         'RGI_V60_Intersects.zip')
             self.assertEqual(url, expected)
@@ -847,7 +1194,7 @@ class TestFakeDownloads(unittest.TestCase):
         with gzip.open(cf, 'wb') as gz:
             gz.write(b'dummy')
 
-        def down_check(url, cache_name=None, reset=False):
+        def down_check(url, cache_name=None, reset=False, auth=None):
             expected = ('https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.01/'
                         'cruts.1709081022.v4.01/tmp/'
                         'cru_ts4.01.1901.2016.tmp.dat.nc.gz')
@@ -866,7 +1213,7 @@ class TestFakeDownloads(unittest.TestCase):
         with bz2.open(cf, 'wb') as gz:
             gz.write(b'dummy')
 
-        def down_check(url, cache_name=None, reset=False):
+        def down_check(url, cache_name=None, reset=False, auth=None):
             expected = ('http://www.zamg.ac.at/histalp/download/grid5m/'
                         'HISTALP_temperature_1780-2014.nc.bz2')
             self.assertEqual(url, expected)
@@ -883,7 +1230,7 @@ class TestFakeDownloads(unittest.TestCase):
         tf = make_fake_zipdir(os.path.join(self.dldir, 'srtm_39_03'),
                               fakefile='srtm_39_03.tif')
 
-        def down_check(url, cache_name=None, reset=False):
+        def down_check(url, cache_name=None, reset=False, auth=None):
             expected = ('http://srtm.csi.cgiar.org/wp-content/uploads/files/'
                         'srtm_5x5/TIFF/srtm_39_03.zip')
             self.assertEqual(url, expected)
@@ -897,7 +1244,7 @@ class TestFakeDownloads(unittest.TestCase):
 
     def test_dem3(self):
 
-        def down_check(url, cache_name=None, reset=False):
+        def down_check(url, cache_name=None, reset=False, auth=None):
             expected = 'http://viewfinderpanoramas.org/dem3/T10.zip'
             self.assertEqual(url, expected)
             return self.dem3_testfile
@@ -910,7 +1257,7 @@ class TestFakeDownloads(unittest.TestCase):
 
     def test_ramp(self):
 
-        def down_check(url):
+        def down_check(url, cache_name=None, reset=False, auth=None):
             expected = 'AntarcticDEM_wgs84.tif'
             self.assertEqual(url, expected)
             return 'yo'
@@ -926,7 +1273,7 @@ class TestFakeDownloads(unittest.TestCase):
 
     def test_gimp(self):
 
-        def down_check(url):
+        def down_check(url, cache_name=None, reset=False, auth=None):
             expected = 'gimpdem_90m_v01.1.tif'
             self.assertEqual(url, expected)
             return 'yo'
@@ -945,7 +1292,7 @@ class TestFakeDownloads(unittest.TestCase):
         tf = make_fake_zipdir(os.path.join(self.dldir, 'ASTGTM2_S88W121'),
                               fakefile='ASTGTM2_S88W121_dem.tif')
 
-        def down_check(url):
+        def down_check(url, cache_name=None, reset=False, auth=None):
             expected = 'ASTGTM_V2/UNIT_S90W125/ASTGTM2_S88W121.zip'
             self.assertEqual(url, expected)
             return tf
@@ -956,6 +1303,30 @@ class TestFakeDownloads(unittest.TestCase):
 
         assert os.path.exists(of[0])
         assert source == 'ASTER'
+
+    def test_cmip5(self):
+
+        fn = 'pr_mon_NorESM1-M_historicalNat_r1i1p1_g025.nc'
+
+        def down_check(url, cache_name=None, reset=False, auth=None):
+            expected = ('https://cluster.klima.uni-bremen.de/~nicolas/cmip5-ng'
+                        '/pr/pr_mon_NorESM1-M_historicalNat_r1i1p1_g025.nc')
+            self.assertEqual(url, expected)
+            return True
+
+        with FakeDownloadManager('file_downloader', down_check):
+            assert utils.get_cmip5_file(fn)
+
+        fn = 'tas_mon_CCSM4_historicalNat_r1i1p1_g025.nc'
+
+        def down_check(url, cache_name=None, reset=False, auth=None):
+            expected = ('https://cluster.klima.uni-bremen.de/~nicolas/cmip5-ng'
+                        '/tas/tas_mon_CCSM4_historicalNat_r1i1p1_g025.nc')
+            self.assertEqual(url, expected)
+            return True
+
+        with FakeDownloadManager('file_downloader', down_check):
+            assert utils.get_cmip5_file(fn)
 
 
 class TestDataFiles(unittest.TestCase):
@@ -1351,6 +1722,12 @@ class TestDataFiles(unittest.TestCase):
         self.assertTrue(fp is None)
 
     @pytest.mark.download
+    def test_download_cmip5(self):
+        fn = 'pr_mon_NorESM1-M_historicalNat_r1i1p1_g025.nc'
+        fp = utils.get_cmip5_file(fn)
+        self.assertTrue(os.path.isfile(fp))
+
+    @pytest.mark.download
     def test_auto_topo(self):
         # Test for combine
         fdem, src = utils.get_topo_file([6, 14], [41, 41])
@@ -1364,6 +1741,28 @@ class TestDataFiles(unittest.TestCase):
         self.assertEqual(len(fdem), 3)
         for fp in fdem:
             self.assertTrue(os.path.exists(fp))
+
+    @pytest.mark.download
+    def test_from_prepro(self):
+
+        # Read in the RGI file
+        rgi_file = utils.get_demo_file('rgi_oetztal.shp')
+        rgidf = gpd.read_file(rgi_file)
+        rgidf['RGIId'] = [rid.replace('RGI50', 'RGI60')
+                          for rid in rgidf.RGIId]
+
+        # Go - initialize working directories
+        gdirs = workflow.init_glacier_regions(rgidf.iloc[:2],
+                                              from_prepro_level=1,
+                                              prepro_rgi_version='61',
+                                              prepro_border=10,
+                                              use_demo_glaciers=False)
+        n_intersects = 0
+        for gdir in gdirs:
+            assert gdir.has_file('dem')
+            n_intersects += gdir.has_file('intersects')
+        assert n_intersects > 0
+        workflow.execute_entity_task(tasks.glacier_masks, gdirs)
 
 
 class TestSkyIsFalling(unittest.TestCase):

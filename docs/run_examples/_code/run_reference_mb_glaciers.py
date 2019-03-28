@@ -38,13 +38,10 @@ cfg.PARAMS['run_mb_calibration'] = True
 # We are using which baseline data?
 cfg.PARAMS['baseline_climate'] = baseline
 
-# No need for intersects since this has an effect on the inversion only
-cfg.PARAMS['use_intersects'] = False
-
 # Use multiprocessing?
 cfg.PARAMS['use_multiprocessing'] = True
 
-# Set to True for operational runs
+# Set to True for operational runs - here we want all glaciers to run
 cfg.PARAMS['continue_on_error'] = False
 
 if baseline == 'HISTALP':
@@ -133,11 +130,13 @@ for gd in gdirs:
 
     mb_mod = MultipleFlowlineMassBalance(gd,
                                          mb_model_class=ConstantMassBalance,
+                                         use_inversion_flowlines=True,
                                          bias=0)  # bias=0 because of calib!
     mb = mb_mod.get_specific_mb()
     np.testing.assert_allclose(mb, 0, atol=5)  # atol for numerical errors
 
-    mb_mod = MultipleFlowlineMassBalance(gd, mb_model_class=PastMassBalance)
+    mb_mod = MultipleFlowlineMassBalance(gd, mb_model_class=PastMassBalance,
+                                         use_inversion_flowlines=True)
 
     refmb = gd.get_ref_mb_data().copy()
     refmb['OGGM'] = mb_mod.get_specific_mb(year=refmb.index)
