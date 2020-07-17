@@ -9,13 +9,23 @@ import sys
 import glob
 import json
 from collections import OrderedDict
+from multiprocessing import Manager
 from distutils.util import strtobool
 
 import numpy as np
 import pandas as pd
-import geopandas as gpd
 from scipy.signal import gaussian
 from configobj import ConfigObj, ConfigObjError
+try:
+    import geopandas as gpd
+except ImportError:
+    pass
+try:
+    import salem
+except ImportError:
+    pass
+
+from oggm.exceptions import InvalidParamsError
 
 # Local logger
 log = logging.getLogger(__name__)
@@ -30,6 +40,11 @@ CONFIG_FILE = os.path.join(os.path.expanduser('~'), '.oggm_config')
 # config was changed, indicates that multiprocessing needs a reset
 CONFIG_MODIFIED = False
 
+# Share state accross processes
+DL_VERIFIED = Manager().dict()
+
+# Machine epsilon
+FLOAT_EPS = np.finfo(float).eps
 
 class DocumentedDict(dict):
     """Quick "magic" to document the BASENAMES entries."""
@@ -76,16 +91,74 @@ class PathOrderedDict(ResettingOrderedDict):
 
     def __setitem__(self, key, value):
         # Overrides the original dic to expand the path
-        ResettingOrderedDict.__setitem__(self, key, os.path.expanduser(value))
+        try:
+            value = os.path.expanduser(value)
+        except AttributeError:
+            raise InvalidParamsError('The value you are trying to set does '
+                                     'not seem to be a valid path: '
+                                     '{}'.format(value))
+
+        ResettingOrderedDict.__setitem__(self, key, value)
+
+
+class ParamsLoggingDict(ResettingOrderedDict):
+    """Quick "magic" to log the parameter changes by the user."""
+
+    do_log = False
+
+    def __setitem__(self, key, value):
+        # Overrides the original dic to log the change
+        if self.do_log:
+            self._log_param_change(key, value)
+        ResettingOrderedDict.__setitem__(self, key, value)
+
+    def _log_param_change(self, key, value):
+
+        prev = self.get(key)
+        if prev is None:
+            if key in ['baseline_y0', 'baseline_y1']:
+                raise InvalidParamsError('The `baseline_y0` and `baseline_y1` '
+                                         'parameters have been removed. '
+                                         'You now have to set them explicitly '
+                                         'in your call to '
+                                         '`process_climate_data`.')
+
+            log.warning('WARNING: adding an unknown parameter '
+                        '`{}`:`{}` to PARAMS.'.format(key, value))
+            return
+
+        if prev == value:
+            return
+
+        if key == 'use_multiprocessing':
+            msg = 'ON' if value else 'OFF'
+            log.workflow('Multiprocessing switched {} '.format(msg) +
+                         'after user settings.')
+            return
+
+        if key == 'mp_processes':
+            if value == -1:
+                import multiprocessing
+                value = multiprocessing.cpu_count()
+                log.workflow('Multiprocessing: using all available '
+                             'processors (N={})'.format(value))
+            else:
+                log.workflow('Multiprocessing: using the requested number of '
+                             'processors (N={})'.format(value))
+            return
+
+        log.workflow("PARAMS['{}'] changed from `{}` to `{}`.".format(key,
+                                                                      prev,
+                                                                      value))
 
 
 # Globals
 IS_INITIALIZED = False
-PARAMS = ResettingOrderedDict()
+PARAMS = ParamsLoggingDict()
 PATHS = PathOrderedDict()
 BASENAMES = DocumentedDict()
 LRUHANDLERS = ResettingOrderedDict()
-DEMO_GLACIERS = None
+DATA = ResettingOrderedDict()
 
 # Constants
 SEC_IN_YEAR = 365*24*3600
@@ -94,7 +167,7 @@ SEC_IN_HOUR = 3600
 SEC_IN_MONTH = 2628000
 DAYS_IN_MONTH = np.array([31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31])
 
-G = 9.81  # gravity
+G = 9.80665  # gravity
 
 GAUSSIAN_KERNEL = dict()
 for ks in [5, 7, 9]:
@@ -105,6 +178,11 @@ _doc = ('A geotiff file containing the DEM (reprojected into the local grid).'
         'This DEM is not smoothed or gap filles, and is the closest to the '
         'original DEM source.')
 BASENAMES['dem'] = ('dem.tif', _doc)
+
+_doc = ('A glacier mask geotiff file with the same extend and projection as '
+        'the `dem.tif`. This geotiff has value 1 at glaciated grid points and '
+        ' value 0 at unglaciated points.')
+BASENAMES['glacier_mask'] = ('glacier_mask.tif', _doc)
 
 _doc = ('The glacier outlines in the local map projection (Transverse '
         'Mercator).')
@@ -165,12 +243,15 @@ _doc = ('A "better" version of the Centerlines, now on a regular spacing '
         'They are now "1.5D" i.e., with a width.')
 BASENAMES['inversion_flowlines'] = ('inversion_flowlines.pkl', _doc)
 
-_doc = 'The monthly climate timeseries stored in a netCDF file.'
+_doc = 'The historical monthly climate timeseries stored in a netCDF file.'
+BASENAMES['climate_historical'] = ('climate_historical.nc', _doc)
+
+_doc = 'Deprecated: old name for `climate_historical`.'
 BASENAMES['climate_monthly'] = ('climate_monthly.nc', _doc)
 
-_doc = ('Some information (dictionary) about the climate data and the mass '
+_doc = ('Some information (dictionary) about the mass '
         'balance parameters for this glacier.')
-BASENAMES['climate_info'] = ('climate_info.pkl', _doc)
+BASENAMES['climate_info'] = ('climate_info.json', _doc)
 
 _doc = 'The monthly GCM climate timeseries stored in a netCDF file.'
 BASENAMES['gcm_data'] = ('gcm_data.nc', _doc)
@@ -202,8 +283,12 @@ _doc = ('A netcdf file containing the model diagnostics (volume, '
         'mass-balance, length...).')
 BASENAMES['model_diagnostics'] = ('model_diagnostics.nc', _doc)
 
-_doc = 'Calving output'
-BASENAMES['calving_output'] = ('calving_output.pkl', _doc)
+_doc = ("A dict containing the glacier's t*, bias, mu*. Analogous "
+        "to 'local_mustar.json', but for the volume/area scaling model.")
+BASENAMES['vascaling_mustar'] = ('vascaling_mustar.json', _doc)
+
+_doc = "A table containing the Huss&Farinotti 2012 squeezed flowlines."
+BASENAMES['elevation_band_flowline'] = ('elevation_band_flowline.csv', _doc)
 
 
 def set_logging_config(logging_level='INFO'):
@@ -222,7 +307,7 @@ def set_logging_config(logging_level='INFO'):
         but that OGGM is still working on this glacier.
     WORKFLOW
         Print only high level, workflow information (typically, one message
-        per task). Errors will still be printed, but warnings won't.
+        per task). Errors and warnings will still be printed.
     ERROR
         Print errors only, e.g. when a glacier cannot run properly.
     CRITICAL
@@ -237,15 +322,15 @@ def set_logging_config(logging_level='INFO'):
     """
 
     # Add a custom level - just for us
-    logging.addLevelName(35, 'WORKFLOW')
+    logging.addLevelName(25, 'WORKFLOW')
 
     def workflow(self, message, *args, **kws):
         """Standard log message with a custom level."""
-        if self.isEnabledFor(35):
+        if self.isEnabledFor(25):
             # Yes, logger takes its '*args' as 'args'.
-            self._log(35, message, args, **kws)
+            self._log(25, message, args, **kws)
 
-    logging.WORKFLOW = 35
+    logging.WORKFLOW = 25
     logging.Logger.workflow = workflow
 
     # Remove all handlers associated with the root logger object.
@@ -258,6 +343,7 @@ def set_logging_config(logging_level='INFO'):
     logging.getLogger("shapely").setLevel(logging.CRITICAL)
     logging.getLogger("rasterio").setLevel(logging.CRITICAL)
     logging.getLogger("matplotlib").setLevel(logging.CRITICAL)
+    logging.getLogger("numexpr").setLevel(logging.CRITICAL)
 
     # Basic config
     if logging_level is None:
@@ -268,11 +354,10 @@ def set_logging_config(logging_level='INFO'):
                         level=getattr(logging, logging_level))
 
 
-def initialize(file=None, logging_level='INFO'):
-    """Read the configuration file containing the run's parameters.
+def initialize_minimal(file=None, logging_level='INFO'):
+    """Same as initialise() but without requiring any download of data.
 
-    This should be the first call, before using any of the other OGGM modules
-    for most (all?) OGGM simulations.
+    This is useful for "flowline only" OGGM applications
 
     Parameters
     ----------
@@ -281,11 +366,9 @@ def initialize(file=None, logging_level='INFO'):
     logging_level : str
         set a logging level. See :func:`set_logging_config` for options.
     """
-
     global IS_INITIALIZED
     global PARAMS
     global PATHS
-    global DEMO_GLACIERS
 
     set_logging_config(logging_level=logging_level)
 
@@ -307,9 +390,57 @@ def initialize(file=None, logging_level='INFO'):
     PATHS['dem_file'] = cp['dem_file']
     PATHS['climate_file'] = cp['climate_file']
 
+    # Do not spam
+    PARAMS.do_log = False
+
     # Multiprocessing pool
-    PARAMS['use_multiprocessing'] = cp.as_bool('use_multiprocessing')
-    PARAMS['mp_processes'] = cp.as_int('mp_processes')
+    try:
+        use_mp = bool(int(os.environ['OGGM_USE_MULTIPROCESSING']))
+        msg = 'ON' if use_mp else 'OFF'
+        log.workflow('Multiprocessing switched {} '.format(msg) +
+                     'according to the ENV variable OGGM_USE_MULTIPROCESSING')
+    except KeyError:
+        use_mp = cp.as_bool('use_multiprocessing')
+        msg = 'ON' if use_mp else 'OFF'
+        log.workflow('Multiprocessing switched {} '.format(msg) +
+                     'according to the parameter file.')
+    PARAMS['use_multiprocessing'] = use_mp
+
+    # Spawn
+    try:
+        use_mp_spawn = bool(int(os.environ['OGGM_USE_MP_SPAWN']))
+        msg = 'ON' if use_mp_spawn else 'OFF'
+        log.workflow('MP spawn context switched {} '.format(msg) +
+                     'according to the ENV variable OGGM_USE_MP_SPAWN')
+    except KeyError:
+        use_mp_spawn = cp.as_bool('use_mp_spawn')
+    PARAMS['use_mp_spawn'] = use_mp_spawn
+
+    # Number of processes
+    mpp = cp.as_int('mp_processes')
+    if mpp == -1:
+        try:
+            mpp = int(os.environ['SLURM_JOB_CPUS_PER_NODE'])
+            log.workflow('Multiprocessing: using slurm allocated '
+                         'processors (N={})'.format(mpp))
+        except KeyError:
+            import multiprocessing
+            mpp = multiprocessing.cpu_count()
+            log.workflow('Multiprocessing: using all available '
+                         'processors (N={})'.format(mpp))
+    else:
+        log.workflow('Multiprocessing: using the requested number of '
+                     'processors (N={})'.format(mpp))
+    PARAMS['mp_processes'] = mpp
+
+    # Size of LRU cache
+    try:
+        lru_maxsize = int(os.environ['LRU_MAXSIZE'])
+        log.workflow('Size of LRU cache set to {} '.format(lru_maxsize) +
+                     'according to the ENV variable LRU_MAXSIZE')
+    except KeyError:
+        lru_maxsize = cp.as_int('lru_maxsize')
+    PARAMS['lru_maxsize'] = lru_maxsize
 
     # Some non-trivial params
     PARAMS['continue_on_error'] = cp.as_bool('continue_on_error')
@@ -317,6 +448,7 @@ def initialize(file=None, logging_level='INFO'):
     PARAMS['topo_interp'] = cp['topo_interp']
     PARAMS['use_intersects'] = cp.as_bool('use_intersects')
     PARAMS['use_compression'] = cp.as_bool('use_compression')
+    PARAMS['border'] = cp.as_int('border')
     PARAMS['mpi_recv_buf_size'] = cp.as_int('mpi_recv_buf_size')
     PARAMS['use_multiple_flowlines'] = cp.as_bool('use_multiple_flowlines')
     PARAMS['filter_min_slope'] = cp.as_bool('filter_min_slope')
@@ -331,13 +463,19 @@ def initialize(file=None, logging_level='INFO'):
     PARAMS['clip_mu_star'] = cp.as_bool('clip_mu_star')
     PARAMS['clip_tidewater_border'] = cp.as_bool('clip_tidewater_border')
     PARAMS['dl_verify'] = cp.as_bool('dl_verify')
+    PARAMS['calving_line_extension'] = cp.as_int('calving_line_extension')
+    k = 'use_kcalving_for_inversion'
+    PARAMS[k] = cp.as_bool(k)
+    PARAMS['use_kcalving_for_run'] = cp.as_bool('use_kcalving_for_run')
+    PARAMS['calving_use_limiter'] = cp.as_bool('calving_use_limiter')
+    k = 'error_when_glacier_reaches_boundaries'
+    PARAMS[k] = cp.as_bool(k)
 
     # Climate
     PARAMS['baseline_climate'] = cp['baseline_climate'].strip().upper()
-    PARAMS['baseline_y0'] = cp.as_int('baseline_y0')
-    PARAMS['baseline_y1'] = cp.as_int('baseline_y1')
     PARAMS['hydro_month_nh'] = cp.as_int('hydro_month_nh')
     PARAMS['hydro_month_sh'] = cp.as_int('hydro_month_sh')
+    PARAMS['climate_qc_months'] = cp.as_int('climate_qc_months')
     PARAMS['temp_use_local_gradient'] = cp.as_bool('temp_use_local_gradient')
     PARAMS['tstar_search_glacierwide'] = cp.as_bool('tstar_search_glacierwide')
 
@@ -346,6 +484,8 @@ def initialize(file=None, logging_level='INFO'):
     k = 'tstar_search_window'
     PARAMS[k] = [int(vk) for vk in cp.as_list(k)]
     PARAMS['use_bias_for_run'] = cp.as_bool('use_bias_for_run')
+    k = 'free_board_marine_terminating'
+    PARAMS[k] = [float(vk) for vk in cp.as_list(k)]
 
     # Inversion
     k = 'use_shape_factor_for_inversion'
@@ -355,53 +495,102 @@ def initialize(file=None, logging_level='INFO'):
     k = 'use_shape_factor_for_fluxbasedmodel'
     PARAMS[k] = cp[k]
 
-    # Make sure we have a proper cache dir
-    from oggm.utils import download_oggm_files, get_demo_file
-    download_oggm_files()
-
     # Delete non-floats
     ltr = ['working_dir', 'dem_file', 'climate_file', 'use_tar_shapefiles',
            'grid_dx_method', 'run_mb_calibration', 'compress_climate_netcdf',
-           'mp_processes', 'use_multiprocessing', 'baseline_y0', 'baseline_y1',
+           'mp_processes', 'use_multiprocessing', 'climate_qc_months',
            'temp_use_local_gradient', 'temp_local_gradient_bounds',
            'topo_interp', 'use_compression', 'bed_shape', 'continue_on_error',
-           'use_multiple_flowlines', 'tstar_search_glacierwide',
+           'use_multiple_flowlines', 'tstar_search_glacierwide', 'border',
            'mpi_recv_buf_size', 'hydro_month_nh', 'clip_mu_star',
            'tstar_search_window', 'use_bias_for_run', 'hydro_month_sh',
            'use_intersects', 'filter_min_slope', 'clip_tidewater_border',
            'auto_skip_task', 'correct_for_neg_flux', 'filter_for_neg_flux',
-           'rgi_version', 'dl_verify',
+           'rgi_version', 'dl_verify', 'use_mp_spawn', 'calving_use_limiter',
            'use_shape_factor_for_inversion', 'use_rgi_area',
-           'use_shape_factor_for_fluxbasedmodel', 'baseline_climate']
+           'use_shape_factor_for_fluxbasedmodel', 'baseline_climate',
+           'calving_line_extension', 'use_kcalving_for_run', 'lru_maxsize',
+           'free_board_marine_terminating', 'use_kcalving_for_inversion',
+           'error_when_glacier_reaches_boundaries']
     for k in ltr:
         cp.pop(k, None)
 
     # Other params are floats
     for k in cp:
         PARAMS[k] = cp.as_float(k)
-
-    # Read-in the reference t* data - maybe it will be used, maybe not
-    fns = ['ref_tstars_rgi5_cru4', 'ref_tstars_rgi6_cru4',
-           'ref_tstars_rgi5_histalp', 'ref_tstars_rgi6_histalp']
-    for fn in fns:
-        PARAMS[fn] = pd.read_csv(get_demo_file('oggm_' + fn + '.csv'))
-        fpath = get_demo_file('oggm_' + fn + '_calib_params.json')
-        with open(fpath, 'r') as fp:
-            mbpar = json.load(fp)
-        PARAMS[fn+'_calib_params'] = mbpar
+    PARAMS.do_log = True
 
     # Empty defaults
     set_intersects_db()
     IS_INITIALIZED = True
 
-    # Pre extract cru cl to avoid problems by multiproc
-    from oggm.utils import get_cru_cl_file
-    get_cru_cl_file()
+
+def initialize(file=None, logging_level='INFO'):
+    """Read the configuration file containing the run's parameters.
+
+    This should be the first call, before using any of the other OGGM modules
+    for most (all?) OGGM simulations.
+
+    Parameters
+    ----------
+    file : str
+        path to the configuration file (default: OGGM params.cfg)
+    logging_level : str
+        set a logging level. See :func:`set_logging_config` for options.
+    """
+    global PARAMS
+    global DATA
+
+    initialize_minimal(file=file, logging_level=logging_level)
+
+    # Do not spam
+    PARAMS.do_log = False
+
+    # Make sure we have a proper cache dir
+    from oggm.utils import download_oggm_files, get_demo_file
+    download_oggm_files()
+
+    # Read-in the reference t* data for all available models types (oggm, vas)
+    model_prefixes = ['oggm_', 'vas_']
+    for prefix in model_prefixes:
+        fns = ['ref_tstars_rgi5_cru4', 'ref_tstars_rgi6_cru4',
+               'ref_tstars_rgi5_histalp', 'ref_tstars_rgi6_histalp']
+        for fn in fns:
+            fpath = get_demo_file(prefix + fn + '.csv')
+            PARAMS[prefix + fn] = pd.read_csv(fpath)
+            fpath = get_demo_file(prefix + fn + '_calib_params.json')
+            with open(fpath, 'r') as fp:
+                mbpar = json.load(fp)
+            PARAMS[prefix + fn + '_calib_params'] = mbpar
 
     # Read in the demo glaciers
     file = os.path.join(os.path.abspath(os.path.dirname(__file__)),
                         'data', 'demo_glaciers.csv')
-    DEMO_GLACIERS = pd.read_csv(file, index_col=0)
+    DATA['demo_glaciers'] = pd.read_csv(file, index_col=0)
+
+    # Add other things
+    if 'dem_grids' not in DATA:
+        grids = {}
+        for grid_json in ['gimpdem_90m_v01.1.json',
+                          'arcticdem_mosaic_100m_v3.0.json',
+                          'Alaska_albers_V3.json',
+                          'AntarcticDEM_wgs84.json',
+                          'REMA_100m_dem.json']:
+            if grid_json not in grids:
+                fp = os.path.join(os.path.abspath(os.path.dirname(__file__)),
+                                  'data', grid_json)
+                try:
+                    grids[grid_json] = salem.Grid.from_json(fp)
+                except NameError:
+                    pass
+        DATA['dem_grids'] = grids
+
+    # Trigger a one time check of the hash file
+    from oggm.utils import get_dl_verify_data
+    get_dl_verify_data('dummy_section')
+
+    # OK
+    PARAMS.do_log = True
 
 
 def oggm_static_paths():
@@ -416,7 +605,6 @@ def oggm_static_paths():
         config['dl_cache_dir'] = os.path.join(dldir, 'download_cache')
         config['dl_cache_readonly'] = False
         config['tmp_dir'] = os.path.join(dldir, 'tmp')
-        config['cru_dir'] = os.path.join(dldir, 'cru')
         config['rgi_dir'] = os.path.join(dldir, 'rgi')
         config['test_dir'] = os.path.join(dldir, 'tests')
         config['has_internet'] = True
@@ -433,10 +621,10 @@ def oggm_static_paths():
 
     # Check that all keys are here
     for k in ['dl_cache_dir', 'dl_cache_readonly', 'tmp_dir',
-              'cru_dir', 'rgi_dir', 'test_dir', 'has_internet']:
+              'rgi_dir', 'test_dir', 'has_internet']:
         if k not in config:
-            raise RuntimeError('The oggm config file ({}) should have an '
-                               'entry for {}.'.format(CONFIG_FILE, k))
+            raise InvalidParamsError('The oggm config file ({}) should have '
+                                     'an entry for {}.'.format(CONFIG_FILE, k))
 
     # Override defaults with env variables if available
     if os.environ.get('OGGM_DOWNLOAD_CACHE_RO') is not None:
@@ -449,13 +637,7 @@ def oggm_static_paths():
         # On the cluster it might be useful to do it on a fast disc
         edir = os.path.abspath(os.environ.get('OGGM_EXTRACT_DIR'))
         config['tmp_dir'] = os.path.join(edir, 'tmp')
-        config['cru_dir'] = os.path.join(edir, 'cru')
         config['rgi_dir'] = os.path.join(edir, 'rgi')
-
-    if not config['dl_cache_dir']:
-        raise RuntimeError('At the very least, the "dl_cache_dir" entry '
-                           'should be provided in the oggm config file '
-                           '({})'.format(CONFIG_FILE, k))
 
     # Fill the PATH dict
     for k, v in config.iteritems():
@@ -464,8 +646,10 @@ def oggm_static_paths():
         PATHS[k] = os.path.abspath(os.path.expanduser(v))
 
     # Other
+    PARAMS.do_log = False
     PARAMS['has_internet'] = config.as_bool('has_internet')
     PARAMS['dl_cache_readonly'] = config.as_bool('dl_cache_readonly')
+    PARAMS.do_log = True
 
     # Create cache dir if possible
     if not os.path.exists(PATHS['dl_cache_dir']):
@@ -477,7 +661,7 @@ def oggm_static_paths():
 oggm_static_paths()
 
 
-def get_lru_handler(tmpdir=None, maxsize=100, ending='.tif'):
+def get_lru_handler(tmpdir=None, maxsize=None, ending='.tif'):
     """LRU handler for a given temporary directory (singleton).
 
     Parameters
@@ -498,18 +682,23 @@ def get_lru_handler(tmpdir=None, maxsize=100, ending='.tif'):
     if not os.path.exists(tmpdir):
         os.makedirs(tmpdir)
 
-    # one handler per directory and per size
+    # one handler per directory and file ending
     # (in practice not very useful, but a dict is easier to handle)
-    k = (tmpdir, maxsize)
+    k = (tmpdir, ending)
     if k in LRUHANDLERS:
         # was already there
-        return LRUHANDLERS[k]
+        lru = LRUHANDLERS[k]
+        # possibility to increase or decrease the cachesize if need be
+        if maxsize is not None:
+            lru.maxsize = maxsize
+            lru.purge()
+        return lru
     else:
         # we do a new one
         from oggm.utils import LRUFileCache
         # the files already present have to be counted, too
         l0 = list(glob.glob(os.path.join(tmpdir, '*' + ending)))
-        l0.sort(key=os.path.getmtime)
+        l0.sort(key=os.path.getctime)
         lru = LRUFileCache(l0, maxsize=maxsize)
         LRUHANDLERS[k] = lru
         return lru
@@ -519,8 +708,8 @@ def set_intersects_db(path_or_gdf=None):
     """Set the glacier intersection database for OGGM to use.
 
     It is now set automatically by the
-    :func:`oggm.workflow.init_glacier_regions` task, but setting it manually
-    can be useful for a slightly faster run initialization.
+    :func:`oggm.workflow.init_glacier_directories` task, but setting it
+    manually can be useful for a slightly faster run initialization.
 
     See :func:`oggm.utils.get_rgi_intersects_region_file` for how to obtain
     such data.
@@ -531,13 +720,17 @@ def set_intersects_db(path_or_gdf=None):
         the intersects file to use
     """
 
+    global PARAMS
+    PARAMS.do_log = False
+
     if PARAMS['use_intersects'] and path_or_gdf is not None:
         if isinstance(path_or_gdf, str):
             PARAMS['intersects_gdf'] = gpd.read_file(path_or_gdf)
         else:
             PARAMS['intersects_gdf'] = path_or_gdf
     else:
-        PARAMS['intersects_gdf'] = gpd.GeoDataFrame()
+        PARAMS['intersects_gdf'] = pd.DataFrame()
+    PARAMS.do_log = True
 
 
 def reset_working_dir():
@@ -557,7 +750,7 @@ def pack_config():
         'PARAMS': PARAMS,
         'PATHS': PATHS,
         'LRUHANDLERS': LRUHANDLERS,
-        'DEMO_GLACIERS': DEMO_GLACIERS,
+        'DATA': DATA,
         'BASENAMES': dict(BASENAMES)
     }
 
@@ -565,16 +758,36 @@ def pack_config():
 def unpack_config(cfg_dict):
     """Unpack and apply the config packed via pack_config."""
 
-    global IS_INITIALIZED, PARAMS, PATHS, BASENAMES, LRUHANDLERS, DEMO_GLACIERS
+    global IS_INITIALIZED, PARAMS, PATHS, BASENAMES, LRUHANDLERS, DATA
 
     IS_INITIALIZED = cfg_dict['IS_INITIALIZED']
     PARAMS = cfg_dict['PARAMS']
     PATHS = cfg_dict['PATHS']
     LRUHANDLERS = cfg_dict['LRUHANDLERS']
-    DEMO_GLACIERS = cfg_dict['DEMO_GLACIERS']
+    DATA = cfg_dict['DATA']
 
     # BASENAMES is a DocumentedDict, which cannot be pickled because
     # set intentionally mismatches with get
     BASENAMES = DocumentedDict()
     for k in cfg_dict['BASENAMES']:
         BASENAMES[k] = (cfg_dict['BASENAMES'][k], 'Imported Pickle')
+
+
+def add_to_basenames(basename, filename, docstr=''):
+    """Add an entry to the list of BASENAMES.
+
+    BASENAMES are access keys to files available at the gdir level.
+
+    Parameters
+    ----------
+    basename : str
+        the key (e.g. 'dem', 'model_flowlines')
+    filename : str
+        the associated filename (e.g. 'dem.tif', 'model_flowlines.pkl')
+    docstr : str
+        the associated docstring (for documentation)
+    """
+    global BASENAMES
+    if '.' not in filename:
+        raise ValueError('The filename needs a proper file suffix!')
+    BASENAMES[basename] = (filename, docstr)

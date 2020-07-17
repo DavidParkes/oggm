@@ -51,7 +51,7 @@ About
 
 :Citation:
     .. image:: https://img.shields.io/badge/Citation-GMD%20paper-orange.svg
-        :target: https://www.geosci-model-dev-discuss.net/gmd-2018-9/
+        :target: https://www.geosci-model-dev.net/12/909/2019/
         :alt: GMD Paper
 
     .. image:: https://zenodo.org/badge/43965645.svg
@@ -81,8 +81,8 @@ About
 
 :License:
     .. image:: https://img.shields.io/pypi/l/oggm.svg
-        :target: http://www.gnu.org/licenses/gpl-3.0.en.html
-        :alt: GNU GPLv3 license
+        :target: https://github.com/OGGM/oggm/blob/master/LICENSE.txt
+        :alt: BSD-3-Clause License
 
 :Authors:
 

@@ -6,13 +6,14 @@ import shutil
 import unittest
 import pickle
 import pytest
-import geopandas as gpd
 import numpy as np
 import xarray as xr
 from numpy.testing import assert_allclose
 import matplotlib.pyplot as plt
-import salem
 from oggm import graphics
+
+salem = pytest.importorskip('salem')
+gpd = pytest.importorskip('geopandas')
 
 # Locals
 import oggm
@@ -20,8 +21,8 @@ import oggm.cfg as cfg
 from oggm import workflow
 from oggm.utils import get_demo_file, write_centerlines_to_shape
 from oggm.tests import mpl_image_compare
-from oggm.tests.funcs import (get_test_dir, use_multiprocessing,
-                              patch_url_retrieve_github)
+from oggm.tests.funcs import get_test_dir, use_multiprocessing
+from oggm.shop import cru
 from oggm.core import flowline
 from oggm import tasks
 from oggm import utils
@@ -30,17 +31,6 @@ from oggm import utils
 pytestmark = pytest.mark.test_env("workflow")
 TEST_DIR = os.path.join(get_test_dir(), 'tmp_workflow')
 CLI_LOGF = os.path.join(TEST_DIR, 'clilog.pkl')
-
-_url_retrieve = None
-
-
-def setup_module(module):
-    module._url_retrieve = utils.oggm_urlretrieve
-    oggm.utils._downloads.oggm_urlretrieve = patch_url_retrieve_github
-
-
-def teardown_module(module):
-    oggm.utils._downloads.oggm_urlretrieve = module._url_retrieve
 
 
 def clean_dir(testdir):
@@ -76,8 +66,12 @@ def up_to_climate(reset=False):
     rgi_file = get_demo_file('rgi_oetztal.shp')
     rgidf = gpd.read_file(rgi_file)
 
+    # Make a fake marine and lake terminating glacier
+    rgidf.loc[0, 'GlacType'] = '0199'
+    rgidf.loc[1, 'GlacType'] = '0299'
+
     # Be sure data is downloaded
-    utils.get_cru_cl_file()
+    cru.get_cru_cl_file()
 
     # Params
     cfg.PARAMS['border'] = 70
@@ -85,7 +79,7 @@ def up_to_climate(reset=False):
     cfg.PARAMS['run_mb_calibration'] = True
 
     # Go
-    gdirs = workflow.init_glacier_regions(rgidf)
+    gdirs = workflow.init_glacier_directories(rgidf)
 
     try:
         tasks.catchment_width_correction(gdirs[0])
@@ -119,8 +113,6 @@ def up_to_inversion(reset=False):
         # Use histalp for the actual inversion test
         cfg.PARAMS['temp_use_local_gradient'] = True
         cfg.PARAMS['baseline_climate'] = 'HISTALP'
-        cru_dir = get_demo_file('HISTALP_precipitation_all_abs_1801-2014.nc')
-        cfg.PATHS['cru_dir'] = os.path.dirname(cru_dir)
         workflow.climate_tasks(gdirs)
         with open(CLI_LOGF, 'wb') as f:
             pickle.dump('histalp', f)
@@ -152,8 +144,6 @@ def up_to_distrib(reset=False):
         cfg.PARAMS['prcp_scaling_factor'] = 2.5
         cfg.PARAMS['temp_use_local_gradient'] = False
         cfg.PARAMS['baseline_climate'] = 'CRU'
-        cru_dir = get_demo_file('cru_ts3.23.1901.2014.tmp.dat.nc')
-        cfg.PATHS['cru_dir'] = os.path.dirname(cru_dir)
         with warnings.catch_warnings():
             # There is a warning from salem
             warnings.simplefilter("ignore")
@@ -192,7 +182,7 @@ class TestFullRun(unittest.TestCase):
 
         # Test the glacier charac
         dfc = utils.compile_glacier_statistics(gdirs)
-        self.assertTrue(np.all(dfc.terminus_type == 'Land-terminating'))
+        self.assertFalse(np.all(dfc.terminus_type == 'Land-terminating'))
         assert np.all(dfc.t_star > 1900)
         dfc = utils.compile_climate_statistics(gdirs)
         cc = dfc[['flowline_mean_elev',
@@ -223,16 +213,42 @@ class TestFullRun(unittest.TestCase):
             os.makedirs(TEST_DIR)
         with open(CLI_LOGF, 'wb') as f:
             pickle.dump('none', f)
-        gdirs = up_to_inversion()
+        gdirs = up_to_inversion(reset=False)
+
+        # First tests
+        df = utils.compile_glacier_statistics(gdirs)
+        df['volume_before_calving_km3'] = df['volume_before_calving'] * 1e-9
+        assert np.sum(~ df.volume_before_calving.isnull()) == 2
+        dfs = df.iloc[:2]
+        assert np.all(dfs['volume_before_calving_km3'] < dfs['inv_volume_km3'])
+        assert_allclose(df['inv_flowline_glacier_area']*1e-6,
+                        df['rgi_area_km2'])
 
         workflow.execute_entity_task(flowline.init_present_time_glacier, gdirs)
+        # Check init_present_time_glacier not messing around too much
+        for gd in gdirs:
+            from oggm.core.massbalance import LinearMassBalance
+            from oggm.core.flowline import FluxBasedModel
+            mb_mod = LinearMassBalance(ela_h=2500)
+            fls = gd.read_pickle('model_flowlines')
+            model = FluxBasedModel(fls, mb_model=mb_mod)
+            df.loc[gd.rgi_id, 'start_area_km2'] = model.area_km2
+            df.loc[gd.rgi_id, 'start_volume_km3'] = model.volume_km3
+            df.loc[gd.rgi_id, 'start_length'] = model.length_m
+        assert_allclose(df['rgi_area_km2'], df['start_area_km2'], 0.06)
+        assert_allclose(df['rgi_area_km2'].sum(), df['start_area_km2'].sum(),
+                        0.004)
+        assert_allclose(df['inv_volume_km3'], df['start_volume_km3'], 0.04)
+        assert_allclose(df['inv_volume_km3'].sum(),
+                        df['start_volume_km3'].sum(), 0.001)
+        assert_allclose(df['main_flowline_length'], df['start_length'])
+
         workflow.execute_entity_task(flowline.run_random_climate, gdirs,
-                                     nyears=200, seed=0,
+                                     nyears=100, seed=0,
                                      store_monthly_step=True,
                                      output_filesuffix='_test')
 
         for gd in gdirs:
-
             path = gd.get_filepath('model_run', filesuffix='_test')
             # See that we are running ok
             with flowline.FileModel(path) as model:
@@ -257,15 +273,31 @@ class TestFullRun(unittest.TestCase):
             assert_allclose(df.RUN, df.DIAG)
 
         # Test output
-        ds = utils.compile_run_output(gdirs, filesuffix='_test')
+        ds = utils.compile_run_output(gdirs, input_filesuffix='_test')
         assert_allclose(ds_diag.volume_m3, ds.volume.sel(rgi_id=gd.rgi_id))
         assert_allclose(ds_diag.area_m2, ds.area.sel(rgi_id=gd.rgi_id))
         assert_allclose(ds_diag.length_m, ds.length.sel(rgi_id=gd.rgi_id))
-        # Test output
-        ds = utils.compile_run_output(gdirs, filesuffix='_test')
         df = ds.volume.sel(rgi_id=gd.rgi_id).to_series().to_frame('OUT')
         df['RUN'] = ds_diag.volume_m3.to_series()
         assert_allclose(df.RUN, df.OUT)
+
+        # Compare to statistics
+        df = utils.compile_glacier_statistics(gdirs)
+        df['y0_vol'] = ds.volume.sel(rgi_id=df.index, time=0) * 1e-9
+        df['y0_area'] = ds.area.sel(rgi_id=df.index, time=0) * 1e-6
+        df['y0_len'] = ds.length.sel(rgi_id=df.index, time=0)
+        assert_allclose(df['rgi_area_km2'], df['y0_area'], 0.06)
+        assert_allclose(df['inv_volume_km3'], df['y0_vol'], 0.04)
+        assert_allclose(df['main_flowline_length'], df['y0_len'])
+
+        # Calving stuff
+        assert ds.isel(rgi_id=0).calving[-1] > 0
+        assert ds.isel(rgi_id=0).calving_rate[-1] > 0
+        assert ds.isel(rgi_id=0).volume_bsl[-1] == 0
+        assert ds.isel(rgi_id=0).volume_bwl[-1] > 0
+        assert ds.isel(rgi_id=1).calving[-1] > 0
+        assert ds.isel(rgi_id=1).calving_rate[-1] > 0
+        assert not np.isfinite(ds.isel(rgi_id=1).volume_bsl[-1])
 
 
 @pytest.mark.slow

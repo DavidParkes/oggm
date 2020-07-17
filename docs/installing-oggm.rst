@@ -3,15 +3,24 @@
 Installing OGGM
 ===============
 
+.. important::
+
+   Did you know that you can try OGGM in your browser before installing it
+   on your computer? Visit :ref:`cloud` for more information.
+
 OGGM itself is a pure Python package, but it has several dependencies which
 are not trivial to install. The instructions below provide all the required
-detail and should work on any platform.
+detail and should work on any platform. See :ref:`install-troubleshooting`
+if something goes wrong.
 
-OGGM is fully `tested`_ with Python version 3.6 on Linux, and all versions
-above 3.4 should work as well. OGGM doesn't work with Python 2.7.
+OGGM is fully `tested`_ with Python version 3.6 and 3.7 on Linux.
+OGGM doesn't work with Python 2.
+We do not test OGGM on Mac OS, but it should probably run fine.
 
-OGGM itself should also work on Mac OS and Windows platforms, but we make no
-guarantee that our dependencies do.
+OGGM usually does not work on Windows. If you are using Windows 10,
+we strongly recommend to install the free
+`Windows subsytem for Linux <https://docs.microsoft.com/en-us/windows/wsl/install-win10>`_
+and install and run OGGM from there.
 
 .. note::
 
@@ -33,6 +42,10 @@ with virtualenv.
 Dependencies
 ------------
 
+Here is a list of *all* dependencies of the OGGM model. If you want to use
+the numerical models and nothing else, refer to
+`Install a minimal OGGM environment`_ below.
+
 Standard SciPy stack:
     - numpy
     - scipy
@@ -41,6 +54,7 @@ Standard SciPy stack:
     - matplotlib
     - pandas
     - xarray
+    - dask
     - joblib
 
 Configuration file parsing tool:
@@ -48,6 +62,7 @@ Configuration file parsing tool:
 
 I/O:
     - netcdf4
+    - pytables
 
 GIS tools:
     - gdal
@@ -58,16 +73,15 @@ GIS tools:
 
 Testing:
     - pytest
+    - pytest-mpl (`OGGM fork <https://github.com/OGGM/pytest-mpl>`_ required)
 
 Other libraries:
-    - boto3
     - `salem <https://github.com/fmaussion/salem>`_
     - `motionless <https://github.com/ryancox/motionless/>`_
 
 Optional:
     - progressbar2 (displays the download progress)
     - bottleneck (speeds up xarray operations)
-    - dask (works nicely with xarray)
     - `python-colorspace <https://github.com/retostauffer/python-colorspace>`_
       (applies HCL-based color palettes to some graphics)
 
@@ -254,6 +268,65 @@ This runs a minimal suite of tests. If you want to run the entire test suite
 **Congrats**, you are now set-up for the :ref:`getting-started` section!
 
 
+
+.. _install-troubleshooting:
+
+Installation troubleshooting
+----------------------------
+
+We try to do our best to avoid issues, but experience shows that the installation
+of the necessary packages can be difficult. Typical errors are often
+related to the pyproj, fiona and GDAL packages, which are heavy and (for pyproj)
+have changed a lot in the recent past and are prone to platform specific errors.
+
+If the tests don't pass, a diagnostic of which package creates the errors
+might be necessary. Errors like ``segmentation fault`` or ``Proj Error``
+are frequent and point to errors in upstream packages, rarely in OGGM itself.
+
+If you are having troubles, installing the packages manually from a fresh
+environment might help. At the time of writing (13.06.2020), creating an
+environment from this environment.yml file used to work (see the
+`conda docs <https://docs.conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.html#creating-an-environment-from-an-environment-yml-file>`_
+for more information about how to create an environment from a yml file)::
+
+    name: oggm_env
+    channels:
+      - conda-forge
+    dependencies:
+      - python=3.7
+      - jupyter
+      - jupyterlab
+      - numpy=1.16.5
+      - scipy=1.4.1
+      - pandas
+      - shapely
+      - matplotlib
+      - Pillow
+      - netcdf4=1.5.3
+      - scikit-image
+      - scikit-learn
+      - configobj
+      - xarray
+      - pytables
+      - pytest
+      - dask
+      - bottleneck
+      - pyproj=2.2.2
+      - cartopy=0.17.0
+      - geopandas=0.7.0
+      - rasterio=1.1.2
+      - descartes
+      - seaborn
+      - pip
+      - pip:
+        - joblib
+        - progressbar2
+        - motionless
+        - git+https://github.com/fmaussion/salem.git
+        - git+https://github.com/OGGM/oggm.git
+        - git+https://github.com/OGGM/pytest-mpl
+
+
 .. _virtualenv-install:
 
 Install with virtualenv (Linux/Debian)
@@ -261,9 +334,9 @@ Install with virtualenv (Linux/Debian)
 
 .. note::
 
-   The installation with virtualenv and pip requires a few more steps than with
-   conda. Unless you have a good reason to install by this route,
-   :ref:`installing with conda <conda-install>` is probably what you want to do.
+   We used to recommend our users to use `conda` instead of `pip`, because
+   of the ease of installation with `conda`. As of August 2019, a `pip`
+   installation is also possible without major issue on Debian.
 
 
 The instructions below have been tested on Debian / Ubuntu / Mint systems only!
@@ -271,11 +344,13 @@ The instructions below have been tested on Debian / Ubuntu / Mint systems only!
 Linux packages
 ~~~~~~~~~~~~~~
 
-Run the following commands to install required packages.
+Run the following commands to install required packages. **We are not sure
+this is strictly necessary, but you never know**.
 
 For the build::
 
-    $ sudo apt-get install build-essential python-pip liblapack-dev gfortran libproj-dev python-setuptools
+    $ sudo apt-get install build-essential python-pip liblapack-dev \
+        gfortran libproj-dev python-setuptools
 
 For matplolib::
 
@@ -324,7 +399,35 @@ Update pip (important!)::
 
 Install some packages one by one::
 
-   $ pip install numpy scipy pandas shapely matplotlib
+   $ pip install numpy==1.16.4 scipy pandas shapely matplotlib pyproj \
+       rasterio Pillow geopandas netcdf4==1.3.1 scikit-image configobj joblib \
+       xarray progressbar2 pytest motionless dask bottleneck toolz descartes \
+       pytables
+
+The pinning of the NetCDF4 package was necessary for us, but your system
+might differ
+(`related issue <https://github.com/Unidata/netcdf4-python/issues/962>`_).
+
+Finally, install the pytest-mpl OGGM fork, salem and python-colorspace libraries::
+
+    $ pip install git+https://github.com/OGGM/pytest-mpl.git
+    $ pip install git+https://github.com/fmaussion/salem.git
+    $ pip install git+https://github.com/retostauffer/python-colorspace.git
+
+OGGM and tests
+~~~~~~~~~~~~~~
+
+Refer to `Install OGGM itself`_ above.
+
+
+Legacy: install GDAL with link to the system libraries
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+.. note::
+
+    The steps below used to be necessary before the availability of pip wheels.
+    We still document them here, just in case.
 
 Installing **GDAL** is not so straightforward. First, check which version of
 GDAL is installed on your Linux system::
@@ -344,16 +447,30 @@ Fiona also builds upon GDAL, so let's compile it the same way::
 
 (Details can be found in `this blog post <http://tylerickson.blogspot.co.at/2011/09/installing-gdal-in-python-virtual.html>`_.)
 
-Now install further dependencies::
 
-    $ pip install pyproj rasterio Pillow geopandas netcdf4 scikit-image configobj joblib xarray boto3 progressbar2 pytest motionless dask bottleneck
+Install a minimal OGGM environment
+----------------------------------
 
-Finally, install the salem and python-colorspace libraries::
+If you plan to use only the numerical core of OGGM (that is, for idealized
+simulations or teaching), you can skip many dependencies and only
+install this shorter list:
 
-    $ pip install git+https://github.com/fmaussion/salem.git
-    $ pip install git+https://github.com/retostauffer/python-colorspace.git
+- numpy
+- scipy
+- pandas
+- matplotlib
+- shapely
+- requests
+- configobj
+- netcdf4
+- xarray
+- pytables
 
-OGGM and tests
-~~~~~~~~~~~~~~
+Installing them with pip or conda should be much easier.
 
-Refer to `Install OGGM itself`_ above.
+Running the tests in this minimal environment works the same. Simply run
+from a terminal::
+
+    pytest --pyargs oggm
+
+The number of tests will be much smaller!

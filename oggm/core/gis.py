@@ -5,39 +5,59 @@ to be realized by any OGGM pre-processing workflow.
 # Built ins
 import os
 import logging
-import json
 import warnings
-from functools import partial
 from distutils.version import LooseVersion
+
 # External libs
-import salem
-import pyproj
 import numpy as np
 import shapely.ops
 import pandas as pd
-import geopandas as gpd
-import skimage.draw as skdraw
 import shapely.geometry as shpg
 import scipy.signal
 from scipy.ndimage.measurements import label
 from scipy.ndimage import binary_erosion
 from scipy.ndimage.morphology import distance_transform_edt
 from scipy.interpolate import griddata
-import rasterio
-from rasterio.warp import reproject, Resampling
-from rasterio.mask import mask as riomask
+from scipy import optimize as optimization
+
+# Optional libs
 try:
-    # rasterio V > 1.0
-    from rasterio.merge import merge as merge_tool
+    import salem
+    from salem.gis import transform_proj
 except ImportError:
-    from rasterio.tools.merge import merge as merge_tool
+    pass
+try:
+    import pyproj
+except ImportError:
+    pass
+try:
+    import geopandas as gpd
+except ImportError:
+    pass
+try:
+    import skimage.draw as skdraw
+except ImportError:
+    pass
+try:
+    import rasterio
+    from rasterio.warp import reproject, Resampling
+    from rasterio.mask import mask as riomask
+    try:
+        # rasterio V > 1.0
+        from rasterio.merge import merge as merge_tool
+    except ImportError:
+        from rasterio.tools.merge import merge as merge_tool
+except ImportError:
+    pass
+
 # Locals
-from oggm import entity_task
+from oggm import entity_task, utils
 import oggm.cfg as cfg
 from oggm.exceptions import (InvalidParamsError, InvalidGeometryError,
-                             InvalidDEMError)
-from oggm.utils import (tuple2int, get_topo_file, get_demo_file,
-                        nicenumber, ncDataset)
+                             InvalidDEMError, GeometryError,
+                             InvalidWorkflowError)
+from oggm.utils import (tuple2int, get_topo_file, is_dem_source_available,
+                        nicenumber, ncDataset, tolist)
 
 
 # Module logger
@@ -46,8 +66,29 @@ log = logging.getLogger(__name__)
 # Needed later
 label_struct = np.ones((3, 3))
 
-with open(get_demo_file('dem_sources.json'), 'r') as fr:
-    DEM_SOURCE_INFO = json.loads(fr.read())
+
+def _parse_source_text():
+    fp = os.path.join(os.path.abspath(os.path.dirname(cfg.__file__)),
+                      'data', 'dem_sources.txt')
+
+    out = dict()
+    cur_key = None
+    with open(fp, 'r', encoding='utf-8') as fr:
+        this_text = []
+        for l in fr.readlines():
+            l = l.strip()
+            if l and (l[0] == '[' and l[-1] == ']'):
+                if cur_key:
+                    out[cur_key] = '\n'.join(this_text)
+                this_text = []
+                cur_key = l.strip('[]')
+                continue
+            this_text.append(l)
+    out[cur_key] = '\n'.join(this_text)
+    return out
+
+
+DEM_SOURCE_INFO = _parse_source_text()
 
 
 def gaussian_blur(in_array, size):
@@ -75,56 +116,6 @@ def gaussian_blur(in_array, size):
 
     # do the Gaussian blur
     return scipy.signal.fftconvolve(padded_array, g, mode='valid')
-
-
-def multi_to_poly(geometry, gdir=None):
-    """Sometimes an RGI geometry is a multipolygon: this should not happen.
-
-    Parameters
-    ----------
-    geometry : shpg.Polygon or shpg.MultiPolygon
-        the geometry to check
-    gdir : GlacierDirectory, optional
-        for logging
-
-    Returns
-    -------
-    the corrected geometry
-    """
-
-    # Log
-    rid = gdir.rgi_id + ': ' if gdir is not None else ''
-
-    if 'Multi' in geometry.type:
-        parts = np.array(geometry)
-        for p in parts:
-            assert p.type == 'Polygon'
-        areas = np.array([p.area for p in parts])
-        parts = parts[np.argsort(areas)][::-1]
-        areas = areas[np.argsort(areas)][::-1]
-
-        # First case (was RGIV4):
-        # let's assume that one poly is exterior and that
-        # the other polygons are in fact interiors
-        exterior = parts[0].exterior
-        interiors = []
-        was_interior = 0
-        for p in parts[1:]:
-            if parts[0].contains(p):
-                interiors.append(p.exterior)
-                was_interior += 1
-        if was_interior > 0:
-            # We are done here, good
-            geometry = shpg.Polygon(exterior, interiors)
-        else:
-            # This happens for bad geometries. We keep the largest
-            geometry = parts[0]
-            if np.any(areas[1:] > (areas[0] / 4)):
-                log.warning('Geometry {} lost quite a chunk.'.format(rid))
-
-    if geometry.type != 'Polygon':
-        raise InvalidGeometryError('Geometry {} is not a Polygon.'.format(rid))
-    return geometry
 
 
 def _interp_polygon(polygon, dx):
@@ -218,8 +209,8 @@ def _polygon_to_pix(polygon):
 
 
 @entity_task(log, writes=['glacier_grid', 'dem', 'outlines'])
-def define_glacier_region(gdir, entity=None):
-    """Very first task: define the glacier's local grid.
+def define_glacier_region(gdir, entity=None, source=None):
+    """Very first task after initialization: define the glacier's local grid.
 
     Defines the local projection (Transverse Mercator), centered on the
     glacier. There is some options to set the resolution of the local grid.
@@ -239,69 +230,38 @@ def define_glacier_region(gdir, entity=None):
     gdir : :py:class:`oggm.GlacierDirectory`
         where to write the data
     entity : geopandas.GeoSeries
-        the glacier geometry to process
+        the glacier geometry to process - DEPRECATED. It is now ignored
+    source : str or list of str, optional
+        If you want to force the use of a certain DEM source. Available are:
+          - 'USER' : file set in cfg.PATHS['dem_file']
+          - 'SRTM' : http://srtm.csi.cgiar.org/
+          - 'GIMP' : https://bpcrc.osu.edu/gdg/data/gimpdem
+          - 'RAMP' : http://nsidc.org/data/docs/daac/nsidc0082_ramp_dem.gd.html
+          - 'REMA' : https://www.pgc.umn.edu/data/rema/
+          - 'DEM3' : http://viewfinderpanoramas.org/
+          - 'ASTER' : https://lpdaac.usgs.gov/products/astgtmv003/
+          - 'TANDEM' : https://geoservice.dlr.de/web/dataguide/tdm90/
+          - 'ARCTICDEM' : https://www.pgc.umn.edu/data/arcticdem/
+          - 'AW3D30' : https://www.eorc.jaxa.jp/ALOS/en/aw3d30
+          - 'MAPZEN' : https://registry.opendata.aws/terrain-tiles/
+          - 'ALASKA' : https://www.the-cryosphere.net/8/503/2014/
+          - 'COPDEM' : Copernicus DEM GLO-90 https://bit.ly/2T98qqs
+          - 'NASADEM': https://lpdaac.usgs.gov/products/nasadem_hgtv001/
     """
 
-    # Make a local glacier map
-    proj_params = dict(name='tmerc', lat_0=0., lon_0=gdir.cenlon,
-                       k=0.9996, x_0=0, y_0=0, datum='WGS84')
-    proj4_str = "+proj={name} +lat_0={lat_0} +lon_0={lon_0} +k={k} " \
-                "+x_0={x_0} +y_0={y_0} +datum={datum}".format(**proj_params)
-    proj_in = pyproj.Proj("+init=EPSG:4326", preserve_units=True)
-    proj_out = pyproj.Proj(proj4_str, preserve_units=True)
-    project = partial(pyproj.transform, proj_in, proj_out)
-    # transform geometry to map
-    geometry = shapely.ops.transform(project, entity['geometry'])
-    geometry = multi_to_poly(geometry, gdir=gdir)
-    xx, yy = geometry.exterior.xy
+    # Get the local map proj params and glacier extent
+    gdf = gdir.read_shapefile('outlines')
 
-    # Save transformed geometry to disk
-    entity = entity.copy()
-    entity['geometry'] = geometry
-    # Avoid fiona bug: https://github.com/Toblerity/Fiona/issues/365
-    for k, s in entity.iteritems():
-        if type(s) in [np.int32, np.int64]:
-            entity[k] = int(s)
-    towrite = gpd.GeoDataFrame(entity).T
-    towrite.crs = proj4_str
-    # Delete the source before writing
-    if 'DEM_SOURCE' in towrite:
-        del towrite['DEM_SOURCE']
+    # Get the map proj
+    utm_proj = salem.check_crs(gdf.crs)
+
+    # Get glacier extent
+    xx, yy = gdf.iloc[0]['geometry'].exterior.xy
 
     # Define glacier area to use
-    area = entity['Area']
+    area = gdir.rgi_area_km2
 
-    # Do we want to use the RGI area or ours?
-    if not cfg.PARAMS['use_rgi_area']:
-        area = geometry.area * 1e-6
-        entity['Area'] = area
-        towrite['Area'] = area
-
-    # Write shapefile
-    gdir.write_shapefile(towrite, 'outlines')
-
-    # Also transform the intersects if necessary
-    gdf = cfg.PARAMS['intersects_gdf']
-    if len(gdf) > 0:
-        gdf = gdf.loc[((gdf.RGIId_1 == gdir.rgi_id) |
-                       (gdf.RGIId_2 == gdir.rgi_id))]
-        if len(gdf) > 0:
-            gdf = salem.transform_geopandas(gdf, to_crs=proj_out)
-            if hasattr(gdf.crs, 'srs'):
-                # salem uses pyproj
-                gdf.crs = gdf.crs.srs
-            gdir.write_shapefile(gdf, 'intersects')
-    else:
-        # Sanity check
-        if cfg.PARAMS['use_intersects']:
-            raise InvalidParamsError('You seem to have forgotten to set the '
-                                     'intersects file for this run. OGGM '
-                                     'works better with such a file. If you '
-                                     'know what your are doing, set '
-                                     "cfg.PARAMS['use_intersects'] = False to "
-                                     "suppress this error.")
-
-    # 6. choose a spatial resolution with respect to the glacier area
+    # Choose a spatial resolution with respect to the glacier area
     dxmethod = cfg.PARAMS['grid_dx_method']
     if dxmethod == 'linear':
         dx = np.rint(cfg.PARAMS['d1'] * area + cfg.PARAMS['d2'])
@@ -314,7 +274,7 @@ def define_glacier_region(gdir, entity=None):
                                  .format(dxmethod))
     # Additional trick for varying dx
     if dxmethod in ['linear', 'square']:
-        dx = np.clip(dx, cfg.PARAMS['d2'], cfg.PARAMS['dmax'])
+        dx = utils.clip_scalar(dx, cfg.PARAMS['d2'], cfg.PARAMS['dmax'])
 
     log.debug('(%s) area %.2f km, dx=%.1f', gdir.rgi_id, area, dx)
 
@@ -340,18 +300,30 @@ def define_glacier_region(gdir, entity=None):
     ny = np.int((uly - lry) / dx)
 
     # Back to lon, lat for DEM download/preparation
-    tmp_grid = salem.Grid(proj=proj_out, nxny=(nx, ny), x0y0=(ulx, uly),
+    tmp_grid = salem.Grid(proj=utm_proj, nxny=(nx, ny), x0y0=(ulx, uly),
                           dxdy=(dx, -dx), pixel_ref='corner')
     minlon, maxlon, minlat, maxlat = tmp_grid.extent_in_crs(crs=salem.wgs84)
 
     # Open DEM
-    source = entity.DEM_SOURCE if hasattr(entity, 'DEM_SOURCE') else None
+    # We test DEM availability for glacier only (maps can grow big)
+    if not is_dem_source_available(source, *gdir.extent_ll):
+        raise InvalidDEMError('Source: {} not available for glacier {}'
+                              .format(source, gdir.rgi_id))
     dem_list, dem_source = get_topo_file((minlon, maxlon), (minlat, maxlat),
                                          rgi_region=gdir.rgi_region,
                                          rgi_subregion=gdir.rgi_subregion,
+                                         dx_meter=dx,
                                          source=source)
     log.debug('(%s) DEM source: %s', gdir.rgi_id, dem_source)
     log.debug('(%s) N DEM Files: %s', gdir.rgi_id, len(dem_list))
+
+    # Decide how to tag nodata
+    def _get_nodata(rio_ds):
+        nodata = rio_ds[0].meta.get('nodata', None)
+        if nodata is None:
+            # badly tagged geotiffs, let's do it ourselves
+            nodata = -32767 if source == 'TANDEM' else -9999
+        return nodata
 
     # A glacier area can cover more than one tile:
     if len(dem_list) == 1:
@@ -361,9 +333,11 @@ def define_glacier_region(gdir, entity=None):
             src_transform = dem_dss[0].transform
         else:
             src_transform = dem_dss[0].affine
+        nodata = _get_nodata(dem_dss)
     else:
         dem_dss = [rasterio.open(s) for s in dem_list]  # list of rasters
-        dem_data, src_transform = merge_tool(dem_dss)  # merged rasters
+        nodata = _get_nodata(dem_dss)
+        dem_data, src_transform = merge_tool(dem_dss, nodata=nodata)  # merge
 
     # Use Grid properties to create a transform (see rasterio cookbook)
     dst_transform = rasterio.transform.from_origin(
@@ -373,10 +347,12 @@ def define_glacier_region(gdir, entity=None):
     # Set up profile for writing output
     profile = dem_dss[0].profile
     profile.update({
-        'crs': proj4_str,
+        'crs': utm_proj.srs,
         'transform': dst_transform,
+        'nodata': nodata,
         'width': nx,
-        'height': ny
+        'height': ny,
+        'driver': 'GTiff'
     })
 
     # Could be extended so that the cfg file takes all Resampling.* methods
@@ -392,10 +368,6 @@ def define_glacier_region(gdir, entity=None):
     profile.pop('blockxsize', None)
     profile.pop('blockysize', None)
     profile.pop('compress', None)
-    nodata = dem_dss[0].meta.get('nodata', None)
-    if source == 'TANDEM' and nodata is None:
-        # badly tagged geotiffs, let's do it ourselves
-        nodata = -32767
     with rasterio.open(dem_reproj, 'w', **profile) as dest:
         dst_array = np.empty((ny, nx), dtype=dem_dss[0].dtypes[0])
         reproject(
@@ -407,11 +379,10 @@ def define_glacier_region(gdir, entity=None):
             # Destination parameters
             destination=dst_array,
             dst_transform=dst_transform,
-            dst_crs=proj4_str,
+            dst_crs=utm_proj.srs,
             dst_nodata=nodata,
             # Configuration
             resampling=resampling)
-
         dest.write(dst_array, 1)
 
     for dem_ds in dem_dss:
@@ -419,7 +390,7 @@ def define_glacier_region(gdir, entity=None):
 
     # Glacier grid
     x0y0 = (ulx+dx/2, uly-dx/2)  # To pixel center coordinates
-    glacier_grid = salem.Grid(proj=proj_out, nxny=(nx, ny),  dxdy=(dx, -dx),
+    glacier_grid = salem.Grid(proj=utm_proj, nxny=(nx, ny), dxdy=(dx, -dx),
                               x0y0=x0y0)
     glacier_grid.to_json(gdir.get_filepath('glacier_grid'))
 
@@ -434,13 +405,137 @@ def define_glacier_region(gdir, entity=None):
             fw.write('{}\n'.format(os.path.basename(fname)))
 
 
-@entity_task(log, writes=['gridded_data', 'geometries'])
-def glacier_masks(gdir):
-    """Makes a gridded mask of the glacier outlines and topography.
+def rasterio_to_gdir(gdir, input_file, output_file_name,
+                     resampling='cubic'):
+    """Reprojects a file that rasterio can read into the glacier directory.
 
-    This function fills holes in the source DEM and produces smoothed gridded
-    topography and glacier outline arrays. These are the ones which will later
-    be used to determine bed and surface height.
+    Parameters
+    ----------
+    gdir : :py:class:`oggm.GlacierDirectory`
+        the glacier directory
+    input_file : str
+        path to the file to reproject
+    output_file_name : str
+        name of the output file (must be in cfg.BASENAMES)
+    resampling : str
+        nearest', 'bilinear', 'cubic', 'cubic_spline', or one of
+        https://rasterio.readthedocs.io/en/latest/topics/resampling.html
+    """
+
+    output_file = gdir.get_filepath(output_file_name)
+    assert '.tif' in output_file, 'output_file should end with .tif'
+
+    if not gdir.has_file('dem'):
+        raise InvalidWorkflowError('Need a dem.tif file to reproject to')
+
+    with rasterio.open(input_file) as src:
+
+        kwargs = src.meta.copy()
+        data = src.read(1)
+
+        with rasterio.open(gdir.get_filepath('dem')) as tpl:
+
+            kwargs.update({
+                'crs': tpl.crs,
+                'transform': tpl.transform,
+                'width': tpl.width,
+                'height': tpl.height
+            })
+
+            with rasterio.open(output_file, 'w', **kwargs) as dst:
+                for i in range(1, src.count + 1):
+
+                    dest = np.zeros(shape=(tpl.height, tpl.width),
+                                    dtype=data.dtype)
+
+                    reproject(
+                        source=rasterio.band(src, i),
+                        destination=dest,
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=tpl.transform,
+                        dst_crs=tpl.crs,
+                        resampling=getattr(Resampling, resampling)
+                    )
+
+                    dst.write(dest, indexes=i)
+
+
+def read_geotiff_dem(gdir):
+    """Reads (and masks out) the DEM out of the gdir's geotiff file.
+
+    Parameters
+    ----------
+    gdir : :py:class:`oggm.GlacierDirectory`
+        the glacier directory
+
+    Returns
+    -------
+    2D np.float32 array
+    """
+    with rasterio.open(gdir.get_filepath('dem'), 'r', driver='GTiff') as ds:
+        topo = ds.read(1).astype(rasterio.float32)
+        topo[topo <= -999.] = np.NaN
+        topo[ds.read_masks(1) == 0] = np.NaN
+    return topo
+
+
+class GriddedNcdfFile(object):
+    """Creates or opens a gridded netcdf file template.
+
+    The other variables have to be created and filled by the calling
+    routine.
+    """
+    def __init__(self, gdir, basename='gridded_data', reset=False):
+        self.fpath = gdir.get_filepath(basename)
+        self.grid = gdir.grid
+        if reset and os.path.exists(self.fpath):
+            os.remove(self.fpath)
+
+    def __enter__(self):
+
+        if os.path.exists(self.fpath):
+            # Already there - just append
+            self.nc = ncDataset(self.fpath, 'a', format='NETCDF4')
+            return self.nc
+
+        # Create and fill
+        nc = ncDataset(self.fpath, 'w', format='NETCDF4')
+
+        nc.createDimension('x', self.grid.nx)
+        nc.createDimension('y', self.grid.ny)
+
+        nc.author = 'OGGM'
+        nc.author_info = 'Open Global Glacier Model'
+        nc.pyproj_srs = self.grid.proj.srs
+
+        x = self.grid.x0 + np.arange(self.grid.nx) * self.grid.dx
+        y = self.grid.y0 + np.arange(self.grid.ny) * self.grid.dy
+
+        v = nc.createVariable('x', 'f4', ('x',), zlib=True)
+        v.units = 'm'
+        v.long_name = 'x coordinate of projection'
+        v.standard_name = 'projection_x_coordinate'
+        v[:] = x
+
+        v = nc.createVariable('y', 'f4', ('y',), zlib=True)
+        v.units = 'm'
+        v.long_name = 'y coordinate of projection'
+        v.standard_name = 'projection_y_coordinate'
+        v[:] = y
+
+        self.nc = nc
+        return nc
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        self.nc.close()
+
+
+@entity_task(log, writes=['gridded_data'])
+def process_dem(gdir):
+    """Reads the DEM from the tiff, attempts to fill voids and apply smooth.
+
+    The data is then written to `gridded_data.nc`.
 
     Parameters
     ----------
@@ -449,26 +544,24 @@ def glacier_masks(gdir):
     """
 
     # open srtm tif-file:
-    dem_dr = rasterio.open(gdir.get_filepath('dem'), 'r', driver='GTiff')
-    dem = dem_dr.read(1).astype(rasterio.float32)
+    dem = read_geotiff_dem(gdir)
 
     # Grid
-    nx = dem_dr.width
-    ny = dem_dr.height
-    assert nx == gdir.grid.nx
-    assert ny == gdir.grid.ny
+    nx = gdir.grid.nx
+    ny = gdir.grid.ny
 
     # Correct the DEM
-    # Currently we just do a linear interp -- filling is totally shit anyway
-    min_z = -999.
-    dem[dem <= min_z] = np.NaN
-    isfinite = np.isfinite(dem)
-    if np.all(~isfinite):
+    valid_mask = np.isfinite(dem)
+    if np.all(~valid_mask):
         raise InvalidDEMError('Not a single valid grid point in DEM')
-    if np.any(~isfinite):
+
+    if np.any(~valid_mask):
+        # We interpolate
+        if np.sum(~valid_mask) > (0.25 * nx * ny):
+            log.info('({}) more than 25% NaNs in DEM'.format(gdir.rgi_id))
         xx, yy = gdir.grid.ij_coordinates
-        pnan = np.nonzero(~isfinite)
-        pok = np.nonzero(isfinite)
+        pnan = np.nonzero(~valid_mask)
+        pok = np.nonzero(valid_mask)
         points = np.array((np.ravel(yy[pok]), np.ravel(xx[pok]))).T
         inter = np.array((np.ravel(yy[pnan]), np.ravel(xx[pnan]))).T
         try:
@@ -476,16 +569,14 @@ def glacier_masks(gdir):
                                  method='linear')
         except ValueError:
             raise InvalidDEMError('DEM interpolation not possible.')
-        log.warning(gdir.rgi_id + ': DEM needed interpolation.')
+        log.info(gdir.rgi_id + ': DEM needed interpolation.')
         gdir.add_to_diagnostics('dem_needed_interpolation', True)
-        gdir.add_to_diagnostics('dem_invalid_perc', len(pnan[0]) / (nx*ny))
+        gdir.add_to_diagnostics('dem_invalid_perc', len(pnan[0]) / (nx * ny))
 
     isfinite = np.isfinite(dem)
     if np.any(~isfinite):
-        # this happens when extrapolation is needed
-        # see how many percent of the dem
-        if np.sum(~isfinite) > (0.5 * nx * ny):
-            log.warning('({}) many NaNs in DEM'.format(gdir.rgi_id))
+        # interpolation will still leave NaNs in DEM:
+        # extrapolate with NN if needed (e.g. coastal areas)
         xx, yy = gdir.grid.ij_coordinates
         pnan = np.nonzero(~isfinite)
         pok = np.nonzero(isfinite)
@@ -496,42 +587,72 @@ def glacier_masks(gdir):
                                  method='nearest')
         except ValueError:
             raise InvalidDEMError('DEM extrapolation not possible.')
-        log.warning(gdir.rgi_id + ': DEM needed extrapolation.')
+        log.info(gdir.rgi_id + ': DEM needed extrapolation.')
         gdir.add_to_diagnostics('dem_needed_extrapolation', True)
-        gdir.add_to_diagnostics('dem_extrapol_perc', len(pnan[0]) / (nx*ny))
+        gdir.add_to_diagnostics('dem_extrapol_perc', len(pnan[0]) / (nx * ny))
 
     if np.min(dem) == np.max(dem):
         raise InvalidDEMError('({}) min equal max in the DEM.'
                               .format(gdir.rgi_id))
 
-    # Projection
-    if LooseVersion(rasterio.__version__) >= LooseVersion('1.0'):
-        transf = dem_dr.transform
-    else:
-        transf = dem_dr.affine
-    x0 = transf[2]  # UL corner
-    y0 = transf[5]  # UL corner
-    dx = transf[0]
-    dy = transf[4]  # Negative
-
-    if not (np.allclose(dx, -dy) or np.allclose(dx, gdir.grid.dx) or
-            np.allclose(y0, gdir.grid.corner_grid.y0, atol=1e-2) or
-            np.allclose(x0, gdir.grid.corner_grid.x0, atol=1e-2)):
-        raise InvalidDEMError('DEM file and Salem Grid do not match!')
-    dem_dr.close()
-
     # Clip topography to 0 m a.s.l.
-    dem = dem.clip(0)
+    utils.clip_min(dem, 0, out=dem)
 
     # Smooth DEM?
     if cfg.PARAMS['smooth_window'] > 0.:
-        gsize = np.rint(cfg.PARAMS['smooth_window'] / dx)
+        gsize = np.rint(cfg.PARAMS['smooth_window'] / gdir.grid.dx)
         smoothed_dem = gaussian_blur(dem, np.int(gsize))
     else:
         smoothed_dem = dem.copy()
 
-    if not np.all(np.isfinite(smoothed_dem)):
-        raise InvalidDEMError('({}) NaN in smoothed DEM'.format(gdir.rgi_id))
+    # Clip topography to 0 m a.s.l.
+    utils.clip_min(smoothed_dem, 0, out=smoothed_dem)
+
+    # Write to file
+    with GriddedNcdfFile(gdir, reset=True) as nc:
+
+        v = nc.createVariable('topo', 'f4', ('y', 'x',), zlib=True)
+        v.units = 'm'
+        v.long_name = 'DEM topography'
+        v[:] = dem
+
+        v = nc.createVariable('topo_smoothed', 'f4', ('y', 'x',), zlib=True)
+        v.units = 'm'
+        v.long_name = ('DEM topography smoothed with radius: '
+                       '{:.1} m'.format(cfg.PARAMS['smooth_window']))
+        v[:] = smoothed_dem
+
+        # If there was some invalid data store this as well
+        v = nc.createVariable('topo_valid_mask', 'i1', ('y', 'x',), zlib=True)
+        v.units = '-'
+        v.long_name = 'DEM validity mask according to geotiff input (1-0)'
+        v[:] = valid_mask.astype(int)
+
+        # add some meta stats and close
+        nc.max_h_dem = np.max(dem)
+        nc.min_h_dem = np.min(dem)
+
+
+@entity_task(log, writes=['gridded_data', 'geometries'])
+def glacier_masks(gdir):
+    """Makes a gridded mask of the glacier outlines that can be used by OGGM.
+
+    For a more robust solution (not OGGM compatible) see simple_glacier_masks.
+
+    Parameters
+    ----------
+    gdir : :py:class:`oggm.GlacierDirectory`
+        where to write the data
+    """
+
+    # In case nominal, just raise
+    if gdir.is_nominal:
+        raise GeometryError('{} is a nominal glacier.'.format(gdir.rgi_id))
+
+    if not os.path.exists(gdir.get_filepath('gridded_data')):
+        # In a possible future, we might actually want to raise a
+        # deprecation warning here
+        process_dem(gdir)
 
     # Geometries
     geometry = gdir.read_shapefile('outlines').geometry[0]
@@ -589,54 +710,58 @@ def glacier_masks(gdir):
         glacier_mask[:] = 0
         glacier_mask[np.where(regions == (am+1))] = 1
 
-    # Last sanity check based on the masked dem
-    tmp_max = np.max(dem[np.where(glacier_mask == 1)])
-    tmp_min = np.min(dem[np.where(glacier_mask == 1)])
-    if tmp_max < (tmp_min + 1):
-        raise InvalidDEMError('({}) min equal max in the masked DEM.'
-                              .format(gdir.rgi_id))
-
-    # write out the grids in the netcdf file
-    nc = gdir.create_gridded_ncdf_file('gridded_data')
-
-    v = nc.createVariable('topo', 'f4', ('y', 'x', ), zlib=True)
-    v.units = 'm'
-    v.long_name = 'DEM topography'
-    v[:] = dem
-
-    v = nc.createVariable('topo_smoothed', 'f4', ('y', 'x', ), zlib=True)
-    v.units = 'm'
-    v.long_name = ('DEM topography smoothed '
-                   'with radius: {:.1} m'.format(cfg.PARAMS['smooth_window']))
-    v[:] = smoothed_dem
-
-    v = nc.createVariable('glacier_mask', 'i1', ('y', 'x', ), zlib=True)
-    v.units = '-'
-    v.long_name = 'Glacier mask'
-    v[:] = glacier_mask
-
-    v = nc.createVariable('glacier_ext', 'i1', ('y', 'x', ), zlib=True)
-    v.units = '-'
-    v.long_name = 'Glacier external boundaries'
-    v[:] = glacier_ext
-
-    # add some meta stats and close
-    nc.max_h_dem = np.max(dem)
-    nc.min_h_dem = np.min(dem)
-    dem_on_g = dem[np.where(glacier_mask)]
-    nc.max_h_glacier = np.max(dem_on_g)
-    nc.min_h_glacier = np.min(dem_on_g)
-    nc.close()
-
+    # Write geometries
     geometries = dict()
     geometries['polygon_hr'] = glacier_poly_hr
     geometries['polygon_pix'] = glacier_poly_pix
     geometries['polygon_area'] = geometry.area
     gdir.write_pickle(geometries, 'geometries')
 
+    # write out the grids in the netcdf file
+    with GriddedNcdfFile(gdir) as nc:
+
+        if 'glacier_mask' not in nc.variables:
+            v = nc.createVariable('glacier_mask', 'i1', ('y', 'x', ),
+                                  zlib=True)
+            v.units = '-'
+            v.long_name = 'Glacier mask'
+        else:
+            v = nc.variables['glacier_mask']
+        v[:] = glacier_mask
+
+        if 'glacier_ext' not in nc.variables:
+            v = nc.createVariable('glacier_ext', 'i1', ('y', 'x', ),
+                                  zlib=True)
+            v.units = '-'
+            v.long_name = 'Glacier external boundaries'
+        else:
+            v = nc.variables['glacier_ext']
+        v[:] = glacier_ext
+
+        dem = nc.variables['topo'][:]
+        valid_mask = nc.variables['topo_valid_mask'][:]
+
+        # Last sanity check based on the masked dem
+        tmp_max = np.max(dem[np.where(glacier_mask == 1)])
+        tmp_min = np.min(dem[np.where(glacier_mask == 1)])
+        if tmp_max < (tmp_min + 1):
+            raise InvalidDEMError('({}) min equal max in the masked DEM.'
+                                  .format(gdir.rgi_id))
+
+        # Log DEM that needed processing within the glacier mask
+        if gdir.get_diagnostics().get('dem_needed_interpolation', False):
+            pnan = (valid_mask == 0) & glacier_mask
+            gdir.add_to_diagnostics('dem_invalid_perc_in_mask',
+                                    np.sum(pnan) / np.sum(glacier_mask))
+
+        # add some meta stats and close
+        dem_on_g = dem[np.where(glacier_mask)]
+        nc.max_h_glacier = np.max(dem_on_g)
+        nc.min_h_glacier = np.min(dem_on_g)
+
 
 @entity_task(log, writes=['gridded_data', 'hypsometry'])
-def simple_glacier_masks(gdir):
+def simple_glacier_masks(gdir, write_hypsometry=False):
     """Compute glacier masks based on much simpler rules than OGGM's default.
 
     This is therefore more robust: we use this function to compute glacier
@@ -646,96 +771,23 @@ def simple_glacier_masks(gdir):
     ----------
     gdir : :py:class:`oggm.GlacierDirectory`
         where to write the data
+    write_hypsometry : bool
+        whether to write out the hypsometry file or not - it is used by e.g,
+        rgitools
     """
 
-    # open srtm tif-file:
-    dem_dr = rasterio.open(gdir.get_filepath('dem'), 'r', driver='GTiff')
-    dem = dem_dr.read(1).astype(rasterio.float32)
-
-    # Grid
-    nx = dem_dr.width
-    ny = dem_dr.height
-    assert nx == gdir.grid.nx
-    assert ny == gdir.grid.ny
-
-    # Correct the DEM
-    # Currently we just do a linear interp -- filling is totally shit anyway
-    min_z = -999.
-    dem[dem <= min_z] = np.NaN
-    isfinite = np.isfinite(dem)
-    if np.all(~isfinite):
-        raise InvalidDEMError('Not a single valid grid point in DEM')
-    if np.any(~isfinite):
-        xx, yy = gdir.grid.ij_coordinates
-        pnan = np.nonzero(~isfinite)
-        pok = np.nonzero(isfinite)
-        points = np.array((np.ravel(yy[pok]), np.ravel(xx[pok]))).T
-        inter = np.array((np.ravel(yy[pnan]), np.ravel(xx[pnan]))).T
-        try:
-            dem[pnan] = griddata(points, np.ravel(dem[pok]), inter,
-                                 method='linear')
-        except ValueError:
-            raise InvalidDEMError('DEM interpolation not possible.')
-        log.warning(gdir.rgi_id + ': DEM needed interpolation.')
-        gdir.add_to_diagnostics('dem_needed_interpolation', True)
-        gdir.add_to_diagnostics('dem_invalid_perc', len(pnan[0]) / (nx*ny))
-
-    isfinite = np.isfinite(dem)
-    if np.any(~isfinite):
-        # this happens when extrapolation is needed
-        # see how many percent of the dem
-        if np.sum(~isfinite) > (0.5 * nx * ny):
-            log.warning('({}) many NaNs in DEM'.format(gdir.rgi_id))
-        xx, yy = gdir.grid.ij_coordinates
-        pnan = np.nonzero(~isfinite)
-        pok = np.nonzero(isfinite)
-        points = np.array((np.ravel(yy[pok]), np.ravel(xx[pok]))).T
-        inter = np.array((np.ravel(yy[pnan]), np.ravel(xx[pnan]))).T
-        try:
-            dem[pnan] = griddata(points, np.ravel(dem[pok]), inter,
-                                 method='nearest')
-        except ValueError:
-            raise InvalidDEMError('DEM extrapolation not possible.')
-        log.warning(gdir.rgi_id + ': DEM needed extrapolation.')
-        gdir.add_to_diagnostics('dem_needed_extrapolation', True)
-        gdir.add_to_diagnostics('dem_extrapol_perc', len(pnan[0]) / (nx*ny))
-
-    if np.min(dem) == np.max(dem):
-        raise InvalidDEMError('({}) min equal max in the DEM.'
-                              .format(gdir.rgi_id))
-
-    # Proj
-    if LooseVersion(rasterio.__version__) >= LooseVersion('1.0'):
-        transf = dem_dr.transform
-    else:
-        raise ImportError('This task needs rasterio >= 1.0 to work properly')
-    x0 = transf[2]  # UL corner
-    y0 = transf[5]  # UL corner
-    dx = transf[0]
-    dy = transf[4]  # Negative
-    assert dx == -dy
-    assert dx == gdir.grid.dx
-    assert y0 == gdir.grid.corner_grid.y0
-    assert x0 == gdir.grid.corner_grid.x0
-
-    profile = dem_dr.profile
-    dem_dr.close()
-
-    # Clip topography to 0 m a.s.l.
-    dem = dem.clip(0)
-
-    # Smooth DEM?
-    if cfg.PARAMS['smooth_window'] > 0.:
-        gsize = np.rint(cfg.PARAMS['smooth_window'] / dx)
-        smoothed_dem = gaussian_blur(dem, np.int(gsize))
-    else:
-        smoothed_dem = dem.copy()
-
-    if not np.all(np.isfinite(smoothed_dem)):
-        raise InvalidDEMError('({}) NaN in smoothed DEM'.format(gdir.rgi_id))
+    if not os.path.exists(gdir.get_filepath('gridded_data')):
+        # In a possible future, we might actually want to raise a
+        # deprecation warning here
+        process_dem(gdir)
 
     # Geometries
     geometry = gdir.read_shapefile('outlines').geometry[0]
+
+    # rio metadata
+    with rasterio.open(gdir.get_filepath('dem'), 'r', driver='GTiff') as ds:
+        data = ds.read(1).astype(rasterio.float32)
+        profile = ds.profile
 
     # simple trick to correct invalid polys:
     # http://stackoverflow.com/questions/20833344/
@@ -748,16 +800,16 @@ def simple_glacier_masks(gdir):
     # Small detour as mask only accepts DataReader objects
     with rasterio.io.MemoryFile() as memfile:
         with memfile.open(**profile) as dataset:
-            dataset.write(dem.astype(np.int16)[np.newaxis, ...])
+            dataset.write(data.astype(np.int16)[np.newaxis, ...])
         dem_data = rasterio.open(memfile.name)
         masked_dem, _ = riomask(dem_data, [shpg.mapping(geometry)],
                                 filled=False)
     glacier_mask = ~masked_dem[0, ...].mask
 
-    # Smame without nunataks
+    # Same without nunataks
     with rasterio.io.MemoryFile() as memfile:
         with memfile.open(**profile) as dataset:
-            dataset.write(dem.astype(np.int16)[np.newaxis, ...])
+            dataset.write(data.astype(np.int16)[np.newaxis, ...])
         dem_data = rasterio.open(memfile.name)
         poly = shpg.mapping(shpg.Polygon(geometry.exterior))
         masked_dem, _ = riomask(dem_data, [poly],
@@ -769,6 +821,8 @@ def simple_glacier_masks(gdir):
     glacier_ext = glacier_mask_nonuna ^ erode
     glacier_ext = np.where(glacier_mask_nonuna, glacier_ext, 0)
 
+    dem = read_geotiff_dem(gdir)
+
     # Last sanity check based on the masked dem
     tmp_max = np.max(dem[glacier_mask])
     tmp_min = np.min(dem[glacier_mask])
@@ -776,7 +830,45 @@ def simple_glacier_masks(gdir):
         raise InvalidDEMError('({}) min equal max in the masked DEM.'
                               .format(gdir.rgi_id))
 
-    # hypsometry
+    # write out the grids in the netcdf file
+    with GriddedNcdfFile(gdir) as nc:
+
+        if 'glacier_mask' not in nc.variables:
+            v = nc.createVariable('glacier_mask', 'i1', ('y', 'x', ),
+                                  zlib=True)
+            v.units = '-'
+            v.long_name = 'Glacier mask'
+        else:
+            v = nc.variables['glacier_mask']
+        v[:] = glacier_mask
+
+        if 'glacier_ext' not in nc.variables:
+            v = nc.createVariable('glacier_ext', 'i1', ('y', 'x', ),
+                                  zlib=True)
+            v.units = '-'
+            v.long_name = 'Glacier external boundaries'
+        else:
+            v = nc.variables['glacier_ext']
+        v[:] = glacier_ext
+
+        # Log DEM that needed processing within the glacier mask
+        valid_mask = nc.variables['topo_valid_mask'][:]
+        if gdir.get_diagnostics().get('dem_needed_interpolation', False):
+            pnan = (valid_mask == 0) & glacier_mask
+            gdir.add_to_diagnostics('dem_invalid_perc_in_mask',
+                                    np.sum(pnan) / np.sum(glacier_mask))
+
+        # add some meta stats and close
+        nc.max_h_dem = np.max(dem)
+        nc.min_h_dem = np.min(dem)
+        dem_on_g = dem[np.where(glacier_mask)]
+        nc.max_h_glacier = np.max(dem_on_g)
+        nc.min_h_glacier = np.min(dem_on_g)
+
+    # hypsometry if asked for
+    if not write_hypsometry:
+        return
+
     bsize = 50.
     dem_on_ice = dem[glacier_mask]
     bins = np.arange(nicenumber(dem_on_ice.min(), bsize, lower=True),
@@ -797,7 +889,7 @@ def simple_glacier_masks(gdir):
             break
 
     # slope
-    sy, sx = np.gradient(dem, dx)
+    sy, sx = np.gradient(dem, gdir.grid.dx)
     aspect = np.arctan2(np.mean(-sx[glacier_mask]), np.mean(sy[glacier_mask]))
     aspect = np.rad2deg(aspect)
     if aspect < 0:
@@ -819,45 +911,91 @@ def simple_glacier_masks(gdir):
         df['{}'.format(np.round(bs).astype(int))] = [b]
     df.to_csv(gdir.get_filepath('hypsometry'), index=False)
 
-    # write out the grids in the netcdf file
-    nc = gdir.create_gridded_ncdf_file('gridded_data')
 
-    v = nc.createVariable('topo', 'f4', ('y', 'x', ), zlib=True)
-    v.units = 'm'
-    v.long_name = 'DEM topography'
-    v[:] = dem
+@entity_task(log, writes=['glacier_mask'])
+def rasterio_glacier_mask(gdir, source=None):
+    """Writes a 1-0 glacier mask GeoTiff with the same dimensions as dem.tif
 
-    v = nc.createVariable('topo_smoothed', 'f4', ('y', 'x', ), zlib=True)
-    v.units = 'm'
-    v.long_name = ('DEM topography smoothed '
-                   'with radius: {:.1} m'.format(cfg.PARAMS['smooth_window']))
-    v[:] = smoothed_dem
 
-    v = nc.createVariable('glacier_mask', 'i1', ('y', 'x', ), zlib=True)
-    v.units = '-'
-    v.long_name = 'Glacier mask'
-    v[:] = glacier_mask
+    Parameters
+    ----------
+    gdir : :py:class:`oggm.GlacierDirectory`
+        the glacier in question
+    source : str
 
-    v = nc.createVariable('glacier_ext', 'i1', ('y', 'x', ), zlib=True)
-    v.units = '-'
-    v.long_name = 'Glacier external boundaries'
-    v[:] = glacier_ext
+        - None (default): the task reads `dem.tif` from the GDir root
+        - 'ALL': try to open any folder from `utils.DEM_SOURCE` and use first
+        - any of `utils.DEM_SOURCE`: try only that one
+    """
 
-    # add some meta stats and close
-    nc.max_h_dem = np.max(dem)
-    nc.min_h_dem = np.min(dem)
-    dem_on_g = dem[np.where(glacier_mask)]
-    nc.max_h_glacier = np.max(dem_on_g)
-    nc.min_h_glacier = np.min(dem_on_g)
-    nc.close()
+    if source is None:
+        dempath = gdir.get_filepath('dem')
+    elif source in utils.DEM_SOURCES:
+        dempath = os.path.join(gdir.dir, source, 'dem.tif')
+    else:
+        for src in utils.DEM_SOURCES:
+            dempath = os.path.join(gdir.dir, src, 'dem.tif')
+            if os.path.isfile(dempath):
+                break
+
+    if not os.path.isfile(dempath):
+        raise ValueError('The specified source does not give a valid DEM file')
+
+    # read dem profile
+    with rasterio.open(dempath, 'r', driver='GTiff') as ds:
+        profile = ds.profile
+
+    # don't even bother reading the actual DEM, just mimic it
+    data = np.zeros((ds.height, ds.width))
+
+    # Read RGI outlines
+    geometry = gdir.read_shapefile('outlines').geometry[0]
+
+    # simple trick to correct invalid polys:
+    # http://stackoverflow.com/questions/20833344/
+    # fix-invalid-polygon-python-shapely
+    geometry = geometry.buffer(0)
+    if not geometry.is_valid:
+        raise InvalidDEMError('This glacier geometry is not valid.')
+
+    # Compute the glacier mask using rasterio
+    # Small detour as mask only accepts DataReader objects
+    with rasterio.io.MemoryFile() as memfile:
+        with memfile.open(**profile) as dataset:
+            dataset.write(data.astype(profile['dtype'])[np.newaxis, ...])
+        dem_data = rasterio.open(memfile.name)
+        masked_dem, _ = riomask(dem_data, [shpg.mapping(geometry)],
+                                filled=False)
+    glacier_mask = ~masked_dem[0, ...].mask
+
+    # parameters to for the new tif
+    nodata = -32767
+    dtype = rasterio.int16
+
+    # let's use integer
+    out = glacier_mask.astype(dtype)
+
+    # and check for sanity
+    if not np.all(np.unique(out) == np.array([0, 1])):
+        raise InvalidDEMError('({}) masked DEM does not consist of 0/1 only.'
+                              .format(gdir.rgi_id))
+
+    # Update existing profile for output
+    profile.update({
+        'dtype': dtype,
+        'nodata': nodata,
+    })
+
+    with rasterio.open(gdir.get_filepath('glacier_mask'), 'w', **profile) as r:
+        r.write(out.astype(dtype), 1)
 
 
 @entity_task(log, writes=['gridded_data'])
-def interpolation_masks(gdir):
-    """Computes the glacier exterior masks taking ice divides into account.
+def gridded_attributes(gdir):
+    """Adds attributes to the gridded file, useful for thickness interpolation.
 
-    This is useful for distributed ice thickness. The masks are added to the
-    gridded data file. For convenience we also add a slope mask.
+    This could be useful for distributed ice thickness models.
+    The raster data are added to the gridded_data file.
 
     Parameters
     ----------
@@ -881,7 +1019,7 @@ def interpolation_masks(gdir):
     if gdir.has_file('intersects'):
         # read and transform to grid
         gdf = gdir.read_shapefile('intersects')
-        salem.transform_geopandas(gdf, gdir.grid, inplace=True)
+        salem.transform_geopandas(gdf, to_crs=gdir.grid, inplace=True)
         gdfi = pd.concat([gdfi, gdf[['geometry']]])
 
     # Ice divide mask
@@ -906,8 +1044,13 @@ def interpolation_masks(gdir):
     glen_n = cfg.PARAMS['glen_n']
     sy, sx = np.gradient(topo_smoothed, dx, dx)
     slope = np.arctan(np.sqrt(sy**2 + sx**2))
-    slope = np.clip(slope, np.deg2rad(cfg.PARAMS['min_slope']*4), np.pi/2.)
-    slope = 1 / slope**(glen_n / (glen_n+2))
+    slope_factor = utils.clip_array(slope,
+                                    np.deg2rad(cfg.PARAMS['min_slope']*4),
+                                    np.pi/2)
+    slope_factor = 1 / slope_factor**(glen_n / (glen_n+2))
+
+    aspect = np.arctan2(-sx, sy)
+    aspect[aspect < 0] += 2 * np.pi
 
     with ncDataset(grids_file, 'a') as nc:
 
@@ -929,6 +1072,24 @@ def interpolation_masks(gdir):
         v.long_name = 'Glacier ice divides'
         v[:] = glacier_ext_intersect
 
+        vn = 'slope'
+        if vn in nc.variables:
+            v = nc.variables[vn]
+        else:
+            v = nc.createVariable(vn, 'f4', ('y', 'x', ))
+        v.units = 'rad'
+        v.long_name = 'Local slope based on smoothed topography'
+        v[:] = slope
+
+        vn = 'aspect'
+        if vn in nc.variables:
+            v = nc.variables[vn]
+        else:
+            v = nc.createVariable(vn, 'f4', ('y', 'x', ))
+        v.units = 'rad'
+        v.long_name = 'Local aspect based on smoothed topography'
+        v[:] = aspect
+
         vn = 'slope_factor'
         if vn in nc.variables:
             v = nc.variables[vn]
@@ -936,7 +1097,7 @@ def interpolation_masks(gdir):
             v = nc.createVariable(vn, 'f4', ('y', 'x', ))
         v.units = '-'
         v.long_name = 'Slope factor as defined in Farinotti et al 2009'
-        v[:] = slope
+        v[:] = slope_factor
 
         vn = 'dis_from_border'
         if vn in nc.variables:
@@ -944,8 +1105,244 @@ def interpolation_masks(gdir):
         else:
             v = nc.createVariable(vn, 'f4', ('y', 'x', ))
         v.units = 'm'
-        v.long_name = 'Distance from border'
+        v.long_name = 'Distance from glacier boundaries'
         v[:] = dis_from_border
+
+
+def _all_inflows(cls, cl):
+    """Find all centerlines flowing into the centerline examined.
+
+    Parameters
+    ----------
+    cls : list
+        all centerlines of the examined glacier
+    cline : Centerline
+        centerline to control
+
+    Returns
+    -------
+    list of strings of centerlines
+    """
+
+    ixs = [str(cls.index(cl.inflows[i])) for i in range(len(cl.inflows))]
+    for cl in cl.inflows:
+        ixs.extend(_all_inflows(cls, cl))
+    return ixs
+
+
+@entity_task(log)
+def gridded_mb_attributes(gdir):
+    """Adds mass-balance related attributes to the gridded data file.
+
+    This could be useful for distributed ice thickness models.
+    The raster data are added to the gridded_data file.
+
+    Parameters
+    ----------
+    gdir : :py:class:`oggm.GlacierDirectory`
+        where to write the data
+    """
+    from oggm.core.massbalance import LinearMassBalance, ConstantMassBalance
+    from oggm.core.centerlines import line_inflows
+
+    # Get the input data
+    with ncDataset(gdir.get_filepath('gridded_data')) as nc:
+        topo_2d = nc.variables['topo_smoothed'][:]
+        glacier_mask_2d = nc.variables['glacier_mask'][:]
+        glacier_mask_2d = glacier_mask_2d == 1
+        catchment_mask_2d = glacier_mask_2d * np.NaN
+
+    cls = gdir.read_pickle('centerlines')
+
+    # Catchment areas
+    cis = gdir.read_pickle('geometries')['catchment_indices']
+    for j, ci in enumerate(cis):
+        catchment_mask_2d[tuple(ci.T)] = j
+
+    # Make everything we need flat
+    catchment_mask = catchment_mask_2d[glacier_mask_2d].astype(int)
+    topo = topo_2d[glacier_mask_2d]
+
+    # Prepare the distributed mass-balance data
+    rho = cfg.PARAMS['ice_density']
+    dx2 = gdir.grid.dx ** 2
+
+    # Linear
+    def to_minimize(ela_h):
+        mbmod = LinearMassBalance(ela_h[0])
+        smb = mbmod.get_annual_mb(heights=topo)
+        return np.sum(smb)**2
+    ela_h = optimization.minimize(to_minimize, [0.], method='Powell')
+    mbmod = LinearMassBalance(float(ela_h['x']))
+    lin_mb_on_z = mbmod.get_annual_mb(heights=topo) * cfg.SEC_IN_YEAR * rho
+    if not np.isclose(np.sum(lin_mb_on_z), 0, atol=10):
+        raise RuntimeError('Spec mass-balance should be zero but is: {}'
+                           .format(np.sum(lin_mb_on_z)))
+
+    # Normal OGGM (a bit tweaked)
+    df = gdir.read_json('local_mustar')
+
+    def to_minimize(mu_star):
+        mbmod = ConstantMassBalance(gdir, mu_star=mu_star, bias=0,
+                                    check_calib_params=False,
+                                    y0=df['t_star'])
+        smb = mbmod.get_annual_mb(heights=topo)
+        return np.sum(smb)**2
+    mu_star = optimization.minimize(to_minimize, [0.], method='Powell')
+    mbmod = ConstantMassBalance(gdir, mu_star=float(mu_star['x']), bias=0,
+                                check_calib_params=False,
+                                y0=df['t_star'])
+    oggm_mb_on_z = mbmod.get_annual_mb(heights=topo) * cfg.SEC_IN_YEAR * rho
+    if not np.isclose(np.sum(oggm_mb_on_z), 0, atol=10):
+        raise RuntimeError('Spec mass-balance should be zero but is: {}'
+                           .format(np.sum(oggm_mb_on_z)))
+
+    # Altitude based mass balance
+    catch_area_above_z = topo * np.NaN
+    lin_mb_above_z = topo * np.NaN
+    oggm_mb_above_z = topo * np.NaN
+    for i, h in enumerate(topo):
+        catch_area_above_z[i] = np.sum(topo >= h) * dx2
+        lin_mb_above_z[i] = np.sum(lin_mb_on_z[topo >= h]) * dx2
+        oggm_mb_above_z[i] = np.sum(oggm_mb_on_z[topo >= h]) * dx2
+
+    # Hardest part - MB per catchment
+    catchment_area = topo * np.NaN
+    lin_mb_above_z_on_catch = topo * np.NaN
+    oggm_mb_above_z_on_catch = topo * np.NaN
+
+    # First, find all inflows indices and min altitude per catchment
+    inflows = []
+    lowest_h = []
+    for i, cl in enumerate(cls):
+        lowest_h.append(np.min(topo[catchment_mask == i]))
+        inflows.append([cls.index(l) for l in line_inflows(cl, keep=False)])
+
+    for i, (catch_id, h) in enumerate(zip(catchment_mask, topo)):
+
+        if h == np.min(topo):
+            t = 1
+
+        # Find the catchment area of the point itself by eliminating points
+        # below the point altitude. We assume we keep all of them first,
+        # then remove those we don't want
+        sel_catchs = inflows[catch_id].copy()
+        for catch in inflows[catch_id]:
+            if h >= lowest_h[catch]:
+                for cc in np.append(inflows[catch], catch):
+                    try:
+                        sel_catchs.remove(cc)
+                    except ValueError:
+                        pass
+
+        # At the very least we need or own catchment
+        sel_catchs.append(catch_id)
+
+        # Then select all the catchment points
+        sel_points = np.isin(catchment_mask, sel_catchs)
+
+        # And keep the ones above our altitude
+        sel_points = sel_points & (topo >= h)
+
+        # Compute
+        lin_mb_above_z_on_catch[i] = np.sum(lin_mb_on_z[sel_points]) * dx2
+        oggm_mb_above_z_on_catch[i] = np.sum(oggm_mb_on_z[sel_points]) * dx2
+        catchment_area[i] = np.sum(sel_points) * dx2
+
+    # Make 2D again
+    def _fill_2d_like(data):
+        out = topo_2d * np.NaN
+        out[glacier_mask_2d] = data
+        return out
+
+    catchment_area = _fill_2d_like(catchment_area)
+    catch_area_above_z = _fill_2d_like(catch_area_above_z)
+    lin_mb_above_z = _fill_2d_like(lin_mb_above_z)
+    oggm_mb_above_z = _fill_2d_like(oggm_mb_above_z)
+    lin_mb_above_z_on_catch = _fill_2d_like(lin_mb_above_z_on_catch)
+    oggm_mb_above_z_on_catch = _fill_2d_like(oggm_mb_above_z_on_catch)
+
+    # Save to file
+    with ncDataset(gdir.get_filepath('gridded_data'), 'a') as nc:
+
+        vn = 'catchment_area'
+        if vn in nc.variables:
+            v = nc.variables[vn]
+        else:
+            v = nc.createVariable(vn, 'f4', ('y', 'x', ))
+        v.units = 'm^2'
+        v.long_name = 'Catchment area above point'
+        v.description = ('This is a very crude method: just the area above '
+                         'the points elevation on glacier.')
+        v[:] = catch_area_above_z
+
+        vn = 'catchment_area_on_catch'
+        if vn in nc.variables:
+            v = nc.variables[vn]
+        else:
+            v = nc.createVariable(vn, 'f4', ('y', 'x',))
+        v.units = 'm^2'
+        v.long_name = 'Catchment area above point on flowline catchments'
+        v.description = ('Uses the catchments masks of the flowlines to '
+                         'compute the area above the altitude of the given '
+                         'point.')
+        v[:] = catchment_area
+
+        vn = 'lin_mb_above_z'
+        if vn in nc.variables:
+            v = nc.variables[vn]
+        else:
+            v = nc.createVariable(vn, 'f4', ('y', 'x', ))
+        v.units = 'kg/year'
+        v.long_name = 'MB above point from linear MB model, without catchments'
+        v.description = ('Mass-balance cumulated above the altitude of the'
+                         'point, hence in unit of flux. Note that it is '
+                         'a coarse approximation of the real flux. '
+                         'The mass-balance model is a simple linear function'
+                         'of altitude.')
+        v[:] = lin_mb_above_z
+
+        vn = 'lin_mb_above_z_on_catch'
+        if vn in nc.variables:
+            v = nc.variables[vn]
+        else:
+            v = nc.createVariable(vn, 'f4', ('y', 'x', ))
+        v.units = 'kg/year'
+        v.long_name = 'MB above point from linear MB model, with catchments'
+        v.description = ('Mass-balance cumulated above the altitude of the'
+                         'point in a flowline catchment, hence in unit of '
+                         'flux. Note that it is a coarse approximation of the '
+                         'real flux. The mass-balance model is a simple '
+                         'linear function of altitude.')
+        v[:] = lin_mb_above_z_on_catch
+
+        vn = 'oggm_mb_above_z'
+        if vn in nc.variables:
+            v = nc.variables[vn]
+        else:
+            v = nc.createVariable(vn, 'f4', ('y', 'x', ))
+        v.units = 'kg/year'
+        v.long_name = 'MB above point from OGGM MB model, without catchments'
+        v.description = ('Mass-balance cumulated above the altitude of the'
+                         'point, hence in unit of flux. Note that it is '
+                         'a coarse approximation of the real flux. '
+                         'The mass-balance model is a calibrated temperature '
+                         'index model like OGGM.')
+        v[:] = oggm_mb_above_z
+
+        vn = 'oggm_mb_above_z_on_catch'
+        if vn in nc.variables:
+            v = nc.variables[vn]
+        else:
+            v = nc.createVariable(vn, 'f4', ('y', 'x', ))
+        v.units = 'kg/year'
+        v.long_name = 'MB above point from OGGM MB model, with catchments'
+        v.description = ('Mass-balance cumulated above the altitude of the'
+                         'point in a flowline catchment, hence in unit of '
+                         'flux. Note that it is a coarse approximation of the '
+                         'real flux. The mass-balance model is a calibrated '
+                         'temperature index model like OGGM.')
+        v[:] = oggm_mb_above_z_on_catch
 
 
 def merged_glacier_masks(gdir, geometry):
@@ -966,40 +1363,18 @@ def merged_glacier_masks(gdir, geometry):
     """
 
     # open srtm tif-file:
-    dem_dr = rasterio.open(gdir.get_filepath('dem'), 'r', driver='GTiff')
-    dem = dem_dr.read(1).astype(rasterio.float32)
-
-    # Grid
-    nx = dem_dr.width
-    ny = dem_dr.height
-    assert nx == gdir.grid.nx
-    assert ny == gdir.grid.ny
+    dem = read_geotiff_dem(gdir)
 
     if np.min(dem) == np.max(dem):
         raise RuntimeError('({}) min equal max in the DEM.'
                            .format(gdir.rgi_id))
 
-    # Projection
-    if LooseVersion(rasterio.__version__) >= LooseVersion('1.0'):
-        transf = dem_dr.transform
-    else:
-        transf = dem_dr.affine
-    x0 = transf[2]  # UL corner
-    y0 = transf[5]  # UL corner
-    dx = transf[0]
-    dy = transf[4]  # Negative
-
-    if not (np.allclose(dx, -dy) or np.allclose(dx, gdir.grid.dx) or
-            np.allclose(y0, gdir.grid.corner_grid.y0, atol=1e-2) or
-            np.allclose(x0, gdir.grid.corner_grid.x0, atol=1e-2)):
-        raise RuntimeError('DEM file and Salem Grid do not match!')
-    dem_dr.close()
-
     # Clip topography to 0 m a.s.l.
-    dem = dem.clip(0)
+    utils.clip_min(dem, 0, out=dem)
 
     # Interpolate shape to a regular path
-    glacier_poly_hr = list(geometry)
+    glacier_poly_hr = tolist(geometry)
+
     for nr, poly in enumerate(glacier_poly_hr):
         # transform geometry to map
         _geometry = salem.transform_geometry(poly, to_crs=gdir.grid.proj)
@@ -1029,13 +1404,14 @@ def merged_glacier_masks(gdir, geometry):
         return np.rint(x).astype(np.int64), np.rint(y).astype(np.int64)
 
     glacier_poly_pix = shapely.ops.transform(project, glacier_poly_hr)
+    glacier_poly_pix_iter = tolist(glacier_poly_pix)
 
     # Compute the glacier mask (currently: center pixels + touched)
     nx, ny = gdir.grid.nx, gdir.grid.ny
     glacier_mask = np.zeros((ny, nx), dtype=np.uint8)
     glacier_ext = np.zeros((ny, nx), dtype=np.uint8)
 
-    for poly in glacier_poly_pix:
+    for poly in glacier_poly_pix_iter:
         (x, y) = poly.exterior.xy
         glacier_mask[skdraw.polygon(np.array(y), np.array(x))] = 1
         for gint in poly.interiors:
@@ -1054,30 +1430,29 @@ def merged_glacier_masks(gdir, geometry):
                            .format(gdir.rgi_id))
 
     # write out the grids in the netcdf file
-    nc = gdir.create_gridded_ncdf_file('gridded_data')
+    with GriddedNcdfFile(gdir, reset=True) as nc:
 
-    v = nc.createVariable('topo', 'f4', ('y', 'x', ), zlib=True)
-    v.units = 'm'
-    v.long_name = 'DEM topography'
-    v[:] = dem
+        v = nc.createVariable('topo', 'f4', ('y', 'x', ), zlib=True)
+        v.units = 'm'
+        v.long_name = 'DEM topography'
+        v[:] = dem
 
-    v = nc.createVariable('glacier_mask', 'i1', ('y', 'x', ), zlib=True)
-    v.units = '-'
-    v.long_name = 'Glacier mask'
-    v[:] = glacier_mask
+        v = nc.createVariable('glacier_mask', 'i1', ('y', 'x', ), zlib=True)
+        v.units = '-'
+        v.long_name = 'Glacier mask'
+        v[:] = glacier_mask
 
-    v = nc.createVariable('glacier_ext', 'i1', ('y', 'x', ), zlib=True)
-    v.units = '-'
-    v.long_name = 'Glacier external boundaries'
-    v[:] = glacier_ext
+        v = nc.createVariable('glacier_ext', 'i1', ('y', 'x', ), zlib=True)
+        v.units = '-'
+        v.long_name = 'Glacier external boundaries'
+        v[:] = glacier_ext
 
-    # add some meta stats and close
-    nc.max_h_dem = np.max(dem)
-    nc.min_h_dem = np.min(dem)
-    dem_on_g = dem[np.where(glacier_mask)]
-    nc.max_h_glacier = np.max(dem_on_g)
-    nc.min_h_glacier = np.min(dem_on_g)
-    nc.close()
+        # add some meta stats and close
+        nc.max_h_dem = np.max(dem)
+        nc.min_h_dem = np.min(dem)
+        dem_on_g = dem[np.where(glacier_mask)]
+        nc.max_h_glacier = np.max(dem_on_g)
+        nc.min_h_glacier = np.min(dem_on_g)
 
     geometries = dict()
     geometries['polygon_hr'] = glacier_poly_hr

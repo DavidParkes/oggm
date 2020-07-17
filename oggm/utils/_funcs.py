@@ -7,9 +7,9 @@ import sys
 import math
 import logging
 import warnings
+from distutils.version import LooseVersion
 
 # External libs
-import geopandas as gpd
 import pandas as pd
 import numpy as np
 from scipy.ndimage import filters
@@ -18,13 +18,20 @@ from scipy.interpolate import interp1d
 import shapely.geometry as shpg
 from shapely.ops import linemerge
 
+# Optional libs
+try:
+    import geopandas as gpd
+except ImportError:
+    pass
+
 # Locals
 import oggm.cfg as cfg
 from oggm.cfg import SEC_IN_YEAR, SEC_IN_MONTH
 from oggm.utils._downloads import get_demo_file
+from oggm.exceptions import InvalidParamsError, InvalidGeometryError
 
 # Module logger
-logger = logging.getLogger('.'.join(__name__.split('.')[:-1]))
+log = logging.getLogger('.'.join(__name__.split('.')[:-1]))
 
 _RGI_METADATA = dict()
 
@@ -309,6 +316,14 @@ def rmsd(ref, data, axis=None):
     return np.sqrt(np.mean((np.asarray(ref) - data)**2, axis=axis))
 
 
+def rmsd_bc(ref, data):
+    """Root Mean Squared Deviation of bias-corrected time series.
+
+    I.e: rmsd(ref - mean(ref), data - mean(data)).
+    """
+    return rmsd(ref - np.mean(ref), data - np.mean(data))
+
+
 def rel_err(ref, data):
     """Relative error. Ref should be non-zero"""
     return (np.asarray(data) - ref) / ref
@@ -317,6 +332,29 @@ def rel_err(ref, data):
 def corrcoef(ref, data):
     """Peason correlation coefficient."""
     return np.corrcoef(ref, data)[0, 1]
+
+
+def clip_scalar(value, vmin, vmax):
+    """A faster numpy.clip ON SCALARS ONLY.
+
+    See https://github.com/numpy/numpy/issues/14281
+    """
+    return vmin if value < vmin else vmax if value > vmax else value
+
+
+if LooseVersion(np.__version__) < LooseVersion('1.17'):
+    clip_array = np.clip
+else:
+    # TODO: reassess this when https://github.com/numpy/numpy/issues/14281
+    # is solved
+    clip_array = np.core.umath.clip
+
+
+# A faster numpy.clip when only one value is clipped (here: min).
+clip_min = np.core.umath.maximum
+
+# A faster numpy.clip when only one value is clipped (here: max).
+clip_max = np.core.umath.minimum
 
 
 def nicenumber(number, binsize, lower=False):
@@ -429,6 +467,56 @@ def polygon_intersections(gdf):
     return out
 
 
+def multipolygon_to_polygon(geometry, gdir=None):
+    """Sometimes an RGI geometry is a multipolygon: this should not happen.
+
+    Parameters
+    ----------
+    geometry : shpg.Polygon or shpg.MultiPolygon
+        the geometry to check
+    gdir : GlacierDirectory, optional
+        for logging
+
+    Returns
+    -------
+    the corrected geometry
+    """
+
+    # Log
+    rid = gdir.rgi_id + ': ' if gdir is not None else ''
+
+    if 'Multi' in geometry.type:
+        parts = np.array(geometry)
+        for p in parts:
+            assert p.type == 'Polygon'
+        areas = np.array([p.area for p in parts])
+        parts = parts[np.argsort(areas)][::-1]
+        areas = areas[np.argsort(areas)][::-1]
+
+        # First case (was RGIV4):
+        # let's assume that one poly is exterior and that
+        # the other polygons are in fact interiors
+        exterior = parts[0].exterior
+        interiors = []
+        was_interior = 0
+        for p in parts[1:]:
+            if parts[0].contains(p):
+                interiors.append(p.exterior)
+                was_interior += 1
+        if was_interior > 0:
+            # We are done here, good
+            geometry = shpg.Polygon(exterior, interiors)
+        else:
+            # This happens for bad geometries. We keep the largest
+            geometry = parts[0]
+            if np.any(areas[1:] > (areas[0] / 4)):
+                log.info('Geometry {} lost quite a chunk.'.format(rid))
+
+    if geometry.type != 'Polygon':
+        raise InvalidGeometryError('Geometry {} is not a Polygon.'.format(rid))
+    return geometry
+
+
 def floatyear_to_date(yr):
     """Converts a float year to an actual (year, month) pair.
 
@@ -479,7 +567,7 @@ def date_to_floatyear(y, m):
             SEC_IN_MONTH / SEC_IN_YEAR)
 
 
-def hydrodate_to_calendardate(y, m, start_month=10):
+def hydrodate_to_calendardate(y, m, start_month=None):
     """Converts a hydrological (year, month) pair to a calendar date.
 
     Parameters
@@ -491,6 +579,11 @@ def hydrodate_to_calendardate(y, m, start_month=10):
     start_month : int
         the first month of the hydrological year
     """
+
+    if start_month is None:
+        raise InvalidParamsError('In order to avoid confusion, we now force '
+                                 'callers of this function to specify the '
+                                 'hydrological convention they are using.')
 
     e = 13 - start_month
     try:
@@ -511,7 +604,7 @@ def hydrodate_to_calendardate(y, m, start_month=10):
     return out_y, out_m
 
 
-def calendardate_to_hydrodate(y, m, start_month=10):
+def calendardate_to_hydrodate(y, m, start_month=None):
     """Converts a calendar (year, month) pair to a hydrological date.
 
     Parameters
@@ -523,6 +616,11 @@ def calendardate_to_hydrodate(y, m, start_month=10):
     start_month : int
         the first month of the hydrological year
     """
+
+    if start_month is None:
+        raise InvalidParamsError('In order to avoid confusion, we now force '
+                                 'callers of this function to specify the '
+                                 'hydrological convention they are using.')
 
     try:
         if m >= start_month:
@@ -581,11 +679,9 @@ def filter_rgi_name(name):
 
 
 def shape_factor_huss(widths, heights, is_rectangular):
-    """Compute shape factor for inclusion of lateral drag
-    according to Huss and Farinotti (2012). The shape factor is only applied
-    for parabolic sections.
+    """Shape factor for lateral drag according to Huss and Farinotti (2012).
 
-    Not yet tested
+    The shape factor is only applied for parabolic sections.
 
     Parameters
     ----------
@@ -605,22 +701,22 @@ def shape_factor_huss(widths, heights, is_rectangular):
     is_rect = is_rectangular.astype(bool)
     shape_factors = np.ones(widths.shape)
 
-    # TODO: could check for division by 0, but at the moment
-    # this is covered by interpolation and clip, resulting in a factor of 1
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=RuntimeWarning)
         shape_factors[~is_rect] = (widths / (2 * heights + widths))[~is_rect]
-    shape_factors[heights <= 0.] = 1.
+
+    # For very small thicknesses ignore
+    shape_factors[heights <= 1.] = 1.
+    # Security
+    shape_factors = clip_array(shape_factors, 0.2, 1.)
 
     return shape_factors
 
 
 def shape_factor_adhikari(widths, heights, is_rectangular):
-    """Compute shape factor for inclusion of lateral drag according to
-    Adhikari (2012)
+    """Shape factor for lateral drag according to Adhikari (2012).
 
-    TODO: should we expand this here to also include
-    the factors suggested for sliding?
+    TODO: other factors could be used when sliding is included
 
     Parameters
     ----------
@@ -639,10 +735,9 @@ def shape_factor_adhikari(widths, heights, is_rectangular):
     # Ensure bool (for masking)
     is_rectangular = is_rectangular.astype(bool)
 
-    # TODO: could check for division by 0, but at the moment
-    # this is covered by interpolation and clip, resulting in a factor of 1
+    # Catch for division by 0 (corrected later)
     with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=RuntimeWarning)
+        warnings.filterwarnings('ignore', category=RuntimeWarning)
         zetas = widths / 2. / heights
 
     shape_factors = np.ones(widths.shape)
@@ -653,161 +748,8 @@ def shape_factor_adhikari(widths, heights, is_rectangular):
     shape_factors[~is_rectangular] = ADHIKARI_FACTORS_PARABOLIC(
         zetas[~is_rectangular])
 
-    np.clip(shape_factors, 0.2, 1., out=shape_factors)
+    shape_factors = clip_array(shape_factors, 0.2, 1.)
     # Set NaN values resulting from zero height to a shape factor of 1
     shape_factors[np.isnan(shape_factors)] = 1.
 
     return shape_factors
-
-
-def calving_flux_from_depth(gdir, k=None, water_depth=None, thick=None):
-    """Finds a calving flux from the calving front thickness.
-
-    Approach based on Huss and Hock, (2015) and Oerlemans and Nick (2005).
-    We take the initial output of the model and surface elevation data
-    to calculate the water depth of the calving front.
-
-    Parameters
-    ----------
-    gdir : GlacierDirectory
-    k : float
-        calving constant
-    water_depth :
-        the default is to compute the water_depth from ice thickness
-        at the terminus and altitude. Set this to force the water depth
-        to a certain value
-    thick :
-        Set this to force the ice thickness to a certain value (for
-        sensitivity experiments).
-
-    Returns
-    -------
-    A dictionary containing:
-    - the calving flux in [km3 yr-1]
-    - the frontal width in m
-    - the frontal thickness in m
-    - the frontal water depth in m
-    - the frontal free board in m
-    """
-
-    # Defaults
-    if k is None:
-        k = cfg.PARAMS['k_calving']
-
-    # Read inversion output
-    cl = gdir.read_pickle('inversion_output')[-1]
-    fl = gdir.read_pickle('inversion_flowlines')[-1]
-
-    # Altitude at the terminus and frontal width
-    t_altitude = np.clip(fl.surface_h[-1], 0, None)
-    width = fl.widths[-1] * gdir.grid.dx
-
-    # Calving formula
-    if thick is None:
-        thick = cl['thick'][-1]
-    if water_depth is None:
-        water_depth = thick - t_altitude
-    else:
-        # Correct thickness with prescribed depth
-        thick = water_depth + t_altitude
-    flux = k * thick * water_depth * width / 1e9
-
-    return {'flux': np.clip(flux, 0, None),
-            'width': width,
-            'thick': thick,
-            'water_depth': water_depth,
-            'free_board': t_altitude}
-
-
-def find_inversion_calving(gdir, water_depth=1, max_ite=30,
-                           stop_after_convergence=True):
-    """Iterative search for a calving flux compatible with the bed inversion.
-
-    See Recinos et al 2019 for details.
-
-    Parameters
-    ----------
-    water_depth : float
-        the initial water depth starting the loop (for sensitivity experiments)
-    """
-
-    # Shortcuts
-    from oggm.core import climate, inversion
-    from oggm.exceptions import MassBalanceCalibrationError
-
-    rho = cfg.PARAMS['ice_density']
-
-    # We accept values down to zero before stopping
-    cfg.PARAMS['min_mu_star'] = 0
-
-    # Start iteration
-    i = 0
-    cfg.PARAMS['clip_mu_star'] = False
-    odf = pd.DataFrame()
-    mu_is_zero = False
-    while i < max_ite:
-
-        # Calculates a calving flux from model output
-        if i == 0:
-            # First call we set to zero (it's just to be sure we start
-            # from a non-calving glacier)
-            f_calving = 0
-        elif i == 1:
-            # Second call we set a small positive calving to start with
-            out = calving_flux_from_depth(gdir, water_depth=water_depth)
-            f_calving = out['flux']
-        elif cfg.PARAMS['clip_mu_star']:
-            # If we had to clip mu, the inversion calving becomes the real
-            # flux, i.e. not compatible with calving law but with the
-            # inversion
-            fl = gdir.read_pickle('inversion_flowlines')[-1]
-            f_calving = fl.flux[-1] * (gdir.grid.dx ** 2) * 1e-9 / rho
-            mu_is_zero = True
-        else:
-            # Otherwise it is parameterized by the calving law
-            f_calving = calving_flux_from_depth(gdir)['flux']
-
-        # Give it back to the inversion and recompute
-        gdir.inversion_calving_rate = f_calving
-
-        # At this step we might raise a MassBalanceCalibrationError
-        try:
-            climate.local_t_star(gdir)
-            df = gdir.read_json('local_mustar')
-        except MassBalanceCalibrationError as e:
-            assert 'mu* out of specified bounds' in str(e)
-            # When this happens we clip mu* to zero and store the
-            # bad value (just for plotting)
-            cfg.PARAMS['clip_mu_star'] = True
-            df = gdir.read_json('local_mustar')
-            df['mu_star_glacierwide'] = float(str(e).split(':')[-1])
-            climate.local_t_star(gdir)
-
-        climate.mu_star_calibration(gdir)
-        inversion.prepare_for_inversion(gdir, add_debug_var=True)
-        v_inv, _ = inversion.mass_conservation_inversion(gdir)
-        out = calving_flux_from_depth(gdir)
-
-        # Store the data
-        odf.loc[i, 'calving_flux'] = f_calving
-        odf.loc[i, 'mu_star'] = df['mu_star_glacierwide']
-        odf.loc[i, 'calving_law_flux'] = out['flux']
-        odf.loc[i, 'width'] = out['width']
-        odf.loc[i, 'thick'] = out['thick']
-        odf.loc[i, 'water_depth'] = out['water_depth']
-        odf.loc[i, 'free_board'] = out['free_board']
-
-        # Do we have to do another_loop?
-        calving_flux = odf.calving_flux.values
-        if stop_after_convergence and i > 0:
-            # We want to make sure that we don't converge by chance
-            # so we test on last two iterations
-            conv = (np.allclose(calving_flux[[-1, -2]],
-                                [out['flux'], out['flux']],
-                                rtol=0.01))
-            if mu_is_zero or conv:
-                break
-        i += 1
-
-    odf.index.name = 'iterations'
-    return odf

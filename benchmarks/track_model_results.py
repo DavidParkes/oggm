@@ -6,11 +6,11 @@ import xarray as xr
 
 from oggm import tasks
 from oggm import cfg, utils, workflow
-from oggm.exceptions import MassBalanceCalibrationError
 from oggm.utils import get_demo_file
 from oggm.tests.funcs import get_test_dir
 from oggm.core import climate, massbalance
 from oggm.workflow import execute_entity_task
+from oggm.shop import cru
 
 
 class hef_prepro:
@@ -20,7 +20,7 @@ class hef_prepro:
     def cfg_init(self):
 
         # Init
-        cfg.initialize()
+        cfg.initialize(logging_level='ERROR')
         cfg.set_intersects_db(get_demo_file('rgi_intersect_oetztal.shp'))
         cfg.PATHS['dem_file'] = get_demo_file('hef_srtm.tif')
         cfg.PATHS['climate_file'] = get_demo_file('histalp_merged_hef.nc')
@@ -36,7 +36,7 @@ class hef_prepro:
 
         gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
 
-        tasks.define_glacier_region(gdir, entity=entity)
+        tasks.define_glacier_region(gdir)
         tasks.glacier_masks(gdir)
         tasks.compute_centerlines(gdir)
         tasks.initialize_flowlines(gdir)
@@ -142,7 +142,7 @@ class full_workflow:
     def cfg_init(self):
 
         # Initialize OGGM and set up the default run parameters
-        cfg.initialize()
+        cfg.initialize(logging_level='ERROR')
         cfg.PATHS['working_dir'] = self.testdir
         cfg.PARAMS['use_multiprocessing'] = True
         cfg.PARAMS['border'] = 100
@@ -156,9 +156,9 @@ class full_workflow:
         self.cfg_init()
 
         # Pre-download other files which will be needed later
-        utils.get_cru_cl_file()
-        utils.get_cru_file(var='tmp')
-        utils.get_cru_file(var='pre')
+        cru.get_cru_cl_file()
+        cru.get_cru_file(var='tmp')
+        cru.get_cru_file(var='pre')
 
         # Get the RGI glaciers for the run.
         rgi_list = ['RGI60-01.10299', 'RGI60-11.00897', 'RGI60-18.02342']
@@ -172,10 +172,11 @@ class full_workflow:
         rgidf = rgidf.sort_values('Area', ascending=False)
 
         # Go - initialize glacier directories
-        gdirs = workflow.init_glacier_regions(rgidf)
+        gdirs = workflow.init_glacier_directories(rgidf)
 
         # Preprocessing tasks
         task_list = [
+            tasks.define_glacier_region,
             tasks.glacier_masks,
             tasks.compute_centerlines,
             tasks.initialize_flowlines,
@@ -216,41 +217,41 @@ class full_workflow:
 
         # Compile output
         utils.compile_glacier_statistics(gdirs)
-        utils.compile_run_output(gdirs, filesuffix='_tstar')
-        utils.compile_run_output(gdirs, filesuffix='_pd')
+        utils.compile_run_output(gdirs, input_filesuffix='_tstar')
+        utils.compile_run_output(gdirs, input_filesuffix='_pd')
         utils.compile_climate_input(gdirs)
 
         return gdirs
 
     def track_start_volume(self, gdirs):
         self.cfg_init()
-        path = os.path.join(cfg.PATHS['working_dir'], 'run_output_tstar.nc')
-        ds = xr.open_dataset(path)
-        return float(ds.volume.sum(dim='rgi_id').isel(time=0)) * 1e-9
+        path = os.path.join(cfg.PATHS['working_dir'], 'run_output_tstar*.nc')
+        with xr.open_mfdataset(path, combine='by_coords') as ds:
+            return float(ds.volume.sum(dim='rgi_id').isel(time=0)) * 1e-9
 
     def track_tstar_run_final_volume(self, gdirs):
         self.cfg_init()
-        path = os.path.join(cfg.PATHS['working_dir'], 'run_output_tstar.nc')
-        ds = xr.open_dataset(path)
-        return float(ds.volume.sum(dim='rgi_id').isel(time=-1)) * 1e-9
+        path = os.path.join(cfg.PATHS['working_dir'], 'run_output_tstar*.nc')
+        with xr.open_mfdataset(path, combine='by_coords') as ds:
+            return float(ds.volume.sum(dim='rgi_id').isel(time=-1)) * 1e-9
 
     def track_1990_run_final_volume(self, gdirs):
         self.cfg_init()
-        path = os.path.join(cfg.PATHS['working_dir'], 'run_output_pd.nc')
-        ds = xr.open_dataset(path)
-        return float(ds.volume.sum(dim='rgi_id').isel(time=-1)) * 1e-9
+        path = os.path.join(cfg.PATHS['working_dir'], 'run_output_pd*.nc')
+        with xr.open_mfdataset(path, combine='by_coords') as ds:
+            return float(ds.volume.sum(dim='rgi_id').isel(time=-1)) * 1e-9
 
     def track_avg_temp_full_period(self, gdirs):
         self.cfg_init()
-        path = os.path.join(cfg.PATHS['working_dir'], 'climate_input.nc')
-        ds = xr.open_dataset(path)
-        return float(ds.temp.mean())
+        path = os.path.join(cfg.PATHS['working_dir'], 'climate_input*.nc')
+        with xr.open_mfdataset(path, combine='by_coords') as ds:
+            return float(ds.temp.mean())
 
     def track_avg_prcp_full_period(self, gdirs):
         self.cfg_init()
-        path = os.path.join(cfg.PATHS['working_dir'], 'climate_input.nc')
-        ds = xr.open_dataset(path)
-        return float(ds.prcp.mean())
+        path = os.path.join(cfg.PATHS['working_dir'], 'climate_input*.nc')
+        with xr.open_mfdataset(path, combine='by_coords') as ds:
+            return float(ds.prcp.mean())
 
 
 class columbia_calving:
@@ -260,7 +261,7 @@ class columbia_calving:
     def cfg_init(self):
 
         # Initialize OGGM and set up the default run parameters
-        cfg.initialize()
+        cfg.initialize(logging_level='ERROR')
         cfg.PATHS['working_dir'] = self.testdir
         cfg.PARAMS['use_intersects'] = False
         cfg.PATHS['dem_file'] = get_demo_file('dem_Columbia.tif')
@@ -276,7 +277,7 @@ class columbia_calving:
         entity = gpd.read_file(get_demo_file('01_rgi60_Columbia.shp')).iloc[0]
         gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
 
-        tasks.define_glacier_region(gdir, entity=entity)
+        tasks.define_glacier_region(gdir)
         tasks.glacier_masks(gdir)
         tasks.compute_centerlines(gdir)
         tasks.initialize_flowlines(gdir)
@@ -286,32 +287,26 @@ class columbia_calving:
         tasks.catchment_intersections(gdir)
         tasks.catchment_width_geom(gdir)
         tasks.catchment_width_correction(gdir)
-        climate.process_dummy_cru_file(gdir, seed=0)
+        tasks.process_dummy_cru_file(gdir, seed=0)
 
         # Test default k (it overshoots)
-        df1 = utils.find_inversion_calving(gdir)
+        df1 = tasks.find_inversion_calving(gdir)
 
         # Test with smaller k (it doesn't overshoot)
-        cfg.PARAMS['k_calving'] = 0.2
-        df2 = utils.find_inversion_calving(gdir)
+        cfg.PARAMS['inversion_calving_k'] = 0.2
+        df2 = tasks.find_inversion_calving(gdir)
 
-        return (df1.calving_flux.values, df1.mu_star.values,
-                df2.calving_flux.values, df2.mu_star.values)
+        return (df1['calving_flux'], df1['calving_mu_star'],
+                df2['calving_flux'], df2['calving_mu_star'])
 
-    def track_over_endloop_calving_flux(self, values):
-        return values[0][-1]
+    def track_overshoot_calving_flux(self, values):
+        return values[0]
 
-    def track_over_startloop_mu_star(self, values):
-        return values[1][0]
+    def track_overshoot_mu_star(self, values):
+        return values[1]
 
-    def track_over_endloop_mu_star(self, values):
-        return values[1][-1]
+    def track_no_overshoot_calving_flux(self, values):
+        return values[2]
 
-    def track_under_endloop_calving_flux(self, values):
-        return values[2][-1]
-
-    def track_under_startloop_mu_star(self, values):
-        return values[3][0]
-
-    def track_under_endloop_mu_star(self, values):
-        return values[3][-1]
+    def track_no_overshoot_mu_star(self, values):
+        return values[3]

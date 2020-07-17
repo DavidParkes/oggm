@@ -4,17 +4,296 @@
 Version history
 ===============
 
-v1.1.x (unreleased)
+v1.3.X (unreleased)
 -------------------
 
 Breaking changes
 ~~~~~~~~~~~~~~~~
 
+- The dynamical model now has a "real" parameterization for calving (WIP).
+  A blog post explaining it can be found
+  `on the website <https://oggm.org/2020/02/16/calving-param/>`_
+  (:pull:`945`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_
+- The calving parameterization has been extended and made more useful
+  by logging its output to compiled files. See :pull:`996` for code changes
+  and watch out for upcoming changes in the documentation and notebooks.
+  By `Fabien Maussion <https://github.com/fmaussion>`_
+- The new default when applying GCM data to a glacier is to correct for
+  temperature standard deviation (:pull:`978`). The previous default was
+  wrong and should not be the default.
+  By `Fabien Maussion <https://github.com/fmaussion>`_
+- Added a new "glacier directory initialization" global task:
+  `init_glacier_directories` (:pull:`983`, :issue:`965`). It replaces
+  `init_glacier_regions` and covers all its functionality, except that
+  it does *not* process the DEM data (this was a confusing "feature" of
+  `init_glacier_regions`). The old task `init_glacier_regions` is officially
+  deprecated but without warnings for now. Since it is a very widely used
+  task, we prefer to deprecate it in a slow cycle: first, change the
+  documentation, deprecate later.
+  By `Fabien Maussion <https://github.com/fmaussion>`_
+- More climate datasets are now supported in OGGM (:pull:`1036`).
+  A new task (`historical_climate_qc`) has been added to quality check the
+  climate timeseries.
+  This has not been tested intensively yet and is still a WIP.
+  By `Fabien Maussion <https://github.com/fmaussion>`_
+- The order of the tasks applied to  the preprocessed levels has
+  changed, climate data comes in later (:pull:`1038`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_
+
 Enhancements
 ~~~~~~~~~~~~
 
+- Added Copernicus DEM GLO-90 as optional DEM. Requires credentials to
+  ``spacedata.copernicus.eu`` stored in a local ``.netrc`` file. Credentials
+  can be added on the command line via ``$ oggm_netrc_credentials``
+  (:pull:`961`).
+  By `Matthias Dusch <https://github.com/matthiasdusch>`_.
+- Added NASADEM as optional DEM. This is a improved version of  SRTM and could
+  replace the current SRTM (https://lpdaac.usgs.gov/products/nasadem_hgtv001/).
+  (:pull:`971`).
+  By `Matthias Dusch <https://github.com/matthiasdusch>`_.
+- Added support for "squeezed" flowlines from Huss & Farinotti 2012
+  (:pull:`1040`). The corresponding tasks are
+  :py:func:`tasks.elevation_band_flowline` and
+  :py:func:`tasks.fixed_dx_elevation_band_flowline`.
+  By `Fabien Maussion <https://github.com/fmaussion>`_
+
+
 Bug fixes
 ~~~~~~~~~
+
+- Maintainance updates for upstream libraries and various small bug fixes
+  (:pull:`957`, :pull:`967`, :pull:`968`, :pull:`958`, :pull:`974`, :pull:`977`,
+  :pull:`976`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_ and
+  `Matthias Dusch <https://github.com/matthiasdusch>`_.
+
+
+v1.3.1 (16.02.2020)
+-------------------
+
+Minor release with small improvements but an important and necessary change in
+multiprocessing.
+
+Enhancements
+~~~~~~~~~~~~
+
+- After a recent change in multiprocessing, creating a pool of workers became
+  very slow. This change was necessary because of race conditions in GDAL,
+  but these conditions are rarely relevant to users. We now make this
+  change in multiprocession optional (:pull:`937`)
+- various improvements and changes in the dynamical model - mass-balance model
+  API. These were necessary to allow compatibility with the PyGEM model
+  (:pull:`938`, :pull:`946`, :pull:`949`, :pull:`953`, :pull:`951`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_ and
+  `David Rounce <https://github.com/drounce>`_.
+- added a "flux gate" to allow for precise mass-conservation checks in
+  numerical experiments (:pull:`944`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+
+
+v1.3.0 (02.02.2020)
+-------------------
+
+The time stepping scheme of OGGM has been fixed for several flaws.
+`This blog post <https://oggm.org/2020/01/18/stability-analysis/>`_
+explains it in detail. We expect some changes in OGGM results after this
+release, but they should not be noticeable in a vast majority of the cases.
+
+We recommend all users to update to this version.
+
+Breaking changes
+~~~~~~~~~~~~~~~~
+
+- The adaptive time stepping scheme of OGGM has been fixed for several flaws
+  which lead to instable results in certain conditions.
+  See `the blog post <https://oggm.org/2020/01/18/stability-analysis/>`_
+  for a full description. The API didn't change in the process, but the
+  OGGM results are likely to change slightly in some conditions.
+  (:issue:`731`, :issue:`860`, :pull:`931`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_ and
+  `Alex Jarosch <https://github.com/alexjarosch>`_.
+
+Enhancements
+~~~~~~~~~~~~
+
+- The `test_models` test module has been refactored to use pytest fixtures
+  instead of unittest classes (:pull:`934` and :pull:`922`).
+  By `Chris Merrill <https://github.com/C-Merrill>`_.
+
+
+v1.2.0 (04.01.2020)
+-------------------
+
+**OGGM is released under a new license.** We now use the
+`BSD-3-Clause <https://github.com/OGGM/oggm/blob/master/LICENSE.txt>`_ license.
+
+v1.1.3 (03.01.2020)
+-------------------
+
+Minor release of the OGGM model with several small improvements.
+We don't expect major changes in the model results due to this release.
+
+**Important:** this will be the last release under a GPL license. The next
+release (v1.2) will be done without modifications but under a BSD-3-Clause
+License.
+
+Enhancements
+~~~~~~~~~~~~
+
+- New function ``cfg.add_to_basenames`` now allows users to define their own
+  entries in glacier directories (:issue:`731`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+- New function ``inversion.compute_velocities`` writes the section and
+  surface veloicites in the inversion output (:issue:`876`).
+  By `Beatriz Recinos <https://github.com/bearecinos>`_.
+- Added ASTER v3 as optional DEM. Requires credentials to
+  ``urs.earthdata.nasa.gov`` stored in a local ``.netrc`` file. Credentials
+  can be added on the command line via ``$ oggm_nasa_earthdata_login``
+  (:pull:`884`).
+  By `Matthias Dusch <https://github.com/matthiasdusch>`_.
+- Added a global task (``tasks.compile_task_time`` and the associated method at
+  the GlacierDirectory level ``get_task_time``) to time the execution of
+  entity tasks (:issue:`918`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+- Improved performance of numerical core thanks to changes in our calls to
+  `np.clip` (:pull:`873` and :pull:`903`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+- Added a function `cfg.initialize_minimal` to run the flowline model
+  without enforcing a full download of the demo files (:pull:`921`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+
+Bug fixes
+~~~~~~~~~
+
+- Small bugs in DEM processing fixed - internal refactoring followed,
+  hopefully for the good (:pull:`890` and :pull:`886`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_ and
+  `Matthias Dusch <https://github.com/matthiasdusch>`_.
+
+
+v1.1.2 (12.09.2019)
+-------------------
+
+Minor release of the OGGM model, with several substantial improvements, most
+notably:
+
+- update in the inversion procedure for calving glaciers (Recinos et al., 2019)
+- new glacier evolution model based on Marzeion et al., 2012
+
+We don't expect major changes in the model results due to this release.
+
+
+Breaking changes
+~~~~~~~~~~~~~~~~
+
+- ``run_until`` now makes sure that the years (months) are not crossed by
+  the adaptive time-stepping scheme (:issue:`710`). ``run_until`` and
+  ``run_until_and_store`` should now be consistent. The change is unlikely to
+  affect the majority of users (which used ``run_until_and_store``), but
+  the results or ``run_until`` can be affected (:pull:`726`).
+  By `Matthias Dusch <https://github.com/matthiasdusch>`_.
+- ``find_inversion_calving`` has been renamed to
+  ``find_inversion_calving_loop`` and will probably be deprecated soon
+  (:pull:`794`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+- ``use_rgi_area=False`` now also recomputes CenLon and CenLat on the fly.
+  (:issue:`838`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+
+Enhancements
+~~~~~~~~~~~~
+
+- Added new ``gridded_attributes`` and ``gridded_mb_attributes`` tasks to
+  add raster glacier attributes such as slope, aspect, mass-balance...
+  to the glacier directory (:pull:`725`). This can be useful for statistical
+  modelling of glacier thickness.
+  By `Matteo Castellani <https://github.com/MatCast>`_.
+- Added support for a new DEM dataset: Mapzen, found on Amazon cloud
+  (:issue:`748`, :pull:`759`). Also added some utility functions to handle
+  DEMs, to be improved further in the near future.
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+- Added support for a new DEM dataset: REMA (:pull:`759`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+- Added an option to pre-process all DEMs at once (:pull:`771`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+- Added support for another evolution model: the volume-area-scaling based
+  model of Marzeion et al., 2012 (:pull:`662`). This is a major enhancement
+  to the code base as it increases the number of choices available to users
+  and demonstrates the modularity of the model.
+  By `Moritz Oberrauch <https://github.com/oberrauch>`_.
+- Changed the way the calving flux is computed during the ice thickness
+  inversion. This no longer relies on an iteration over mu*, but solves
+  for `h` instead. The new function is likely to replace the "old"
+  calving loop (:pull:`794`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+- ``compile_climate_input`` and ``compile_run_output`` are now faster for
+  larger numbers of glaciers thanks to temporary files (:pull:`814`).
+  By `Anouk Vlug <https://github.com/anoukvlug>`_. Could be made faster with
+  multiprocessing one day.
+- OGGM can now run in "minimal mode", i.e. without many of the hard
+  dependencies (:issue:`420`). This is useful for teaching or idealized
+  simulations, but won't work in production.
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+- the flowline model gives access to new diagnostics such as ice velocity and
+  flux along the flowline. The numerical core code changed in the process,
+  and we will monitor performance after this change (:pull:`853`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+
+
+Bug fixes
+~~~~~~~~~
+
+- Preprocessed directories at the level 3 now also have the glacier flowlines
+  ready for the run (:issue:`736`, :pull:`771`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+- Nominal glaciers now error early in the processing chain (:issue:`832`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+- Specific MB (not used operationaly) was wrongly computer for zero ice
+  thickness rectangular or parabolic sections. This is now corrected
+  (:issue:`828`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+- Fixed a bug in model output files where SH glaciers were wrongly attributed
+  with NH calendar dates (:issue:`824`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+
+
+v1.1.1 (24.04.2019)
+-------------------
+
+Minor release of the OGGM model, with several bugfixes and some improvements.
+
+We don't expect any change in the model results due to this release.
+
+Enhancements
+~~~~~~~~~~~~
+
+- Adapted ``graphics.plot_domain``, ``graphics.plot_centerlines`` and
+  ``graphics_plot_modeloutput_map`` to work with merged glaciers (:pull:`726`).
+  By `Matthias Dusch <https://github.com/matthiasdusch>`_.
+- Added (and updated) an official task to find the calving flux based on the
+  mass-conservation inversion (`inversion.find_inversion_calving`). This
+  is still in experimentation phase! (:pull:`720`).
+  By `Beatriz Recinos <https://github.com/bearecinos>`_.
+- Added a mechanism to add custom MB data to OGGM (:issue:`724`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+- The ALOS Global Digital Surface Model "ALOS World 3D - 30m" DEM from JAXA can
+  now be used as alternative DEM within OGGM.
+  `See our tutorial <http://edu.oggm.org/en/latest/oggm_tuto.html>`_ on how to
+  set an alternative DEM (:pull:`734`).
+  By `Matthias Dusch <https://github.com/matthiasdusch>`_.
+- Switch to setuptools-scm as a version control system (:issue:`727`).
+  By `Timo Rothenpieler <https://github.com/TimoRoth>`_.
+
+Bug fixes
+~~~~~~~~~
+
+- Fixed several problems with the file download verification algorithm.
+  By `Timo Rothenpieler <https://github.com/TimoRoth>`_.
+- Fixed a timing problem in the benchmark command line tool (:pull:`717`).
+  By `Fabien Maussion <https://github.com/fmaussion>`_.
+
 
 v1.1 (28.02.2019)
 -----------------
@@ -22,7 +301,7 @@ v1.1 (28.02.2019)
 This is a major new release of the OGGM model, with substantial improvements
 to version 1. We recommend to use this version from now on. It coincides
 with the publication of our publication in
-`Geoscientific Model Development <https://www.geosci-model-dev-discuss.net/gmd-2018-9/>`_.
+`Geoscientific Model Development <https://www.geosci-model-dev.net/12/909/2019/>`_.
 
 New contributors to the project:
 

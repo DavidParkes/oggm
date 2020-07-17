@@ -1,13 +1,18 @@
 """ OGGM package.
 
-Copyright: OGGM developers, 2014-2018
+Copyright: OGGM e.V. and OGGM Contributors
 
-License: GPLv3+
+License: BSD-3-Clause
 """
 # flake8: noqa
-from ._version import get_versions
-__version__ = get_versions()['version']
-del get_versions
+from pkg_resources import get_distribution, DistributionNotFound
+try:
+    __version__ = get_distribution(__name__).version
+except DistributionNotFound:
+    # package is not installed
+    pass
+finally:
+    del get_distribution, DistributionNotFound
 
 
 try:

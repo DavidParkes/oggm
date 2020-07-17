@@ -33,7 +33,8 @@ cfg.PARAMS['use_multiprocessing'] = True
 cfg.PARAMS['border'] = 80
 
 # Go - initialize glacier directories
-gdirs = workflow.init_glacier_regions(['RGI60-11.00897'], from_prepro_level=4)
+gdirs = workflow.init_glacier_directories(['RGI60-11.00897'],
+                                          from_prepro_level=4)
 
 # Additional climate file (CESM)
 cfg.PATHS['cesm_temp_file'] = get_demo_file('cesm.TREFHT.160001-200512'
@@ -65,8 +66,8 @@ execute_entity_task(tasks.run_from_climate_data, gdirs,
 # Compile output
 log.info('Compiling output')
 utils.compile_glacier_statistics(gdirs)
-ds1 = utils.compile_run_output(gdirs, filesuffix='_no_spinup')
-ds2 = utils.compile_run_output(gdirs, filesuffix='_with_spinup')
+ds1 = utils.compile_run_output(gdirs, input_filesuffix='_no_spinup')
+ds2 = utils.compile_run_output(gdirs, input_filesuffix='_with_spinup')
 
 # Log
 m, s = divmod(time.time() - start, 60)

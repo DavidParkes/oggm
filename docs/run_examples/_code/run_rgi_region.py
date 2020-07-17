@@ -52,7 +52,7 @@ log.workflow('Starting OGGM run')
 log.workflow('Number of glaciers: {}'.format(len(rgidf)))
 
 # Go - get the pre-processed glacier directories
-gdirs = workflow.init_glacier_regions(rgidf, from_prepro_level=4)
+gdirs = workflow.init_glacier_directories(rgidf, from_prepro_level=4)
 
 # We can step directly to a new experiment!
 # Random climate representative for the recent climate (1985-2015)
@@ -72,9 +72,9 @@ workflow.execute_entity_task(tasks.run_random_climate, gdirs,
 
 # Write the compiled output
 utils.compile_glacier_statistics(gdirs)
-utils.compile_run_output(gdirs, filesuffix='_commitment')
-utils.compile_run_output(gdirs, filesuffix='_bias_p')
-utils.compile_run_output(gdirs, filesuffix='_bias_m')
+utils.compile_run_output(gdirs, input_filesuffix='_commitment')
+utils.compile_run_output(gdirs, input_filesuffix='_bias_p')
+utils.compile_run_output(gdirs, input_filesuffix='_bias_m')
 
 # Log
 m, s = divmod(time.time() - start, 60)

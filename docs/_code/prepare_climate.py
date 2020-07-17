@@ -12,16 +12,20 @@ from oggm.core.climate import (mb_yearly_climate_on_glacier,
                                local_t_star, mu_star_calibration)
 from oggm.core.massbalance import (ConstantMassBalance)
 from oggm.utils import get_demo_file, gettempdir
+from oggm.shop import histalp
 
 cfg.initialize()
 cfg.set_intersects_db(get_demo_file('rgi_intersect_oetztal.shp'))
 cfg.PATHS['dem_file'] = get_demo_file('hef_srtm.tif')
+histalp.set_histalp_url('https://cluster.klima.uni-bremen.de/~oggm/'
+                        'test_climate/histalp/')
 
 base_dir = gettempdir('Climate_docs')
+cfg.PATHS['working_dir'] = base_dir
 entity = gpd.read_file(get_demo_file('HEF_MajDivide.shp')).iloc[0]
-gdir = oggm.GlacierDirectory(entity, base_dir=base_dir)
+gdir = oggm.GlacierDirectory(entity, base_dir=base_dir, reset=True)
 
-tasks.define_glacier_region(gdir, entity=entity)
+tasks.define_glacier_region(gdir)
 tasks.glacier_masks(gdir)
 tasks.compute_centerlines(gdir)
 tasks.initialize_flowlines(gdir)
@@ -29,12 +33,9 @@ tasks.compute_downstream_line(gdir)
 tasks.catchment_area(gdir)
 tasks.catchment_width_geom(gdir)
 tasks.catchment_width_correction(gdir)
-data_dir = get_demo_file('HISTALP_precipitation_all_abs_1801-2014.nc')
-cfg.PATHS['cru_dir'] = os.path.dirname(data_dir)
 cfg.PARAMS['baseline_climate'] = 'HISTALP'
-cfg.PARAMS['baseline_y0'] = 1850
 tasks.process_histalp_data(gdir)
-tasks.glacier_mu_candidates(gdir)
+mu_yr_clim = tasks.glacier_mu_candidates(gdir)
 
 mbdf = gdir.get_ref_mb_data()
 res = t_star_from_refmb(gdir, mbdf=mbdf.ANNUAL_BALANCE)
@@ -45,7 +46,6 @@ mu_star_calibration(gdir, reset=True)
 tasks.prepare_for_inversion(gdir, add_debug_var=True)
 
 # For plots
-mu_yr_clim = gdir.read_pickle('climate_info')['mu_candidates_glacierwide']
 years, temp_yr, prcp_yr = mb_yearly_climate_on_glacier(gdir)
 
 # which years to look at
@@ -80,9 +80,13 @@ tasks.distribute_thickness_per_altitude(gdir)
 
 # plot functions
 def example_plot_temp_ts():
-    d = xr.open_dataset(gdir.get_filepath('climate_monthly'))
+    d = xr.open_dataset(gdir.get_filepath('climate_historical'))
     temp = d.temp.resample(time='12MS').mean('time').to_series()
-    del temp.index.name
+    temp.index = temp.index.year
+    try:
+        temp = temp.rename_axis(None)
+    except AttributeError:
+        del temp.index.name
     temp.plot(figsize=(8, 4), label='Annual temp')
     tsm = temp.rolling(31, center=True, min_periods=15).mean()
     tsm.plot(label='31-yr avg')

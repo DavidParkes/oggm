@@ -4,33 +4,39 @@
 """
 # Builtins
 import logging
-import warnings
 import copy
 from collections import OrderedDict
+from functools import partial
 from time import gmtime, strftime
 import os
+import shutil
 
 # External libs
 import numpy as np
 import shapely.geometry as shpg
 import xarray as xr
-import salem
-import shutil
+
+# Optional libs
+try:
+    import salem
+except ImportError:
+    pass
 
 # Locals
 from oggm import __version__
 import oggm.cfg as cfg
 from oggm import utils
 from oggm import entity_task
-from oggm.exceptions import InvalidParamsError
+from oggm.exceptions import InvalidParamsError, InvalidWorkflowError
 from oggm.core.massbalance import (MultipleFlowlineMassBalance,
                                    ConstantMassBalance,
                                    PastMassBalance,
                                    RandomMassBalance)
 from oggm.core.centerlines import Centerline, line_order
+from oggm.core.inversion import find_sia_flux_from_thickness
 
 # Constants
-from oggm.cfg import SEC_IN_DAY, SEC_IN_YEAR, SEC_IN_HOUR
+from oggm.cfg import SEC_IN_DAY, SEC_IN_YEAR
 from oggm.cfg import G, GAUSSIAN_KERNEL
 
 # Module logger
@@ -38,30 +44,55 @@ log = logging.getLogger(__name__)
 
 
 class Flowline(Centerline):
-    """The is the input flowline for the model."""
+    """Common logic for different types of flowlines used as input to the model
+
+
+    """
 
     def __init__(self, line=None, dx=1, map_dx=None,
-                 surface_h=None, bed_h=None, rgi_id=None):
-        """ Instanciate.
+                 surface_h=None, bed_h=None, rgi_id=None,
+                 water_level=None):
+        """ Initialize a Flowline
 
-        #TODO: documentation
+        Parameters
+        ----------
+        line : :py:class:`shapely.geometry.LineString`
+            the geometrical line of a :py:class:`oggm.Centerline`
+        dx : float
+            Grid spacing in pixel coordinates
+        map_dx : float
+            DEM grid spacing in meters
+        surface_h: :py:class:`numpy.ndarray`
+            elevation [m] of the flowline grid points
+        bed_h: :py:class:`numpy.ndarray`
+            elevation[m] of the bedrock at the flowline grid points
+        rgi_id : str
+            The glacier's RGI identifier
+        water_level : float
+            The water level (to compute volume below sea-level)
         """
 
-        # This is do add flexibility for testing. I have no time for fancier
-        # stuff right now, but I will do this better one day:
+        # This is do add flexibility for testing
         if dx is None:
             dx = 1.
         if line is None:
-            coords = np.arange(0, len(surface_h)-0.5, dx)
-            line = shpg.LineString(np.vstack([coords, coords*0.]).T)
+            coords = np.arange(len(surface_h)) * dx
+            line = shpg.LineString(np.vstack([coords, coords * 0.]).T)
 
         super(Flowline, self).__init__(line, dx, surface_h)
 
-        self._thick = (surface_h - bed_h).clip(0.)
+        self._thick = utils.clip_min(surface_h - bed_h, 0.)
         self.map_dx = map_dx
         self.dx_meter = map_dx * self.dx
         self.bed_h = bed_h
         self.rgi_id = rgi_id
+        self.water_level = water_level
+
+        # volume not yet removed from the flowline
+        self.calving_bucket_m3 = 0
+
+    def has_ice(self):
+        return np.any(self.thick > 0)
 
     @Centerline.widths.getter
     def widths(self):
@@ -75,7 +106,7 @@ class Flowline(Centerline):
 
     @thick.setter
     def thick(self, value):
-        self._thick = value.clip(0)
+        self._thick = utils.clip_min(value, 0)
 
     @Centerline.surface_h.getter
     def surface_h(self):
@@ -86,22 +117,64 @@ class Flowline(Centerline):
         self.thick = value - self.bed_h
 
     @property
+    def bin_area_m2(self):
+        # area of the grid point
+        # this takes the ice thickness into account
+        return np.where(self.thick > 0, self.widths_m, 0) * self.dx_meter
+
+    @property
     def length_m(self):
         # We define the length a bit differently: but more robust
+        # TODO: take calving bucket into account
         pok = np.where(self.thick > 0.)[0]
         return len(pok) * self.dx_meter
 
     @property
     def volume_m3(self):
-        return np.sum(self.section * self.dx_meter)
+        return utils.clip_min(np.sum(self.section * self.dx_meter) -
+                              getattr(self, 'calving_bucket_m3', 0), 0)
 
     @property
     def volume_km3(self):
         return self.volume_m3 * 1e-9
 
+    def _vol_below_level(self, water_level=0):
+
+        thick = np.copy(self.thick)
+        n_thick = np.copy(thick)
+        bwl = (self.bed_h < water_level) & (thick > 0)
+        n_thick[~bwl] = 0
+        self.thick = n_thick
+        vol_tot = np.sum(self.section * self.dx_meter)
+        n_thick[bwl] = utils.clip_max(self.surface_h[bwl],
+                                      water_level) - self.bed_h[bwl]
+        self.thick = n_thick
+        vol_bwl = np.sum(self.section * self.dx_meter)
+        self.thick = thick
+        fac = vol_bwl / vol_tot if vol_tot > 0 else 0
+        return utils.clip_min(vol_bwl -
+                              getattr(self, 'calving_bucket_m3', 0) * fac, 0)
+
+    @property
+    def volume_bsl_m3(self):
+        return self._vol_below_level(water_level=0)
+
+    @property
+    def volume_bsl_km3(self):
+        return self.volume_bsl_m3 * 1e-9
+
+    @property
+    def volume_bwl_m3(self):
+        return self._vol_below_level(water_level=self.water_level)
+
+    @property
+    def volume_bwl_km3(self):
+        return self.volume_bwl_m3 * 1e-9
+
     @property
     def area_m2(self):
-        return np.sum(self.widths_m * self.dx_meter)
+        # TODO: take calving bucket into account
+        return np.sum(self.bin_area_m2)
 
     @property
     def area_km2(self):
@@ -119,7 +192,11 @@ class Flowline(Centerline):
         ds = xr.Dataset()
         ds.coords['x'] = np.arange(nx)
         ds.coords['c'] = [0, 1]
-        ds['linecoords'] = (['x', 'c'], np.asarray(self.line.coords))
+        try:
+            ds['linecoords'] = (['x', 'c'], np.asarray(self.line.coords))
+        except AttributeError:
+            # squeezed lines
+            pass
         ds['surface_h'] = (['x'],  h)
         ds['bed_h'] = (['x'],  self.bed_h)
         ds.attrs['class'] = type(self).__name__
@@ -130,15 +207,18 @@ class Flowline(Centerline):
 
 
 class ParabolicBedFlowline(Flowline):
-    """A more advanced Flowline."""
+    """A parabolic shaped Flowline with one degree of freedom
+    """
 
     def __init__(self, line=None, dx=None, map_dx=None,
-                 surface_h=None, bed_h=None, bed_shape=None, rgi_id=None):
+                 surface_h=None, bed_h=None, bed_shape=None, rgi_id=None,
+                 water_level=None):
         """ Instanciate.
 
         Parameters
         ----------
-        line: Shapely LineString
+        line : :py:class:`shapely.geometry.LineString`
+            the geometrical line of a :py:class:`oggm.Centerline`
 
         Properties
         ----------
@@ -146,7 +226,8 @@ class ParabolicBedFlowline(Flowline):
         """
         super(ParabolicBedFlowline, self).__init__(line, dx, map_dx,
                                                    surface_h, bed_h,
-                                                   rgi_id=rgi_id)
+                                                   rgi_id=rgi_id,
+                                                   water_level=water_level)
 
         assert np.all(np.isfinite(bed_shape))
         self.bed_shape = bed_shape
@@ -164,21 +245,30 @@ class ParabolicBedFlowline(Flowline):
     def section(self, val):
         self.thick = (0.75 * val * np.sqrt(self.bed_shape))**(2./3.)
 
+    @utils.lazy_property
+    def shape_str(self):
+        """The bed shape in text (for debug and other things)"""
+        return np.repeat('parabolic', self.nx)
+
     def _add_attrs_to_dataset(self, ds):
         """Add bed specific parameters."""
         ds['bed_shape'] = (['x'],  self.bed_shape)
 
 
 class RectangularBedFlowline(Flowline):
-    """A more advanced Flowline."""
+    """Simple shaped Flowline, glacier width does not change with ice thickness
+
+    """
 
     def __init__(self, line=None, dx=None, map_dx=None,
-                 surface_h=None, bed_h=None, widths=None, rgi_id=None):
+                 surface_h=None, bed_h=None, widths=None, rgi_id=None,
+                 water_level=None):
         """ Instanciate.
 
         Parameters
         ----------
-        line: Shapely LineString
+        line : :py:class:`shapely.geometry.LineString`
+            the geometrical line of a :py:class:`oggm.Centerline`
 
         Properties
         ----------
@@ -186,7 +276,8 @@ class RectangularBedFlowline(Flowline):
         """
         super(RectangularBedFlowline, self).__init__(line, dx, map_dx,
                                                      surface_h, bed_h,
-                                                     rgi_id=rgi_id)
+                                                     rgi_id=rgi_id,
+                                                     water_level=water_level)
 
         self._widths = widths
 
@@ -203,10 +294,10 @@ class RectangularBedFlowline(Flowline):
     def section(self, val):
         self.thick = val / self.widths_m
 
-    @property
-    def area_m2(self):
-        widths = np.where(self.thick > 0., self.widths_m, 0.)
-        return np.sum(widths * self.dx_meter)
+    @utils.lazy_property
+    def shape_str(self):
+        """The bed shape in text (for debug and other things)"""
+        return np.repeat('rectangular', self.nx)
 
     def _add_attrs_to_dataset(self, ds):
         """Add bed specific parameters."""
@@ -214,15 +305,18 @@ class RectangularBedFlowline(Flowline):
 
 
 class TrapezoidalBedFlowline(Flowline):
-    """A more advanced Flowline."""
+    """A Flowline with trapezoidal shape and two degrees of freedom
+    """
 
     def __init__(self, line=None, dx=None, map_dx=None, surface_h=None,
-                 bed_h=None, widths=None, lambdas=None, rgi_id=None):
+                 bed_h=None, widths=None, lambdas=None, rgi_id=None,
+                 water_level=None):
         """ Instanciate.
 
         Parameters
         ----------
-        line: Shapely LineString
+        line : :py:class:`shapely.geometry.LineString`
+            the geometrical line of a :py:class:`oggm.Centerline`
 
         Properties
         ----------
@@ -230,14 +324,15 @@ class TrapezoidalBedFlowline(Flowline):
         """
         super(TrapezoidalBedFlowline, self).__init__(line, dx, map_dx,
                                                      surface_h, bed_h,
-                                                     rgi_id=rgi_id)
+                                                     rgi_id=rgi_id,
+                                                     water_level=water_level)
 
         self._w0_m = widths * self.map_dx - lambdas * self.thick
 
         if np.any(self._w0_m <= 0):
             raise ValueError('Trapezoid beds need to have origin widths > 0.')
 
-        self._prec = np.where(lambdas == 0)
+        self._prec = np.where(lambdas == 0)[0]
 
         self._lambdas = lambdas
 
@@ -259,10 +354,10 @@ class TrapezoidalBedFlowline(Flowline):
         thick[self._prec] = val[self._prec] / self._w0_m[self._prec]
         self.thick = thick
 
-    @property
-    def area_m2(self):
-        widths = np.where(self.thick > 0., self.widths_m, 0.)
-        return np.sum(widths * self.dx_meter)
+    @utils.lazy_property
+    def shape_str(self):
+        """The bed shape in text (for debug and other things)"""
+        return np.repeat('trapezoid', self.nx)
 
     def _add_attrs_to_dataset(self, ds):
         """Add bed specific parameters."""
@@ -271,16 +366,22 @@ class TrapezoidalBedFlowline(Flowline):
 
 
 class MixedBedFlowline(Flowline):
-    """A more advanced Flowline."""
+    """A Flowline which can take a combination of different shapes (default)
+
+    The default shape is parabolic. At ice divides a rectangular shape is used.
+    And if the parabola gets to flat a trapezoidal shape is used.
+    """
 
     def __init__(self, *, line=None, dx=None, map_dx=None, surface_h=None,
                  bed_h=None, section=None, bed_shape=None,
-                 is_trapezoid=None, lambdas=None, widths_m=None, rgi_id=None):
+                 is_trapezoid=None, lambdas=None, widths_m=None, rgi_id=None,
+                 water_level=None):
         """ Instanciate.
 
         Parameters
         ----------
-        line: Shapely LineString
+        line : :py:class:`shapely.geometry.LineString`
+            the geometrical line of a :py:class:`oggm.Centerline`
 
         Properties
         ----------
@@ -291,7 +392,8 @@ class MixedBedFlowline(Flowline):
         super(MixedBedFlowline, self).__init__(line=line, dx=dx, map_dx=map_dx,
                                                surface_h=surface_h.copy(),
                                                bed_h=bed_h.copy(),
-                                               rgi_id=rgi_id)
+                                               rgi_id=rgi_id,
+                                               water_level=water_level)
 
         # To speedup calculations if no trapezoid bed is present
         self._do_trapeze = np.any(is_trapezoid)
@@ -334,7 +436,7 @@ class MixedBedFlowline(Flowline):
 
         assert np.all(self.bed_shape[~is_trapezoid] > 0)
 
-        self._prec = np.where(is_trapezoid & (lambdas == 0))
+        self._prec = np.where(is_trapezoid & (lambdas == 0))[0]
 
         assert np.allclose(section, self.section)
 
@@ -369,10 +471,13 @@ class MixedBedFlowline(Flowline):
             out[self._prec] = val[self._prec] / self._w0_m[self._prec]
         self.thick = out
 
-    @property
-    def area_m2(self):
-        widths = np.where(self.thick > 0., self.widths_m, 0.)
-        return np.sum(widths * self.dx_meter)
+    @utils.lazy_property
+    def shape_str(self):
+        """The bed shape in text (for debug and other things)"""
+        out = np.repeat('rectangular', self.nx)
+        out[~ self.is_trapezoid] = 'parabolic'
+        out[self.is_trapezoid & ~ self.is_rectangular] = 'trapezoid'
+        return out
 
     def _add_attrs_to_dataset(self, ds):
         """Add bed specific parameters."""
@@ -388,18 +493,20 @@ class FlowlineModel(object):
     """Interface to the actual model"""
 
     def __init__(self, flowlines, mb_model=None, y0=0., glen_a=None,
-                 fs=None, inplace=False, is_tidewater=False,
-                 mb_elev_feedback='annual', check_for_boundaries=True):
+                 fs=None, inplace=False, smooth_trib_influx=True,
+                 is_tidewater=False, is_lake_terminating=False,
+                 mb_elev_feedback='annual', check_for_boundaries=None,
+                 water_level=None):
         """Create a new flowline model from the flowlines and a MB model.
 
         Parameters
         ----------
         flowlines : list
-            a list of Flowlines instances, sorted by order
-        mb_model : MassBalanceModel
+            a list of :py:class:`oggm.Flowline` instances, sorted by order
+        mb_model : :py:class:`oggm.core.massbalance.MassBalanceModel`
             the MB model to use
         y0 : int
-            the starting year of the simultation
+            the starting year of the simulation
         glen_a : float
             glen's parameter A
         fs: float
@@ -408,8 +515,14 @@ class FlowlineModel(object):
             whether or not to make a copy of the flowline objects for the run
             setting to True implies that your objects will be modified at run
             time by the model (can help to spare memory)
-        is_tidewater : bool
-            this changes how the last grid points of the domain are handled
+        smooth_trib_influx : bool
+            whether to smooth the mass influx from the incoming tributary.
+            The fefault is to use a gaussian kernel on a 9 grid points
+            window.
+        is_tidewater: bool, default: False
+            is this a tidewater glacier?
+        is_lake_terminating: bool, default: False
+            is this a lake terminating glacier?
         mb_elev_feedback : str, default: 'annual'
             'never', 'always', 'annual', or 'monthly': how often the
             mass-balance should be recomputed from the mass balance model.
@@ -417,13 +530,34 @@ class FlowlineModel(object):
             at all (the heights are taken from the first call).
         check_for_boundaries : bool
             whether the model should raise an error when the glacier exceeds
-            the domain boundaries.
+            the domain boundaries. The default is to follow
+            PARAMS['error_when_glacier_reaches_boundaries']
         """
 
         self.is_tidewater = is_tidewater
+        self.is_lake_terminating = is_lake_terminating
+        self.is_marine_terminating = is_tidewater and not is_lake_terminating
+
+        if water_level is None:
+            self.water_level = 0
+            if self.is_lake_terminating:
+                if not flowlines[-1].has_ice():
+                    raise InvalidParamsError('Set `water_level` for lake '
+                                             'terminating glaciers in '
+                                             'idealized runs')
+                # Arbitrary water level 1m below last grid points elevation
+                min_h = flowlines[-1].surface_h[flowlines[-1].thick > 0][-1]
+                self.water_level = (min_h -
+                                    cfg.PARAMS['free_board_lake_terminating'])
+        else:
+            self.water_level = water_level
 
         # Mass balance
-        self.mb_elev_feedback = mb_elev_feedback
+        self.mb_elev_feedback = mb_elev_feedback.lower()
+        if self.mb_elev_feedback in ['never', 'annual']:
+            self.mb_step = 'annual'
+        elif self.mb_elev_feedback in ['always', 'monthly']:
+            self.mb_step = 'monthly'
         self.mb_model = mb_model
 
         # Defaults
@@ -435,19 +569,26 @@ class FlowlineModel(object):
         self.fs = fs
         self.glen_n = cfg.PARAMS['glen_n']
         self.rho = cfg.PARAMS['ice_density']
-
-        self.check_for_boundaries = check_for_boundaries and not is_tidewater
+        if check_for_boundaries is None:
+            check_for_boundaries = cfg.PARAMS[('error_when_glacier_reaches_'
+                                               'boundaries')]
+        self.check_for_boundaries = check_for_boundaries
 
         # we keep glen_a as input, but for optimisation we stick to "fd"
         self._fd = 2. / (cfg.PARAMS['glen_n']+2) * self.glen_a
+
+        # Calving shenanigans
+        self.calving_m3_since_y0 = 0.  # total calving since time y0
+        self.calving_rate_myr = 0.
 
         self.y0 = None
         self.t = None
         self.reset_y0(y0)
 
         self.fls = None
-        self._trib = None
-        self.reset_flowlines(flowlines, inplace=inplace)
+        self._tributary_indices = None
+        self.reset_flowlines(flowlines, inplace=inplace,
+                             smooth_trib_influx=smooth_trib_influx)
 
     @property
     def mb_model(self):
@@ -475,7 +616,8 @@ class FlowlineModel(object):
         self.y0 = y0
         self.t = 0
 
-    def reset_flowlines(self, flowlines, inplace=False):
+    def reset_flowlines(self, flowlines, inplace=False,
+                        smooth_trib_influx=True):
         """Reset the initial model flowlines"""
 
         if not inplace:
@@ -491,12 +633,18 @@ class FlowlineModel(object):
         # list of tributary coordinates and stuff
         trib_ind = []
         for fl in self.fls:
+            # Important also
+            fl.water_level = self.water_level
             if fl.flows_to is None:
                 trib_ind.append((None, None, None, None))
                 continue
             idl = self.fls.index(fl.flows_to)
             ide = fl.flows_to_indice
-            if fl.flows_to.nx >= 9:
+            if not smooth_trib_influx:
+                gk = 1
+                id0 = ide
+                id1 = ide+1
+            elif fl.flows_to.nx >= 9:
                 gk = GAUSSIAN_KERNEL[9]
                 id0 = ide-4
                 id1 = ide+5
@@ -509,7 +657,8 @@ class FlowlineModel(object):
                 id0 = ide-2
                 id1 = ide+3
             trib_ind.append((idl, id0, id1, gk))
-        self._trib = trib_ind
+
+        self._tributary_indices = trib_ind
 
     @property
     def yr(self):
@@ -528,6 +677,22 @@ class FlowlineModel(object):
         return self.volume_m3 * 1e-9
 
     @property
+    def volume_bsl_m3(self):
+        return np.sum([f.volume_bsl_m3 for f in self.fls])
+
+    @property
+    def volume_bsl_km3(self):
+        return self.volume_bsl_m3 * 1e-9
+
+    @property
+    def volume_bwl_m3(self):
+        return np.sum([f.volume_bwl_m3 for f in self.fls])
+
+    @property
+    def volume_bwl_km3(self):
+        return self.volume_bwl_m3 * 1e-9
+
+    @property
     def area_km2(self):
         return self.area_m2 * 1e-6
 
@@ -535,7 +700,7 @@ class FlowlineModel(object):
     def length_m(self):
         return self.fls[-1].length_m
 
-    def get_mb(self, heights, year=None, fl_id=None):
+    def get_mb(self, heights, year=None, fl_id=None, fls=None):
         """Get the mass balance at the requested height and time.
 
         Optimized so that no mb model call is necessary at each step.
@@ -543,7 +708,7 @@ class FlowlineModel(object):
 
         # Do we even have to optimise?
         if self.mb_elev_feedback == 'always':
-            return self._mb_call(heights, year, fl_id=fl_id)
+            return self._mb_call(heights, year=year, fl_id=fl_id, fls=fls)
 
         # Ok, user asked for it
         if fl_id is None:
@@ -565,14 +730,18 @@ class FlowlineModel(object):
         if self._mb_current_date == date:
             if fl_id not in self._mb_current_out:
                 # We need to reset just this tributary
-                self._mb_current_out[fl_id] = self._mb_call(heights, year,
-                                                            fl_id=fl_id)
+                self._mb_current_out[fl_id] = self._mb_call(heights,
+                                                            year=year,
+                                                            fl_id=fl_id,
+                                                            fls=fls)
         else:
             # We need to reset all
             self._mb_current_date = date
             self._mb_current_out = dict()
-            self._mb_current_out[fl_id] = self._mb_call(heights, year,
-                                                        fl_id=fl_id)
+            self._mb_current_out[fl_id] = self._mb_call(heights,
+                                                        year=year,
+                                                        fl_id=fl_id,
+                                                        fls=fls)
 
         return self._mb_current_out[fl_id]
 
@@ -580,7 +749,7 @@ class FlowlineModel(object):
         """Creates a netcdf group file storing the state of the model."""
 
         flows_to_id = []
-        for trib in self._trib:
+        for trib in self._tributary_indices:
             flows_to_id.append(trib[0] if trib[0] is not None else -1)
 
         ds = xr.Dataset()
@@ -603,11 +772,31 @@ class FlowlineModel(object):
         return np.isclose(self.fls[-1].thick[-1], 0)
 
     def step(self, dt):
-        """Advance one step."""
+        """Advance the numerical simulation of one single step.
+
+        Important: the step dt is a maximum boundary that is *not* guaranteed
+        to be met if dt is too large for the underlying numerical
+        implementation. However, ``step(dt)`` should never cross the desired
+        time step, i.e. if dt is small enough to ensure stability, step
+        should match it.
+
+        The caller will know how much has been actually advanced by looking
+        at the output of ``step()`` or by monitoring ``self.t`` or `self.yr``
+
+        Parameters
+        ----------
+        dt : float
+             the step length in seconds
+
+        Returns
+        -------
+        the actual dt chosen by the numerical implementation. Guaranteed to
+        be dt or lower.
+        """
         raise NotImplementedError
 
     def run_until(self, y1):
-        """Runs the model from the current year up to a given year y1.
+        """Runs the model from the current year up to a given year date y1.
 
         This function runs the model for the time difference y1-self.y0
         If self.y0 has not been specified at some point, it is 0 and y1 will
@@ -615,26 +804,40 @@ class FlowlineModel(object):
 
         Parameters
         ----------
-        y1 : int
+        y1 : float
             Upper time span for how long the model should run
         """
 
-        t = (y1-self.y0) * SEC_IN_YEAR
-        while self.t < t:
-            self.step(t-self.t)
+        # We force timesteps to monthly frequencies for consistent results
+        # among use cases (monthly or yearly output) and also to prevent
+        # "too large" steps in the adaptive scheme.
+        ts = utils.monthly_timeseries(self.yr, y1)
 
-        # Check for domain bounds
-        if self.check_for_boundaries:
-            if self.fls[-1].thick[-1] > 10:
-                raise RuntimeError('Glacier exceeds domain boundaries.')
+        # Add the last date to be sure we end on it
+        ts = np.append(ts, y1)
 
-        # Check for NaNs
-        for fl in self.fls:
-            if np.any(~np.isfinite(fl.thick)):
-                raise FloatingPointError('NaN in numerical solution.')
+        # Loop over the steps we want to meet
+        for y in ts:
+            t = (y - self.y0) * SEC_IN_YEAR
+            # because of CFL, step() doesn't ensure that the end date is met
+            # lets run the steps until we reach our desired date
+            while self.t < t:
+                self.step(t-self.t)
+
+            # Check for domain bounds
+            if self.check_for_boundaries:
+                if self.fls[-1].thick[-1] > 10:
+                    raise RuntimeError('Glacier exceeds domain boundaries, '
+                                       'at year: {}'.format(self.yr))
+
+            # Check for NaNs
+            for fl in self.fls:
+                if np.any(~np.isfinite(fl.thick)):
+                    raise FloatingPointError('NaN in numerical solution, '
+                                             'at year: {}'.format(self.yr))
 
     def run_until_and_store(self, y1, run_path=None, diag_path=None,
-                            store_monthly_step=False):
+                            store_monthly_step=None):
         """Runs the model and returns intermediate steps in xarray datasets.
 
         This function repeatedly calls FlowlineModel.run_until for either
@@ -643,13 +846,16 @@ class FlowlineModel(object):
         Parameters
         ----------
         y1 : int
-            Upper time span for how long the model should run
+            Upper time span for how long the model should run (needs to be
+            a full year)
         run_path : str
             Path and filename where to store the model run dataset
         diag_path : str
             Path and filename where to store the model diagnostics dataset
         store_monthly_step : Bool
-            If True (False)  model diagnostics will be stored monthly (yearly)
+            If True (False)  model diagnostics will be stored monthly (yearly).
+            If unspecified, we follow the update of the MB model, which
+            defaults to yearly (see __init__).
 
         Returns
         -------
@@ -663,15 +869,30 @@ class FlowlineModel(object):
             and ELA of the glacier.
         """
 
+        if int(y1) != y1:
+            raise InvalidParamsError('run_until_and_store only accepts '
+                                     'integer year dates.')
+
+        if not self.mb_model.hemisphere:
+            raise InvalidParamsError('run_until_and_store needs a '
+                                     'mass-balance model with an unambiguous '
+                                     'hemisphere.')
         # time
         yearly_time = np.arange(np.floor(self.yr), np.floor(y1)+1)
+
+        if store_monthly_step is None:
+            store_monthly_step = self.mb_step == 'monthly'
 
         if store_monthly_step:
             monthly_time = utils.monthly_timeseries(self.yr, y1)
         else:
             monthly_time = np.arange(np.floor(self.yr), np.floor(y1)+1)
+
+        sm = cfg.PARAMS['hydro_month_' + self.mb_model.hemisphere]
+
         yrs, months = utils.floatyear_to_date(monthly_time)
-        cyrs, cmonths = utils.hydrodate_to_calendardate(yrs, months)
+        cyrs, cmonths = utils.hydrodate_to_calendardate(yrs, months,
+                                                        start_month=sm)
 
         # init output
         if run_path is not None:
@@ -685,6 +906,7 @@ class FlowlineModel(object):
         nm = len(monthly_time)
         sects = [(np.zeros((ny, fl.nx)) * np.NaN) for fl in self.fls]
         widths = [(np.zeros((ny, fl.nx)) * np.NaN) for fl in self.fls]
+        bucket = [(np.zeros(ny) * np.NaN) for _ in self.fls]
         diag_ds = xr.Dataset()
 
         # Global attributes
@@ -693,6 +915,8 @@ class FlowlineModel(object):
         diag_ds.attrs['calendar'] = '365-day no leap'
         diag_ds.attrs['creation_date'] = strftime("%Y-%m-%d %H:%M:%S",
                                                   gmtime())
+        diag_ds.attrs['hemisphere'] = self.mb_model.hemisphere
+        diag_ds.attrs['water_level'] = self.water_level
 
         # Coordinates
         diag_ds.coords['time'] = ('time', monthly_time)
@@ -711,6 +935,18 @@ class FlowlineModel(object):
         diag_ds['volume_m3'] = ('time', np.zeros(nm) * np.NaN)
         diag_ds['volume_m3'].attrs['description'] = 'Total glacier volume'
         diag_ds['volume_m3'].attrs['unit'] = 'm 3'
+        if self.is_marine_terminating:
+            diag_ds['volume_bsl_m3'] = ('time', np.zeros(nm) * np.NaN)
+            diag_ds['volume_bsl_m3'].attrs['description'] = ('Glacier volume '
+                                                             'below '
+                                                             'sea-level')
+            diag_ds['volume_bsl_m3'].attrs['unit'] = 'm 3'
+            diag_ds['volume_bwl_m3'] = ('time', np.zeros(nm) * np.NaN)
+            diag_ds['volume_bwl_m3'].attrs['description'] = ('Glacier volume '
+                                                             'below '
+                                                             'water-level')
+            diag_ds['volume_bwl_m3'].attrs['unit'] = 'm 3'
+
         diag_ds['area_m2'] = ('time', np.zeros(nm) * np.NaN)
         diag_ds['area_m2'].attrs['description'] = 'Total glacier area'
         diag_ds['area_m2'].attrs['unit'] = 'm 2'
@@ -726,6 +962,9 @@ class FlowlineModel(object):
             diag_ds['calving_m3'].attrs['description'] = ('Total accumulated '
                                                           'calving flux')
             diag_ds['calving_m3'].attrs['unit'] = 'm 3'
+            diag_ds['calving_rate_myr'] = ('time', np.zeros(nm) * np.NaN)
+            diag_ds['calving_rate_myr'].attrs['description'] = 'Calving rate'
+            diag_ds['calving_rate_myr'].attrs['unit'] = 'm yr-1'
 
         # Run
         j = 0
@@ -733,21 +972,37 @@ class FlowlineModel(object):
             self.run_until(yr)
             # Model run
             if mo == 1:
-                for s, w, fl in zip(sects, widths, self.fls):
+                for s, w, b, fl in zip(sects, widths, bucket, self.fls):
                     s[j, :] = fl.section
                     w[j, :] = fl.widths_m
+                    if self.is_tidewater:
+                        try:
+                            b[j] = fl.calving_bucket_m3
+                        except AttributeError:
+                            pass
                 j += 1
             # Diagnostics
             diag_ds['volume_m3'].data[i] = self.volume_m3
             diag_ds['area_m2'].data[i] = self.area_m2
             diag_ds['length_m'].data[i] = self.length_m
-            diag_ds['ela_m'].data[i] = self.mb_model.get_ela(year=yr)
+            try:
+                ela_m = self.mb_model.get_ela(year=yr, fls=self.fls,
+                                              fl_id=len(self.fls)-1)
+                diag_ds['ela_m'].data[i] = ela_m
+            except BaseException:
+                # We really don't want to stop the model for some ELA issues
+                diag_ds['ela_m'].data[i] = np.NaN
+
             if self.is_tidewater:
                 diag_ds['calving_m3'].data[i] = self.calving_m3_since_y0
+                diag_ds['calving_rate_myr'].data[i] = self.calving_rate_myr
+                if self.is_marine_terminating:
+                    diag_ds['volume_bsl_m3'].data[i] = self.volume_bsl_m3
+                    diag_ds['volume_bwl_m3'].data[i] = self.volume_bwl_m3
 
         # to datasets
         run_ds = []
-        for (s, w) in zip(sects, widths):
+        for (s, w, b) in zip(sects, widths, bucket):
             ds = xr.Dataset()
             ds.attrs['description'] = 'OGGM model output'
             ds.attrs['oggm_version'] = __version__
@@ -762,6 +1017,9 @@ class FlowlineModel(object):
                                             coords=varcoords)
             ds['ts_width_m'] = xr.DataArray(w, dims=('time', 'x'),
                                             coords=varcoords)
+            if self.is_tidewater:
+                ds['ts_calving_bucket_m3'] = xr.DataArray(b, dims=('time', ),
+                                                          coords=varcoords)
             run_ds.append(ds)
 
         # write output?
@@ -772,6 +1030,9 @@ class FlowlineModel(object):
             for i, ds in enumerate(run_ds):
                 ds.to_netcdf(run_path, 'a', group='fl_{}'.format(i),
                              encoding=encode)
+            # Add other diagnostics
+            diag_ds.to_netcdf(run_path, 'a')
+
         if diag_path is not None:
             diag_ds.to_netcdf(diag_path)
 
@@ -803,108 +1064,246 @@ class FlowlineModel(object):
             raise RuntimeError('Did not find equilibrium.')
 
 
+def flux_gate_with_build_up(year, flux_value=None, flux_gate_yr=None):
+    """Default scalar flux gate with build up period"""
+    fac = 1 - (flux_gate_yr - year) / flux_gate_yr
+    return flux_value * utils.clip_scalar(fac, 0, 1)
+
+
 class FluxBasedModel(FlowlineModel):
-    """The actual model"""
+    """The flowline model used by OGGM in production.
+
+    It solves for the SIA along the flowline(s) using a staggered grid. It
+    computes the *ice flux* between grid points and transports the mass
+    accordingly (also between flowlines).
+
+    This model is numerically less stable than fancier schemes, but it
+    is fast and works with multiple flowlines of any bed shape (rectangular,
+    parabolic, trapeze, and any combination of them).
+
+    We test that it conserves mass in most cases, but not on very stiff cliffs.
+    """
 
     def __init__(self, flowlines, mb_model=None, y0=0., glen_a=None,
-                 fs=0., inplace=False, fixed_dt=None, cfl_number=0.05,
-                 min_dt=1*SEC_IN_HOUR, max_dt=10*SEC_IN_DAY,
-                 time_stepping='user',
+                 fs=0., inplace=False, fixed_dt=None, cfl_number=None,
+                 min_dt=None, flux_gate_thickness=None,
+                 flux_gate=None, flux_gate_build_up=100,
+                 do_kcalving=None, calving_k=None, calving_use_limiter=None,
+                 calving_limiter_frac=None, water_level=None,
                  **kwargs):
-        """ Instanciate.
+        """Instanciate the model.
 
         Parameters
         ----------
-
-        Properties
-        ----------
-        #TODO: document properties
+        flowlines : list
+            the glacier flowlines
+        mb_model : MassBakanceModel
+            the mass-balance model
+        y0 : int
+            initial year of the simulation
+        glen_a : float
+            Glen's creep parameter
+        fs : float
+            Oerlemans sliding parameter
+        inplace : bool
+            whether or not to make a copy of the flowline objects for the run
+            setting to True implies that your objects will be modified at run
+            time by the model (can help to spare memory)
+        fixed_dt : float
+            set to a value (in seconds) to prevent adaptive time-stepping.
+        cfl_number : float
+            Defaults to cfg.PARAMS['cfl_number'].
+            For adaptive time stepping (the default), dt is chosen from the
+            CFL criterion (dt = cfl_number * dx / max_u).
+            To choose the "best" CFL number we would need a stability
+            analysis - we used an empirical analysis (see blog post) and
+            settled on 0.02 for the default cfg.PARAMS['cfl_number'].
+        min_dt : float
+            Defaults to cfg.PARAMS['cfl_min_dt'].
+            At high velocities, time steps can become very small and your
+            model might run very slowly. In production, it might be useful to
+            set a limit below which the model will just error.
+        is_tidewater: bool, default: False
+            is this a tidewater glacier?
+        is_lake_terminating: bool, default: False
+            is this a lake terminating glacier?
+        mb_elev_feedback : str, default: 'annual'
+            'never', 'always', 'annual', or 'monthly': how often the
+            mass-balance should be recomputed from the mass balance model.
+            'Never' is equivalent to 'annual' but without elevation feedback
+            at all (the heights are taken from the first call).
+        check_for_boundaries: bool, default: True
+            raise an error when the glacier grows bigger than the domain
+            boundaries
+        flux_gate_thickness : float or array
+            flux of ice from the left domain boundary (and tributaries).
+            Units of m of ice thickness. Note that unrealistic values won't be
+            met by the model, so this is really just a rough guidance.
+            It's better to use `flux_gate` instead.
+        flux_gate : float or function or array of floats or array of functions
+            flux of ice from the left domain boundary (and tributaries)
+            (unit: m3 of ice per second). If set to a high value, consider
+            changing the flux_gate_buildup time. You can also provide
+            a function (or an array of functions) returning the flux
+            (unit: m3 of ice per second) as a function of time.
+            This is overriden by `flux_gate_thickness` if provided.
+        flux_gate_buildup : int
+            number of years used to build up the flux gate to full value
+        do_kcalving : bool
+            switch on the k-calving parameterisation. Ignored if not a
+            tidewater glacier. Use the option from PARAMS per default
+        calving_k : float
+            the calving proportionality constant (units: yr-1). Use the
+            one from PARAMS per default
+        calving_use_limiter : bool
+            whether to switch on the calving limiter on the parameterisation
+            makes the calving fronts thicker but the model is more stable
+        calving_limiter_frac : float
+            limit the front slope to a fraction of the calving front.
+            "3" means 1/3. Setting it to 0 limits the slope to sea-level.
+        water_level : float
+            the water level. It should be zero m a.s.l, but:
+            - sometimes the frontal elevation is unrealistically high (or low).
+            - lake terminating glaciers
+            - other uncertainties
+            The default is 0. For lake terminating glaciers,
+            it is inferred from PARAMS['free_board_lake_terminating'].
+            The best way to set the water level for real glaciers is to use
+            the same as used for the inversion (this is what
+            `robust_model_run` does for you)
         """
         super(FluxBasedModel, self).__init__(flowlines, mb_model=mb_model,
                                              y0=y0, glen_a=glen_a, fs=fs,
                                              inplace=inplace,
+                                             water_level=water_level,
                                              **kwargs)
 
-        if time_stepping == 'ambitious':
-            cfl_number = 0.1
-            min_dt = 1*SEC_IN_DAY
-            max_dt = 15*SEC_IN_DAY
-        elif time_stepping == 'default':
-            cfl_number = 0.05
-            min_dt = 1*SEC_IN_HOUR
-            max_dt = 10*SEC_IN_DAY
-        elif time_stepping == 'conservative':
-            cfl_number = 0.01
-            min_dt = SEC_IN_HOUR
-            max_dt = 5*SEC_IN_DAY
-        elif time_stepping == 'ultra-conservative':
-            cfl_number = 0.01
-            min_dt = SEC_IN_HOUR / 10
-            max_dt = 5*SEC_IN_DAY
-        else:
-            if time_stepping != 'user':
-                raise ValueError('time_stepping not understood.')
-
-        self.dt_warning = False
-        if fixed_dt is not None:
-            min_dt = fixed_dt
-            max_dt = fixed_dt
+        self.fixed_dt = fixed_dt
+        if min_dt is None:
+            min_dt = cfg.PARAMS['cfl_min_dt']
+        if cfl_number is None:
+            cfl_number = cfg.PARAMS['cfl_number']
         self.min_dt = min_dt
-        self.max_dt = max_dt
         self.cfl_number = cfl_number
-        self.calving_m3_since_y0 = 0.  # total calving since time y0
 
         # Do we want to use shape factors?
         self.sf_func = None
-        # Use .get to obtain default None for non-existing key
-        # necessary to pass some tests
-        # TODO: change to direct dictionary query after tests are adapted?
         use_sf = cfg.PARAMS.get('use_shape_factor_for_fluxbasedmodel')
         if use_sf == 'Adhikari' or use_sf == 'Nye':
             self.sf_func = utils.shape_factor_adhikari
         elif use_sf == 'Huss':
             self.sf_func = utils.shape_factor_huss
 
+        # Calving params
+        if do_kcalving is None:
+            do_kcalving = cfg.PARAMS['use_kcalving_for_run']
+        self.do_calving = do_kcalving and self.is_tidewater
+        if calving_k is None:
+            calving_k = cfg.PARAMS['calving_k']
+        self.calving_k = calving_k / cfg.SEC_IN_YEAR
+        if calving_use_limiter is None:
+            calving_use_limiter = cfg.PARAMS['calving_use_limiter']
+        self.calving_use_limiter = calving_use_limiter
+        if calving_limiter_frac is None:
+            calving_limiter_frac = cfg.PARAMS['calving_limiter_frac']
+        if calving_limiter_frac > 0:
+            raise NotImplementedError('calving limiter other than 0 not '
+                                      'implemented yet')
+        self.calving_limiter_frac = calving_limiter_frac
+
+        # Flux gate
+        self.flux_gate = utils.tolist(flux_gate, length=len(self.fls))
+        self.flux_gate_m3_since_y0 = 0.
+        if flux_gate_thickness is not None:
+            # Compute the theoretical ice flux from the slope at the top
+            flux_gate_thickness = utils.tolist(flux_gate_thickness,
+                                               length=len(self.fls))
+            self.flux_gate = []
+            for fl, fgt in zip(self.fls, flux_gate_thickness):
+                # We set the thickness to the desired value so that
+                # the widths work ok
+                fl = copy.deepcopy(fl)
+                fl.thick = fl.thick * 0 + fgt
+                slope = (fl.surface_h[0] - fl.surface_h[1]) / fl.dx_meter
+                if slope == 0:
+                    raise ValueError('I need a slope to compute the flux')
+                flux = find_sia_flux_from_thickness(slope,
+                                                    fl.widths_m[0],
+                                                    fgt,
+                                                    shape=fl.shape_str[0],
+                                                    glen_a=self.glen_a,
+                                                    fs=self.fs)
+                self.flux_gate.append(flux)
+
+        # convert the floats to function calls
+        for i, fg in enumerate(self.flux_gate):
+            if fg is None:
+                continue
+            try:
+                # Do we have a function? If yes all good
+                fg(self.yr)
+            except TypeError:
+                # If not, make one
+                self.flux_gate[i] = partial(flux_gate_with_build_up,
+                                            flux_value=fg,
+                                            flux_gate_yr=(flux_gate_build_up +
+                                                          self.y0))
+
         # Optim
-        self._stags = []
-        for fl, trib in zip(self.fls, self._trib):
+        self.slope_stag = []
+        self.thick_stag = []
+        self.section_stag = []
+        self.u_stag = []
+        self.shapefac_stag = []
+        self.flux_stag = []
+        self.trib_flux = []
+        for fl, trib in zip(self.fls, self._tributary_indices):
             nx = fl.nx
+            # This is not staggered
+            self.trib_flux.append(np.zeros(nx))
+            # We add an additional fake grid point at the end of tributaries
             if trib[0] is not None:
                 nx = fl.nx + 1
-            elif self.is_tidewater:
-                nx = fl.nx + 1
-            a = np.zeros(nx+1)
-            b = np.zeros(nx+1)
-            c = np.zeros(nx+1)
-            d = np.ones(nx+1)  # shape factor default is 1
-            e = np.zeros(nx-1)
-            f = np.zeros(nx)
-            self._stags.append((a, b, c, d, e, f))
+            # +1 is for the staggered grid
+            self.slope_stag.append(np.zeros(nx+1))
+            self.thick_stag.append(np.zeros(nx+1))
+            self.section_stag.append(np.zeros(nx+1))
+            self.u_stag.append(np.zeros(nx+1))
+            self.shapefac_stag.append(np.ones(nx+1))  # beware the ones!
+            self.flux_stag.append(np.zeros(nx+1))
 
     def step(self, dt):
         """Advance one step."""
 
-        # This is to guarantee a precise arrival on a specific date if asked
-        min_dt = dt if dt < self.min_dt else self.min_dt
+        # Just a check to avoid useless computations
+        if dt <= 0:
+            raise InvalidParamsError('dt needs to be strictly positive')
+
+        # Simple container
+        mbs = []
 
         # Loop over tributaries to determine the flux rate
-        flxs = []
-        aflxs = []
+        for fl_id, fl in enumerate(self.fls):
 
-        for fl, trib, (slope_stag, thick_stag, section_stag, sf_stag,
-                       znxm1, znx) in zip(self.fls, self._trib, self._stags):
+            # This is possibly less efficient than zip() but much clearer
+            trib = self._tributary_indices[fl_id]
+            slope_stag = self.slope_stag[fl_id]
+            thick_stag = self.thick_stag[fl_id]
+            section_stag = self.section_stag[fl_id]
+            sf_stag = self.shapefac_stag[fl_id]
+            flux_stag = self.flux_stag[fl_id]
+            trib_flux = self.trib_flux[fl_id]
+            u_stag = self.u_stag[fl_id]
+            flux_gate = self.flux_gate[fl_id]
 
+            # Flowline state
             surface_h = fl.surface_h
             thick = fl.thick
             section = fl.section
             dx = fl.dx_meter
 
-            # Reset
-            znxm1[:] = 0
-            znx[:] = 0
-
             # If it is a tributary, we use the branch it flows into to compute
-            # the slope of the last grid points
+            # the slope of the last grid point
             is_trib = trib[0] is not None
             if is_trib:
                 fl_to = self.fls[trib[0]]
@@ -912,21 +1311,21 @@ class FluxBasedModel(FlowlineModel):
                 surface_h = np.append(surface_h, fl_to.surface_h[ide])
                 thick = np.append(thick, thick[-1])
                 section = np.append(section, section[-1])
-            elif self.is_tidewater:
-                # For tidewater glacier, we trick and set the outgoing thick
-                # to zero (for numerical stability and this should quite OK
-                # represent what happens at the calving tongue)
-                surface_h = np.append(surface_h, surface_h[-1] - thick[-1])
-                thick = np.append(thick, 0)
-                section = np.append(section, 0)
+            elif self.do_calving and self.calving_use_limiter:
+                # We lower the max possible ice deformation
+                # by clipping the surface slope here. It is completely
+                # arbitrary but reduces ice deformation at the calving front.
+                # I think that in essence, it is also partly
+                # a "calving process", because this ice deformation must
+                # be less at the calving front. The result is that calving
+                # front "free boards" are quite high.
+                # Note that 0 is arbitrary, it could be any value below SL
+                surface_h = utils.clip_min(surface_h, self.water_level)
 
             # Staggered gradient
             slope_stag[0] = 0
             slope_stag[1:-1] = (surface_h[0:-1] - surface_h[1:]) / dx
             slope_stag[-1] = slope_stag[-2]
-
-            # Convert to angle?
-            # slope_stag = np.sin(np.arctan(slope_stag))
 
             # Staggered thick
             thick_stag[1:-1] = (thick[0:-1] + thick[1:]) / 2.
@@ -935,9 +1334,8 @@ class FluxBasedModel(FlowlineModel):
             if self.sf_func is not None:
                 # TODO: maybe compute new shape factors only every year?
                 sf = self.sf_func(fl.widths_m, fl.thick, fl.is_rectangular)
-                if is_trib or self.is_tidewater:
-                    # for water termination or inflowing tributary, the sf
-                    # makes no sense
+                if is_trib:
+                    # for inflowing tributary, the sf makes no sense
                     sf = np.append(sf, 1.)
                 sf_stag[1:-1] = (sf[0:-1] + sf[1:]) / 2.
                 sf_stag[[0, -1]] = sf[[0, -1]]
@@ -946,80 +1344,202 @@ class FluxBasedModel(FlowlineModel):
             # _fd = 2/(N+2) * self.glen_a
             N = self.glen_n
             rhogh = (self.rho*G*slope_stag)**N
-            u_stag = (thick_stag**(N+1)) * self._fd * rhogh * sf_stag**N + \
-                     (thick_stag**(N-1)) * self.fs * rhogh
+            u_stag[:] = (thick_stag**(N+1)) * self._fd * rhogh * sf_stag**N + \
+                        (thick_stag**(N-1)) * self.fs * rhogh
 
             # Staggered section
             section_stag[1:-1] = (section[0:-1] + section[1:]) / 2.
             section_stag[[0, -1]] = section[[0, -1]]
 
             # Staggered flux rate
-            flx_stag = u_stag * section_stag / dx
+            flux_stag[:] = u_stag * section_stag
 
-            # Store the results
-            if is_trib:
-                flxs.append(flx_stag[:-1])
-                aflxs.append(znxm1)
-                u_stag = u_stag[:-1]
-            elif self.is_tidewater:
-                flxs.append(flx_stag[:-1])
-                aflxs.append(znxm1)
-                u_stag = u_stag[:-1]
-            else:
-                flxs.append(flx_stag)
-                aflxs.append(znx)
+            # Add boundary condition
+            if flux_gate is not None:
+                flux_stag[0] = flux_gate(self.yr)
 
             # CFL condition
-            maxu = np.max(np.abs(u_stag))
-            if maxu > 0.:
-                _dt = self.cfl_number * dx / maxu
-            else:
-                _dt = self.max_dt
-            if _dt < dt:
-                dt = _dt
+            if not self.fixed_dt:
+                maxu = np.max(np.abs(u_stag))
+                if maxu > cfg.FLOAT_EPS:
+                    cfl_dt = self.cfl_number * dx / maxu
+                else:
+                    cfl_dt = dt
+
+                # Update dt only if necessary
+                if cfl_dt < dt:
+                    dt = cfl_dt
+                    if cfl_dt < self.min_dt:
+                        raise RuntimeError(
+                            'CFL error: required time step smaller '
+                            'than the minimum allowed: '
+                            '{:.1f}s vs {:.1f}s.'.format(cfl_dt, self.min_dt))
+
+            # Since we are in this loop, reset the tributary flux
+            trib_flux[:] = 0
+
+            # We compute MB in this loop, before mass-redistribution occurs,
+            # so that MB models which rely on glacier geometry to decide things
+            # (like PyGEM) can do wo with a clean glacier state
+            mbs.append(self.get_mb(fl.surface_h, self.yr,
+                                   fl_id=fl_id, fls=self.fls))
 
         # Time step
-        self.dt_warning = dt < min_dt
-        dt = np.clip(dt, min_dt, self.max_dt)
+        if self.fixed_dt:
+            # change only if step dt is larger than the chosen dt
+            if self.fixed_dt < dt:
+                dt = self.fixed_dt
 
         # A second loop for the mass exchange
-        for i, (fl, flx_stag, aflx, trib) in enumerate(zip(self.fls, flxs,
-                                                           aflxs, self._trib)):
+        for fl_id, fl in enumerate(self.fls):
+
+            flx_stag = self.flux_stag[fl_id]
+            trib_flux = self.trib_flux[fl_id]
+            tr = self._tributary_indices[fl_id]
 
             dx = fl.dx_meter
 
-            # Mass balance
-            widths = fl.widths_m
-            mb = self.get_mb(fl.surface_h, self.yr, fl_id=i)
-            # Allow parabolic beds to grow
-            widths = np.where((mb > 0.) & (widths == 0), 10., widths)
-            mb = dt * mb * widths
+            is_trib = tr[0] is not None
 
-            # Update section with flowing and mass balance
-            new_section = (fl.section + (flx_stag[0:-1] - flx_stag[1:])*dt +
-                           aflx*dt + mb)
+            # For these we had an additional grid point
+            if is_trib:
+                flx_stag = flx_stag[:-1]
+
+            # Mass-balance
+            widths = fl.widths_m
+            mb = mbs[fl_id]
+            # Allow parabolic beds to grow
+            mb = dt * mb * np.where((mb > 0.) & (widths == 0), 10., widths)
+
+            # Update section with ice flow and mass balance
+            new_section = (fl.section + (flx_stag[0:-1] - flx_stag[1:])*dt/dx +
+                           trib_flux*dt/dx + mb)
 
             # Keep positive values only and store
-            fl.section = new_section.clip(0)
+            fl.section = utils.clip_min(new_section, 0)
+
+            # If we use a flux-gate, store the total volume that came in
+            self.flux_gate_m3_since_y0 += flx_stag[0] * dt
 
             # Add the last flux to the tributary
-            # this is ok because the lines are sorted in order
-            if trib[0] is not None:
-                aflxs[trib[0]][trib[1]:trib[2]] += (flx_stag[-1].clip(0) *
-                                                    trib[3])
-            elif self.is_tidewater:
-                # -2 because the last flux is zero per construction
-                # TODO: not sure if this is the way to go yet,
-                # but mass conservation is OK
-                self.calving_m3_since_y0 += flx_stag[-2].clip(0)*dt*dx
+            # this works because the lines are sorted in order
+            if is_trib:
+                # tr tuple: line_index, start, stop, gaussian_kernel
+                self.trib_flux[tr[0]][tr[1]:tr[2]] += \
+                    utils.clip_min(flx_stag[-1], 0) * tr[3]
+
+            # --- The rest is for calving only ---
+            self.calving_rate_myr = 0.
+
+            # If tributary, do calving only if we are not transferring mass
+            if is_trib and flx_stag[-1] > 0:
+                continue
+
+            # No need to do calving in these cases either
+            if not self.do_calving or not fl.has_ice():
+                continue
+
+            # We do calving only if the last glacier bed pixel is below water
+            # (this is to avoid calving elsewhere than at the front)
+            if fl.bed_h[fl.thick > 0][-1] > self.water_level:
+                continue
+
+            # We do calving only if there is some ice above wl
+            last_above_wl = np.nonzero((fl.surface_h > self.water_level) &
+                                       (fl.thick > 0))[0][-1]
+            if fl.bed_h[last_above_wl] > self.water_level:
+                continue
+
+            # OK, we're really calving
+            section = fl.section
+
+            # Calving law
+            h = fl.thick[last_above_wl]
+            d = h - (fl.surface_h[last_above_wl] - self.water_level)
+            k = self.calving_k
+            q_calving = k * d * h * fl.widths_m[last_above_wl]
+            # Add to the bucket and the diagnostics
+            fl.calving_bucket_m3 += q_calving * dt
+            self.calving_m3_since_y0 += q_calving * dt
+            self.calving_rate_myr = (q_calving / section[last_above_wl] *
+                                     cfg.SEC_IN_YEAR)
+
+            # See if we have ice below sea-water to clean out first
+            below_sl = (fl.surface_h < self.water_level) & (fl.thick > 0)
+            to_remove = np.sum(section[below_sl]) * fl.dx_meter
+            if 0 < to_remove < fl.calving_bucket_m3:
+                # This is easy, we remove everything
+                section[below_sl] = 0
+                fl.calving_bucket_m3 -= to_remove
+            elif to_remove > 0:
+                # We can only remove part of if
+                section[below_sl] = 0
+                section[last_above_wl+1] = ((to_remove - fl.calving_bucket_m3)
+                                            / fl.dx_meter)
+                fl.calving_bucket_m3 = 0
+
+            # The rest of the bucket might calve an entire grid point
+            vol_last = section[last_above_wl] * fl.dx_meter
+            if fl.calving_bucket_m3 > vol_last:
+                fl.calving_bucket_m3 -= vol_last
+                section[last_above_wl] = 0
+
+            # We update the glacier with our changes
+            fl.section = section
 
         # Next step
         self.t += dt
         return dt
 
+    def get_diagnostics(self, fl_id=-1):
+        """Obtain model diagnostics in a pandas DataFrame.
+
+        Parameters
+        ----------
+        fl_id : int
+            the index of the flowline of interest, from 0 to n_flowline-1.
+            Default is to take the last (main) one
+
+        Returns
+        -------
+        a pandas DataFrame, which index is distance along flowline (m). Units:
+            - surface_h, bed_h, ice_tick, section_width: m
+            - section_area: m2
+            - slope: -
+            - ice_flux, tributary_flux: m3 of *ice* per second
+            - ice_velocity: m per second (depth-section integrated)
+        """
+        import pandas as pd
+
+        fl = self.fls[fl_id]
+        nx = fl.nx
+
+        df = pd.DataFrame(index=fl.dx_meter * np.arange(nx))
+        df.index.name = 'distance_along_flowline'
+        df['surface_h'] = fl.surface_h
+        df['bed_h'] = fl.bed_h
+        df['ice_thick'] = fl.thick
+        df['section_width'] = fl.widths_m
+        df['section_area'] = fl.section
+
+        # Staggered
+        var = self.slope_stag[fl_id]
+        df['slope'] = (var[1:nx+1] + var[:nx])/2
+        var = self.flux_stag[fl_id]
+        df['ice_flux'] = (var[1:nx+1] + var[:nx])/2
+        var = self.u_stag[fl_id]
+        df['ice_velocity'] = (var[1:nx+1] + var[:nx])/2
+        var = self.shapefac_stag[fl_id]
+        df['shape_fac'] = (var[1:nx+1] + var[:nx])/2
+
+        # Not Staggered
+        df['tributary_flux'] = self.trib_flux[fl_id]
+
+        return df
+
 
 class MassConservationChecker(FluxBasedModel):
-    """This checks if the FluzBasedmodel is conserving mass."""
+    """This checks if the FluxBasedModel is conserving mass."""
 
     def __init__(self, flowlines, **kwargs):
         """ Instanciate.
@@ -1053,7 +1573,7 @@ class MassConservationChecker(FluxBasedModel):
             # there can't be more negative mb than there is section
             # this isn't an exact solution unfortunately
             # TODO: exact solution for mass conservation
-            mb = mb.clip(-sec)
+            mb = utils.clip_min(mb, -sec)
             self.total_mass += np.sum(mb * dx)
 
 
@@ -1061,8 +1581,8 @@ class KarthausModel(FlowlineModel):
     """The actual model"""
 
     def __init__(self, flowlines, mb_model=None, y0=0., glen_a=None, fs=0.,
-                 fixed_dt=None, min_dt=SEC_IN_DAY,
-                 max_dt=31*SEC_IN_DAY, inplace=False):
+                 fixed_dt=None, min_dt=SEC_IN_DAY, max_dt=31*SEC_IN_DAY,
+                 inplace=False, **kwargs):
         """ Instanciate.
 
         Parameters
@@ -1079,7 +1599,7 @@ class KarthausModel(FlowlineModel):
 
         super(KarthausModel, self).__init__(flowlines, mb_model=mb_model,
                                             y0=y0, glen_a=glen_a, fs=fs,
-                                            inplace=inplace)
+                                            inplace=inplace, **kwargs)
         self.dt_warning = False,
         if fixed_dt is not None:
             min_dt = fixed_dt
@@ -1090,9 +1610,13 @@ class KarthausModel(FlowlineModel):
     def step(self, dt):
         """Advance one step."""
 
+        # Just a check to avoid useless computations
+        if dt <= 0:
+            raise InvalidParamsError('dt needs to be strictly positive')
+
         # This is to guarantee a precise arrival on a specific date if asked
         min_dt = dt if dt < self.min_dt else self.min_dt
-        dt = np.clip(dt, min_dt, self.max_dt)
+        dt = utils.clip_scalar(dt, min_dt, self.max_dt)
 
         fl = self.fls[0]
         dx = fl.dx_meter
@@ -1136,177 +1660,11 @@ class KarthausModel(FlowlineModel):
 
         NewIceThickness[-1] = thick[fl.nx-2]
 
-        fl.thick = NewIceThickness.clip(0)
+        fl.thick = utils.clip_min(NewIceThickness, 0)
 
         # Next step
         self.t += dt
-
-
-class MUSCLSuperBeeModel(FlowlineModel):
-    """This model is based on Jarosch et al. 2013 (doi:10.5194/tc-7-229-2013)
-
-       The equation references in the comments refer to the paper for clarity
-    """
-
-    def __init__(self, flowlines, mb_model=None, y0=0., glen_a=None, fs=None,
-                 fixed_dt=None, min_dt=SEC_IN_DAY, max_dt=31*SEC_IN_DAY,
-                 inplace=False):
-        """ Instanciate.
-
-        Parameters
-        ----------
-
-        Properties
-        ----------
-        #TODO: document properties
-        """
-
-        if len(flowlines) > 1:
-            raise ValueError('MUSCL SuperBee model does not work with '
-                             'tributaries.')
-
-        super(MUSCLSuperBeeModel, self).__init__(flowlines, mb_model=mb_model,
-                                                 y0=y0, glen_a=glen_a, fs=fs,
-                                                 inplace=inplace)
-        self.dt_warning = False,
-        if fixed_dt is not None:
-            min_dt = fixed_dt
-            max_dt = fixed_dt
-        self.min_dt = min_dt
-        self.max_dt = max_dt
-
-    def phi(self, r):
-        """ a definition of the limiting scheme to use"""
-        # minmod limiter Eq. 28
-        # val_phi = numpy.maximum(0,numpy.minimum(1,r))
-
-        # superbee limiter Eq. 29
-        val_phi = np.maximum(0, np.minimum(2*r, 1), np.minimum(r, 2))
-
-        return val_phi
-
-    def step(self, dt):
-        """Advance one step."""
-
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=RuntimeWarning)
-
-            # Guarantee a precise arrival on a specific date if asked
-            min_dt = dt if dt < self.min_dt else self.min_dt
-            dt = np.clip(dt, min_dt, self.max_dt)
-
-            fl = self.fls[0]
-            dx = fl.dx_meter
-
-            # Switch to the notation from the MUSCL_1D example
-            # This is useful to ensure that the MUSCL-SuperBee code
-            # is working as it has been benchmarked many times
-
-            # mass balance
-            m_dot = self.get_mb(fl.surface_h, self.yr, fl_id=id(fl))
-            # get in the surface elevation
-            S = fl.surface_h
-            # get the bed
-            B = fl.bed_h
-            # define Glen's law here
-            N = self.glen_n
-            # this is the correct Gamma !!
-            Gamma = 2.*self.glen_a*(self.rho*G)**N / (N+2.)
-            # time stepping
-            c_stab = 0.165
-
-            # define the finite difference indices
-            k = np.arange(0, fl.nx)
-            kp = np.hstack([np.arange(1, fl.nx), fl.nx-1])
-            kpp = np.hstack([np.arange(2, fl.nx), fl.nx-1, fl.nx-1])
-            km = np.hstack([0, np.arange(0, fl.nx-1)])
-            kmm = np.hstack([0, 0, np.arange(0, fl.nx-2)])
-
-            # I'm gonna introduce another level of adaptive time stepping here,
-            # which is probably not necessary. However I keep it to be
-            # consistent with my benchmarked and tested code.
-            # If the OGGM time stepping is correctly working, this loop
-            # should never run more than once
-            # Fabi: actually no, it is your job to choose the right time step
-            # but you can let OGGM decide whether a new time step is needed
-            # or not -> to be meliorated one day
-            stab_t = 0.
-            while stab_t < dt:
-                H = S - B
-
-                # MUSCL scheme up. "up" denotes here the k+1/2 flux boundary
-                r_up_m = (H[k]-H[km])/(H[kp]-H[k])  # Eq. 27
-                H_up_m = H[k] + 0.5 * self.phi(r_up_m)*(H[kp]-H[k])  # Eq. 23
-                # Eq. 27, k+1 is used instead of k
-                r_up_p = (H[kp]-H[k])/(H[kpp]-H[kp])
-                # Eq. 24
-                H_up_p = H[kp] - 0.5 * self.phi(r_up_p)*(H[kpp]-H[kp])
-
-                # surface slope gradient
-                s_grad_up = ((S[kp]-S[k])**2. / dx**2.)**((N-1.)/2.)
-                # like Eq. 30, now using Eq. 23 instead of Eq. 24
-                D_up_m = Gamma * H_up_m**(N+2.) * s_grad_up
-                D_up_p = Gamma * H_up_p**(N+2.) * s_grad_up  # Eq. 30
-
-                # Eq. 31
-                D_up_min = np.minimum(D_up_m, D_up_p)
-                # Eq. 32
-                D_up_max = np.maximum(D_up_m, D_up_p)
-                D_up = np.zeros(fl.nx)
-
-                # Eq. 33
-                cond = (S[kp] <= S[k]) & (H_up_m <= H_up_p)
-                D_up[cond] = D_up_min[cond]
-                cond = (S[kp] <= S[k]) & (H_up_m > H_up_p)
-                D_up[cond] = D_up_max[cond]
-                cond = (S[kp] > S[k]) & (H_up_m <= H_up_p)
-                D_up[cond] = D_up_max[cond]
-                cond = (S[kp] > S[k]) & (H_up_m > H_up_p)
-                D_up[cond] = D_up_min[cond]
-
-                # MUSCL scheme down. "down" denotes the k-1/2 flux boundary
-                r_dn_m = (H[km]-H[kmm])/(H[k]-H[km])
-                H_dn_m = H[km] + 0.5 * self.phi(r_dn_m)*(H[k]-H[km])
-                r_dn_p = (H[k]-H[km])/(H[kp]-H[k])
-                H_dn_p = H[k] - 0.5 * self.phi(r_dn_p)*(H[kp]-H[k])
-
-                # calculate the slope gradient
-                s_grad_dn = ((S[k]-S[km])**2. / dx**2.)**((N-1.)/2.)
-                D_dn_m = Gamma * H_dn_m**(N+2.) * s_grad_dn
-                D_dn_p = Gamma * H_dn_p**(N+2.) * s_grad_dn
-
-                D_dn_min = np.minimum(D_dn_m, D_dn_p)
-                D_dn_max = np.maximum(D_dn_m, D_dn_p)
-                D_dn = np.zeros(fl.nx)
-
-                cond = (S[k] <= S[km]) & (H_dn_m <= H_dn_p)
-                D_dn[cond] = D_dn_min[cond]
-                cond = (S[k] <= S[km]) & (H_dn_m > H_dn_p)
-                D_dn[cond] = D_dn_max[cond]
-                cond = (S[k] > S[km]) & (H_dn_m <= H_dn_p)
-                D_dn[cond] = D_dn_max[cond]
-                cond = (S[k] > S[km]) & (H_dn_m > H_dn_p)
-                D_dn[cond] = D_dn_min[cond]
-
-                # Eq. 37
-                dt_stab = c_stab * dx**2. / max(max(abs(D_up)), max(abs(D_dn)))
-                dt_use = min(dt_stab, dt-stab_t)
-                stab_t = stab_t + dt_use
-
-                # explicit time stepping scheme, Eq. 36
-                div_q = (D_up * (S[kp] - S[k])/dx - D_dn *
-                         (S[k] - S[km])/dx)/dx
-                # Eq. 35
-                S = S[k] + (m_dot + div_q)*dt_use
-
-                # Eq. 7
-                S = np.maximum(S, B)
-
-        # Done with the loop, prepare output
-        fl.thick = S-B
-
-        # Next step
-        self.t += dt
+        return dt
 
 
 class FileModel(object):
@@ -1329,8 +1687,20 @@ class FileModel(object):
             ds = xr.open_dataset(path, group='fl_{}'.format(flid))
             ds.load()
             dss.append(ds)
+
         self.last_yr = ds.year.values[-1]
         self.dss = dss
+
+        # Calving diags
+        try:
+            with xr.open_dataset(path) as ds:
+                self._calving_m3_since_y0 = ds.calving_m3.load()
+                self.do_calving = True
+        except AttributeError:
+            self._calving_m3_since_y0 = 0
+            self.do_calving = False
+
+        # time
         self.reset_y0()
 
     def __enter__(self):
@@ -1368,21 +1738,31 @@ class FileModel(object):
     def length_m(self):
         return self.fls[-1].length_m
 
+    @property
+    def calving_m3_since_y0(self):
+        return self._calving_m3_since_y0.sel(time=self.yr).values
+
     def run_until(self, year=None, month=None):
         """Mimics the model's behavior.
 
-        Is quite slow, I must say.
+        Is quite slow tbh.
         """
-
         if month is not None:
             for fl, ds in zip(self.fls, self.dss):
-                sel = ds.ts_section.isel(time=(ds.year == year) &
-                                              (ds.month == month))
-                fl.section = sel.values
+                sel = ds.isel(time=(ds.year == year) & (ds.month == month))
+                fl.section = sel.ts_section.values
+                try:
+                    fl.calving_bucket_m3 = sel.ts_calving_bucket_m3.values
+                except AttributeError:
+                    fl.calving_bucket_m3 = 0
         else:
             for fl, ds in zip(self.fls, self.dss):
-                sel = ds.ts_section.sel(time=year)
-                fl.section = sel.values
+                sel = ds.sel(time=year)
+                fl.section = sel.ts_section.values
+                try:
+                    fl.calving_bucket_m3 = sel.ts_calving_bucket_m3.values
+                except AttributeError:
+                    fl.calving_bucket_m3 = 0
         self.yr = sel.time.values
 
     def area_m2_ts(self, rollmin=0):
@@ -1405,6 +1785,10 @@ class FileModel(object):
         sel = 0
         for fl, ds in zip(self.fls, self.dss):
             sel += ds.ts_section.sum(dim='x') * fl.dx_meter
+            try:
+                sel -= ds.ts_calving_bucket_m3
+            except AttributeError:
+                pass
         return sel.to_series()
 
     def volume_km3_ts(self):
@@ -1434,7 +1818,8 @@ def flowline_from_dataset(ds):
                 bed_h=ds['bed_h'].values)
 
     have = {'c', 'x', 'surface_h', 'linecoords', 'bed_h', 'z', 'p', 'n',
-            'time', 'month', 'year', 'ts_width_m', 'ts_section'}
+            'time', 'month', 'year', 'ts_width_m', 'ts_section',
+            'ts_calving_bucket_m3'}
     missing_vars = set(ds.variables.keys()).difference(have)
     for k in missing_vars:
         data = ds[k].values
@@ -1462,6 +1847,17 @@ def glacier_from_netcdf(path):
         fl.order = line_order(fl)
 
     return fls
+
+
+def calving_glacier_downstream_line(line, n_points):
+    """Extends a calving glacier flowline past the terminus."""
+
+    x, y = line.coords.xy
+    dx = x[-1] - x[-2]
+    dy = y[-1] - y[-2]
+    x = np.append(x, x[-1] + dx * np.arange(1, n_points+1))
+    y = np.append(y, y[-1] + dy * np.arange(1, n_points+1))
+    return shpg.LineString(np.array([x, y]).T)
 
 
 @entity_task(log, writes=['model_flowlines'])
@@ -1527,7 +1923,7 @@ def init_present_time_glacier(gdir):
             # Interpolate
             bed_shape = utils.interp_nans(np.append(bed_shape,
                                                     dic_ds['bedshapes'][0]))
-            bed_shape = bed_shape[:-1].clip(min_shape)
+            bed_shape = utils.clip_min(bed_shape[:-1], min_shape)
 
             # Correct the section volume
             h = inv['thick']
@@ -1541,6 +1937,23 @@ def init_present_time_glacier(gdir):
             bed_h = np.append(bed_h, dic_ds['surface_h'])
             widths_m = np.append(widths_m, dic_ds['bedshapes'] * 0.)
             line = dic_ds['full_line']
+
+        if gdir.is_tidewater and inv['is_last']:
+            # Continue the bed a little
+            n_points = cfg.PARAMS['calving_line_extension']
+            cf_slope = cfg.PARAMS['calving_front_slope']
+            deepening = n_points * cl.dx * map_dx * cf_slope
+
+            line = calving_glacier_downstream_line(line, n_points=n_points)
+            bed_shape = np.append(bed_shape, np.zeros(n_points))
+            lambdas = np.append(lambdas, np.zeros(n_points))
+            section = np.append(section, np.zeros(n_points))
+            # The bed slowly deepens
+            bed_down = np.linspace(bed_h[-1], bed_h[-1]-deepening, n_points)
+            bed_h = np.append(bed_h, bed_down)
+            surface_h = np.append(surface_h, bed_down)
+            widths_m = np.append(widths_m,
+                                 np.zeros(n_points) + np.mean(widths_m[-5:]))
 
         nfl = MixedBedFlowline(line=line, dx=cl.dx, map_dx=map_dx,
                                surface_h=surface_h, bed_h=bed_h,
@@ -1576,26 +1989,9 @@ def init_present_time_glacier(gdir):
 def robust_model_run(gdir, output_filesuffix=None, mb_model=None,
                      ys=None, ye=None, zero_initial_glacier=False,
                      init_model_fls=None, store_monthly_step=False,
+                     water_level=None,
                      **kwargs):
-    """Trial-error-and-retry algorithm to run the flowline model.
-
-     Runs a model simulation with the default time stepping scheme and,
-     if failing, tries a more conservative one.
-     This is a rather clumsy way to deal with numerical instabilities:
-     for most glaciers the default numerical parameters work fine, but for some
-     glaciers numerical instabilities might arise and lead to overfloating
-     errors or NaNs. This catches those, and tries again.
-
-     Pros of the method:
-     - it is cheap, because the "quicker" time stepping is tested first
-     - it is easy
-
-     Cons:
-     - the model might be unstable without necessarily leading to NaN in the
-       solution. These cases will not be caught
-     - it is inelegant
-
-     Possibly a method based on mass-conservation checks would be more robust.
+    """Runs a model simulation with the default time stepping scheme.
 
     Parameters
     ----------
@@ -1618,6 +2014,13 @@ def robust_model_run(gdir, output_filesuffix=None, mb_model=None,
     store_monthly_step : bool
         whether to store the diagnostic data at a monthly time step or not
         (default is yearly)
+    water_level : float
+        the water level. It should be zero m a.s.l, but:
+        - sometimes the frontal elevation is unrealistically high (or low).
+        - lake terminating glaciers
+        - other uncertainties
+        The default is to take the water level obtained from the ice
+        thickness inverion.
     kwargs : dict
         kwargs to pass to the FluxBasedModel instance
      """
@@ -1631,38 +2034,40 @@ def robust_model_run(gdir, output_filesuffix=None, mb_model=None,
                                   filesuffix=output_filesuffix,
                                   delete=True)
 
-    steps = ['default', 'conservative', 'ultra-conservative']
-    for step in steps:
-        log.info('(%s) trying %s time stepping scheme.', gdir.rgi_id, step)
-        if init_model_fls is None:
-            fls = gdir.read_pickle('model_flowlines')
-        else:
-            fls = copy.deepcopy(init_model_fls)
-        if zero_initial_glacier:
-            for fl in fls:
-                fl.thick = fl.thick * 0.
-        model = FluxBasedModel(fls, mb_model=mb_model, y0=ys,
-                               inplace=True,
-                               time_stepping=step,
-                               is_tidewater=gdir.is_tidewater,
-                               **kwargs)
+    if init_model_fls is None:
+        fls = gdir.read_pickle('model_flowlines')
+    else:
+        fls = copy.deepcopy(init_model_fls)
+    if zero_initial_glacier:
+        for fl in fls:
+            fl.thick = fl.thick * 0.
 
-        with np.warnings.catch_warnings():
-            # For operational runs we ignore the warnings
-            np.warnings.filterwarnings('ignore', category=RuntimeWarning)
-            try:
-                model.run_until_and_store(ye, run_path=run_path,
-                                          diag_path=diag_path,
-                                          store_monthly_step=store_monthly_step
-                                          )
-            except (RuntimeError, FloatingPointError):
-                if step == 'ultra-conservative':
-                    raise
-                continue
+    if (cfg.PARAMS['use_kcalving_for_run'] and gdir.is_tidewater and
+            water_level is None):
+        # check for water level
+        water_level = gdir.get_diagnostics().get('calving_water_level', None)
+        if water_level is None:
+            raise InvalidWorkflowError('This tidewater glacier seems to not '
+                                       'have been inverted with the '
+                                       '`find_inversion_calving` task. Set '
+                                       "PARAMS['use_kcalving_for_run'] to "
+                                       '`False` or set `water_level` '
+                                       'to prevent this error.')
 
-        # If we get here we good
-        log.info('(%s) %s time stepping was successful!', gdir.rgi_id, step)
-        break
+    model = FluxBasedModel(fls, mb_model=mb_model, y0=ys,
+                           inplace=True,
+                           is_tidewater=gdir.is_tidewater,
+                           is_lake_terminating=gdir.is_lake_terminating,
+                           water_level=water_level,
+                           **kwargs)
+
+    with np.warnings.catch_warnings():
+        # For operational runs we ignore the warnings
+        np.warnings.filterwarnings('ignore', category=RuntimeWarning)
+        model.run_until_and_store(ye, run_path=run_path,
+                                  diag_path=diag_path,
+                                  store_monthly_step=store_monthly_step)
+
     return model
 
 
@@ -1670,7 +2075,7 @@ def robust_model_run(gdir, output_filesuffix=None, mb_model=None,
 def run_random_climate(gdir, nyears=1000, y0=None, halfsize=15,
                        bias=None, seed=None, temperature_bias=None,
                        store_monthly_step=False,
-                       climate_filename='climate_monthly',
+                       climate_filename='climate_historical',
                        climate_input_filesuffix='',
                        output_filesuffix='', init_model_fls=None,
                        zero_initial_glacier=False,
@@ -1707,7 +2112,7 @@ def run_random_climate(gdir, nyears=1000, y0=None, halfsize=15,
         whether to store the diagnostic data at a monthly time step or not
         (default is yearly)
     climate_filename : str
-        name of the climate file, e.g. 'climate_monthly' (default) or
+        name of the climate file, e.g. 'climate_historical' (default) or
         'gcm_data'
     climate_input_filesuffix: str
         filesuffix for the input climate file
@@ -1751,7 +2156,7 @@ def run_constant_climate(gdir, nyears=1000, y0=None, halfsize=15,
                          bias=None, temperature_bias=None,
                          store_monthly_step=False,
                          output_filesuffix='',
-                         climate_filename='climate_monthly',
+                         climate_filename='climate_historical',
                          climate_input_filesuffix='',
                          init_model_fls=None,
                          zero_initial_glacier=False,
@@ -1784,7 +2189,7 @@ def run_constant_climate(gdir, nyears=1000, y0=None, halfsize=15,
         whether to store the diagnostic data at a monthly time step or not
         (default is yearly)
     climate_filename : str
-        name of the climate file, e.g. 'climate_monthly' (default) or
+        name of the climate file, e.g. 'climate_historical' (default) or
         'gcm_data'
     climate_input_filesuffix: str
         filesuffix for the input climate file
@@ -1819,11 +2224,11 @@ def run_constant_climate(gdir, nyears=1000, y0=None, halfsize=15,
 @entity_task(log)
 def run_from_climate_data(gdir, ys=None, ye=None, min_ys=None,
                           store_monthly_step=False,
-                          climate_filename='climate_monthly',
+                          climate_filename='climate_historical',
                           climate_input_filesuffix='', output_filesuffix='',
                           init_model_filesuffix=None, init_model_yr=None,
                           init_model_fls=None, zero_initial_glacier=False,
-                          **kwargs):
+                          bias=None, **kwargs):
     """ Runs a glacier with climate input from e.g. CRU or a GCM.
 
     This will initialize a
@@ -1846,7 +2251,7 @@ def run_from_climate_data(gdir, ys=None, ye=None, min_ys=None,
         whether to store the diagnostic data at a monthly time step or not
         (default is yearly)
     climate_filename : str
-        name of the climate file, e.g. 'climate_monthly' (default) or
+        name of the climate file, e.g. 'climate_historical' (default) or
         'gcm_data'
     climate_input_filesuffix: str
         filesuffix for the input climate file
@@ -1864,6 +2269,10 @@ def run_from_climate_data(gdir, ys=None, ye=None, min_ys=None,
         Ignored if `init_model_filesuffix` is set
     zero_initial_glacier : bool
         if true, the ice thickness is set to zero before the simulation
+    bias : float
+        bias of the mb model. Default is to use the calibrated one, which
+        is often a better idea. For t* experiments it can be useful to set it
+        to zero
     kwargs : dict
         kwargs to pass to the FluxBasedModel instance
     """
@@ -1873,6 +2282,11 @@ def run_from_climate_data(gdir, ys=None, ye=None, min_ys=None,
             ys = gdir.rgi_date.year
         except AttributeError:
             ys = gdir.rgi_date
+        # The RGI timestamp is in calendar date - we convert to hydro date,
+        # i.e. 2003 becomes 2004 (so that we don't count the MB year 2003
+        # in the simulation)
+        # See also: https://github.com/OGGM/oggm/issues/1020
+        ys += 1
     if ye is None:
         raise InvalidParamsError('Need to set the `ye` kwarg!')
     if min_ys is not None:
@@ -1887,7 +2301,7 @@ def run_from_climate_data(gdir, ys=None, ye=None, min_ys=None,
             init_model_fls = fmod.fls
 
     mb = MultipleFlowlineMassBalance(gdir, mb_model_class=PastMassBalance,
-                                     filename=climate_filename,
+                                     filename=climate_filename, bias=bias,
                                      input_filesuffix=climate_input_filesuffix)
 
     return robust_model_run(gdir, output_filesuffix=output_filesuffix,
@@ -1897,17 +2311,18 @@ def run_from_climate_data(gdir, ys=None, ye=None, min_ys=None,
                             zero_initial_glacier=zero_initial_glacier,
                             **kwargs)
 
-@entity_task(log)
-def merge_tributary_flowlines(main, tribs=[], filename='climate_monthly',
-                              input_filesuffix=''):
-    """Merge multiple tributary glaciers to a main glacier
+
+def merge_to_one_glacier(main, tribs, filename='climate_historical',
+                         input_filesuffix=''):
+    """Merge multiple tributary glacier flowlines to a main glacier
 
     This function will merge multiple tributary glaciers to a main glacier
     and write modified `model_flowlines` to the main GlacierDirectory.
-    Afterwards only the main GlacierDirectory must be processed and the results
-    will cover the main and the tributary glaciers.
     The provided tributaries must have an intersecting downstream line.
     To be sure about this, use `intersect_downstream_lines` first.
+    This function is mainly responsible to reporject the flowlines, set
+    flowline attributes and to copy additional files, like the necessary climat
+    files.
 
     Parameters
     ----------
@@ -1921,114 +2336,262 @@ def merge_tributary_flowlines(main, tribs=[], filename='climate_monthly',
         Filesuffix to the climate file
     """
 
-    # If its a dict, select the relevant ones
-    if isinstance(tribs, dict):
-        tribs = tribs[main.rgi_id.split('_merged')[0]]
-    # make sure tributaries are iteratable
-    tribs = utils.tolist(tribs)
-
-    # Buffer in pixels where to cut the incoming centerlines
-    buffer = cfg.PARAMS['kbuffer']
-    # Number of pixels to arbitrarily remove at junctions
-    lid = int(cfg.PARAMS['flowline_junction_pix'])
-
     # read flowlines of the Main glacier
-    mfls = main.read_pickle('model_flowlines')
-    mfl = mfls.pop(-1)  # remove main line from list and treat seperately
+    fls = main.read_pickle('model_flowlines')
+    mfl = fls.pop(-1)  # remove main line from list and treat seperately
 
     for trib in tribs:
 
+        # read tributary flowlines and append to list
         tfls = trib.read_pickle('model_flowlines')
 
-        # order flowlines in ascending way
+        # copy climate file and local_mustar to new gdir
+        # if we have a merge-merge situation we need to copy multiple files
+        rgiids = set([fl.rgi_id for fl in tfls])
+
+        for uid in rgiids:
+            if len(rgiids) == 1:
+                # we do not have a merge-merge situation
+                in_id = ''
+                out_id = trib.rgi_id
+            else:
+                in_id = '_' + uid
+                out_id = uid
+
+            climfile_in = filename + in_id + input_filesuffix + '.nc'
+            climfile_out = filename + '_' + out_id + input_filesuffix + '.nc'
+            shutil.copyfile(os.path.join(trib.dir, climfile_in),
+                            os.path.join(main.dir, climfile_out))
+
+            _m = os.path.basename(trib.get_filepath('local_mustar')).split('.')
+            muin = _m[0] + in_id + '.' + _m[1]
+            muout = _m[0] + '_' + out_id + '.' + _m[1]
+
+            shutil.copyfile(os.path.join(trib.dir, muin),
+                            os.path.join(main.dir, muout))
+
+        # sort flowlines descending
         tfls.sort(key=lambda x: x.order, reverse=True)
 
-        # check if flowlines are in correct order
-        order = [o.order for i, o in enumerate(tfls)]
-        if not (np.all(np.diff(order) <= 0)) & \
-               (tfls[0].order == np.max(order)):
-            raise RuntimeError('Flowline order is not correct')
-
+        # loop over tributaries and reproject to main glacier
         for nr, tfl in enumerate(tfls):
 
             # 1. Step: Change projection to the main glaciers grid
             _line = salem.transform_geometry(tfl.line,
                                              crs=trib.grid, to_crs=main.grid)
 
-            if nr == 0:
-                # cut tributary main line to size
-                # find area where lines overlap within a given buffer
-                _overlap = _line.intersection(mfl.line.buffer(buffer))
-                _line = _line.difference(_overlap)  # cut to new line
-
-                # if the tributary flowline is longer than the main line,
-                # _line will contain multiple LineStrings: only keep the first
-                try:
-                    _line = _line[0]
-                except TypeError:
-                    pass
-
-                # remove cfg.PARAMS['flowline_junction_pix'] from the _line
-                # gives a bigger gap at the junction and makes sure the last
-                # point is not corrupted in terms of spacing
-                _line = shpg.LineString(_line.coords[:-lid])
-
             # 2. set new line
             tfl.set_line(_line)
 
-            # 3. set flow to attributes
-            if nr == 0:
-                # this one flows to the main glacier
-                tfl.set_flows_to(mfl)  # set flows_to also changes mfl!
-            else:
-                # reset to the existing link, neccessary to set attributes
-                tfl.set_flows_to(tfl.flows_to)
-            # remove inflow points, will be set by other flowlines if need be
-            tfl.inflow_points = []
-
-            # 5. set grid size attributes
+            # 3. set map attributes
             dx = [shpg.Point(tfl.line.coords[i]).distance(
                 shpg.Point(tfl.line.coords[i+1]))
                 for i, pt in enumerate(tfl.line.coords[:-1])]  # get distance
             # and check if equally spaced
             if not np.allclose(dx, np.mean(dx), atol=1e-2):
                 raise RuntimeError('Flowline is not evenly spaced.')
+
             tfl.dx = np.mean(dx).round(2)
             tfl.map_dx = mfl.map_dx
             tfl.dx_meter = tfl.map_dx * tfl.dx
 
-            if nr == 0:
-                # change the array size of tributary main flowline attributs
-                for atr, value in tfl.__dict__.items():
-                    try:
-                        if len(value) > tfl.nx:
-                            tfl.__setattr__(atr, value[:tfl.nx])
-                    except TypeError:
-                        pass
+            # 3. remove attributes, they will be set again later
+            tfl.inflow_points = []
+            tfl.inflows = []
 
-            # replace tributary flowline within the list
-            tfls[nr] = tfl
+            # 4. set flows to, mainly to update flows_to_point coordinates
+            if tfl.flows_to is not None:
+                tfl.set_flows_to(tfl.flows_to)
 
-        # copy climate file and local_mustar to new gdir
-        climfilename = filename + '_' + trib.rgi_id + input_filesuffix + '.nc'
-        climfile = os.path.join(main.dir, climfilename)
-        shutil.copyfile(trib.get_filepath(filename,
-                                          filesuffix=input_filesuffix),
-                        climfile)
-        _mu = os.path.basename(trib.get_filepath('local_mustar')).split('.')
-        mufile = _mu[0] + '_' + trib.rgi_id + '.' + _mu[1]
-        shutil.copyfile(trib.get_filepath('local_mustar'),
-                        os.path.join(main.dir, mufile))
+        # append tributary flowlines to list
+        fls += tfls
 
-        mfls = tfls + mfls  # add all tributary flowlines to the main glacier
-    mfls = mfls + [mfl]  # add the main glacier flowline back to the list
-
-    # Set the new flowline levels
-    for fl in mfls:
-        fl.order = line_order(fl)
-
-    # order flowlines in descending way, important for downstream tasks
-    mfls.sort(key=lambda x: x.order, reverse=False)
+    # add main flowline to the end
+    fls = fls + [mfl]
 
     # Finally write the flowlines
-    main.write_pickle(mfls, 'model_flowlines')
+    main.write_pickle(fls, 'model_flowlines')
+
+
+def clean_merged_flowlines(gdir, buffer=None):
+    """Order and cut merged flowlines to size.
+
+    After matching flowlines were found and merged to one glacier directory
+    this function makes them nice:
+    There should only be one flowline per bed, so overlapping lines have to be
+    cut, attributed to a another flowline and orderd.
+
+    Parameters
+    ----------
+    gdir : oggm.GlacierDirectory
+        The GDir of the glacier of interest
+    buffer: float
+        Buffer around the flowlines to find overlaps
+    """
+
+    # No buffer does not work
+    if buffer is None:
+        buffer = cfg.PARAMS['kbuffer']
+
+    # Number of pixels to arbitrarily remove at junctions
+    lid = int(cfg.PARAMS['flowline_junction_pix'])
+
+    fls = gdir.read_pickle('model_flowlines')
+
+    # seperate the main main flowline
+    mainfl = fls.pop(-1)
+
+    # split fls in main and tribs
+    mfls = [fl for fl in fls if fl.flows_to is None]
+    tfls = [fl for fl in fls if fl not in mfls]
+
+    # --- first treat the main flowlines ---
+    # sort by order and length as a second choice
+    mfls.sort(key=lambda x: (x.order, len(x.inflows), x.length_m),
+              reverse=False)
+
+    merged = []
+
+    # for fl1 in mfls:
+    while len(mfls) > 0:
+        fl1 = mfls.pop(0)
+
+        ol_index = []  # list of index from first overlap
+
+        # loop over other main lines and main main line
+        for fl2 in mfls + [mainfl]:
+
+            # calculate overlap, maybe use larger buffer here only to find it
+            _overlap = fl1.line.intersection(fl2.line.buffer(buffer*2))
+
+            # calculate indice of first overlap if overlap length > 0
+            oix = 9999
+            if _overlap.length > 0 and fl1 != fl2 and fl2.flows_to != fl1:
+                if isinstance(_overlap, shpg.MultiLineString):
+                    if _overlap[0].coords[0] == fl1.line.coords[0]:
+                        # if the head of overlap is same as the first line,
+                        # best guess is, that the heads are close topgether!
+                        _ov1 = _overlap[1].coords[1]
+                    else:
+                        _ov1 = _overlap[0].coords[1]
+                else:
+                    _ov1 = _overlap.coords[1]
+                for _i, _p in enumerate(fl1.line.coords):
+                    if _p == _ov1:
+                        oix = _i
+                # low indices are more likely due to an wrong overlap
+                if oix < 10:
+                    oix = 9999
+            ol_index.append(oix)
+
+        ol_index = np.array(ol_index)
+        if np.all(ol_index == 9999):
+            log.warning('Glacier %s could not be merged, removed!' %
+                        fl1.rgi_id)
+            # remove possible tributary flowlines
+            tfls = [fl for fl in tfls if fl.rgi_id != fl1.rgi_id]
+            # skip rest of this while loop
+            continue
+
+        # make this based on first overlap, but consider order and or length
+        minx = ol_index[ol_index <= ol_index.min()+10][-1]
+        i = np.where(ol_index == minx)[0][-1]
+        _olline = (mfls + [mainfl])[i]
+
+        # 1. cut line to size
+        _line = fl1.line
+
+        bufferuse = buffer
+        while bufferuse > 0:
+            _overlap = _line.intersection(_olline.line.buffer(bufferuse))
+            _linediff = _line.difference(_overlap)  # cut to new line
+
+            # if the tributary flowline is longer than the main line,
+            # _line will contain multiple LineStrings: only keep the first
+            if isinstance(_linediff, shpg.MultiLineString):
+                _linediff = _linediff[0]
+
+            if len(_linediff.coords) < 10:
+                bufferuse -= 1
+            else:
+                break
+
+        if bufferuse <= 0:
+            log.warning('Glacier %s would be to short after merge, removed!' %
+                        fl1.rgi_id)
+            # remove possible tributary flowlines
+            tfls = [fl for fl in tfls if fl.rgi_id != fl1.rgi_id]
+            # skip rest of this while loop
+            continue
+
+        # remove cfg.PARAMS['flowline_junction_pix'] from the _line
+        # gives a bigger gap at the junction and makes sure the last
+        # point is not corrupted in terms of spacing
+        _line = shpg.LineString(_linediff.coords[:-lid])
+
+        # 2. set new line
+        fl1.set_line(_line)
+
+        # 3. set flow to attributes. This also adds inflow values to other
+        fl1.set_flows_to(_olline)
+
+        # change the array size of tributary flowline attributs
+        for atr, value in fl1.__dict__.items():
+            if atr in ['_ptrap', '_prec']:
+                # those are indices, remove those above nx
+                fl1.__setattr__(atr, value[value < fl1.nx])
+            elif isinstance(value, np.ndarray) and (len(value) > fl1.nx):
+                # those are actual parameters on the grid
+                fl1.__setattr__(atr, value[:fl1.nx])
+
+        merged.append(fl1)
+    allfls = merged + tfls
+
+    # now check all lines for possible cut offs
+    for fl in allfls:
+        try:
+            fl.flows_to_indice
+        except AssertionError:
+            mfl = fl.flows_to
+            # remove it from original
+            mfl.inflow_points.remove(fl.flows_to_point)
+            mfl.inflows.remove(fl)
+
+            prdis = mfl.line.project(fl.tail)
+            mfl_keep = mfl
+
+            while mfl.flows_to is not None:
+                prdis2 = mfl.flows_to.line.project(fl.tail)
+                if prdis2 < prdis:
+                    mfl_keep = mfl
+                    prdis = prdis2
+                mfl = mfl.flows_to
+
+            # we should be good to add this line here
+            fl.set_flows_to(mfl_keep.flows_to)
+
+    allfls = allfls + [mainfl]
+
+    for fl in allfls:
+        fl.inflows = []
+        fl.inflow_points = []
+        if hasattr(fl, '_lazy_flows_to_indice'):
+            delattr(fl, '_lazy_flows_to_indice')
+        if hasattr(fl, '_lazy_inflow_indices'):
+            delattr(fl, '_lazy_inflow_indices')
+
+    for fl in allfls:
+        if fl.flows_to is not None:
+            fl.set_flows_to(fl.flows_to)
+
+    for fl in allfls:
+        fl.order = line_order(fl)
+
+    # order flowlines in descending way
+    allfls.sort(key=lambda x: x.order, reverse=False)
+
+    # assert last flowline is main flowline
+    assert allfls[-1] == mainfl
+
+    # Finally write the flowlines
+    gdir.write_pickle(allfls, 'model_flowlines')

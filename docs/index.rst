@@ -8,10 +8,8 @@ future mass-balance, volume and geometry of (almost) any glacier in the world
 in a fully automated and extensible workflow. We rely exclusively on publicly
 available data for calibration and validation.
 
-.. note::
-
-    **This is the software documentation: for general information about the
-    OGGM project and related news, visit** `oggm.org <http://oggm.org>`_.
+**This is the software documentation: for general information about the
+OGGM project and related news, visit** `oggm.org <http://oggm.org>`_.
 
 
 .. include:: _generated/version_text.txt
@@ -23,7 +21,7 @@ Principles
 Physical principles implemented in the model and their underlying assumptions,
 with as little code as possible. For more detailed information, we recommend
 to read the OGGM
-`description paper <https://www.geosci-model-dev-discuss.net/gmd-2018-9/>`_ as
+`description paper <https://www.geosci-model-dev.net/12/909/2019/>`_ as
 well.
 
 * :doc:`introduction`
@@ -48,13 +46,15 @@ Using OGGM
 
 How to use the model, with concrete python code examples.
 
+* :doc:`cloud`
 * :doc:`installing-oggm`
 * :doc:`getting-started`
 * :doc:`input-data`
-* :doc:`mpi`
 * :doc:`run`
+* :doc:`practicalities`
 * :doc:`api`
 * :doc:`faq`
+* :doc:`pitfalls`
 * :doc:`whats-new`
 
 .. toctree::
@@ -62,13 +62,15 @@ How to use the model, with concrete python code examples.
     :hidden:
     :caption: Using OGGM
 
+    cloud.rst
     installing-oggm.rst
     getting-started.rst
     input-data.rst
-    mpi.rst
     run.rst
     api.rst
+    practicalities.rst
     faq.rst
+    pitfalls.rst
     whats-new.rst
 
 Contributing
@@ -78,6 +80,7 @@ Do you want to contribute to the model? This is the right place to start.
 
 * :doc:`citing-oggm`
 * :doc:`add-module`
+* :doc:`oeps`
 * :doc:`contributing`
 
 .. toctree::
@@ -87,6 +90,7 @@ Do you want to contribute to the model? This is the right place to start.
 
     citing-oggm.rst
     add-module.rst
+    oeps.rst
     contributing.rst
 
 .. _contact:
@@ -95,12 +99,14 @@ Get in touch
 ------------
 
 - View the source code `on GitHub`_.
-- Report bugs or share your ideas on the `issue tracker`_.
-- Improve the model by submitting a `pull request`_.
+- Report bugs or share your ideas on the `issue tracker`_, and improve
+  the model by submitting a `pull request`_.
+- Chat with us on `Slack`_! (just send us an email so we can add you)
 - Follow us on `Twitter`_.
 - Or you can always send us an `e-mail`_ the good old way.
 
-.. _e-mail: https://mailman.zfn.uni-bremen.de/cgi-bin/mailman/listinfo/oggm-users
+.. _e-mail: info@oggm.org
+.. _Slack: https://slack.com
 .. _on GitHub: https://github.com/OGGM/oggm
 .. _issue tracker: https://github.com/OGGM/oggm/issues
 .. _pull request: https://github.com/OGGM/oggm/pulls
@@ -110,72 +116,30 @@ Get in touch
 License and citation
 --------------------
 
-.. image:: _static/gpl.png
-   :width: 140 px
+OGGM is available under the open source `3-Clause BSD License`_.
 
-OGGM is available under the open source `GNU GPLv3 license`_.
-
-.. _GNU GPLv3 license: http://www.gnu.org/licenses/gpl-3.0.en.html
+.. _3-Clause BSD License: https://opensource.org/licenses/BSD-3-Clause
 
 OGGM is free software. This implies that you are free to use the model and
 copy or modify its code at your wish, under certain conditions:
 
 1. When using this software, please acknowledge the original authors of this
-   contribution by linking to our project website `www.oggm.org <http://oggm.org>`_.
-   For your publications, presentations or posters we kindly ask you to refer to the
-   `paper in Geoscientific Model Development`_ (in review).
+   contribution by using our logo, referring to our website or using an
+   appropriate citation. See :ref:`citing-oggm` for how to do that.
 
-   BibTeX entry::
+2. Redistributions of any substantial portion of the OGGM source code must
+   meet the conditions listed in the `OGGM license`_
 
-        @Article{gmd-2018-9,
-        AUTHOR = {Maussion, F. and Butenko, A. and Eis, J. and Fourteau, K. and
-                  Jarosch, A. H. and Landmann, J. and Oesterle, F. and
-                  Recinos, B. and Rothenpieler, T. and Vlug, A. and
-                  Wild, C. T. and Marzeion, B.},
-        TITLE = {The Open Global Glacier Model (OGGM) v1.0},
-        JOURNAL = {Geoscientific Model Development Discussions},
-        VOLUME = {2018},
-        YEAR = {2018},
-        PAGES = {1--33},
-        URL = {https://www.geosci-model-dev-discuss.net/gmd-2018-9/},
-        DOI = {10.5194/gmd-2018-9}
-        }
+3. Neither OGGM e.V. nor the names of OGGM contributors may be used to endorse
+   or promote products derived from this software without specific prior
+   written permission. This does not mean that you need our written permission
+   to work with OGGM or publish results based on OGGM: it simply means that
+   the OGGM developers are not accountable for your use of the tool
+   (`more info <https://opensource.stackexchange.com/a/9137>`_).
 
+See the `OGGM license`_ for more information.
 
-   If you want to refer to a specific version of the software you can use
-   the `Zenodo citation`_ for this purpose.
-
-   An example BibTeX entry::
-
-        @misc{OGGM_v1.0.0,
-        author       = {Fabien Maussion and Timo Rothenpieler and
-                        Beatriz Recinos and Anouk Vlug and
-                        Ben Marzeion and Felix Oesterle and
-                        Johannes Landmann and Alex Jarosch and
-                        Julia Eis and Anton Butenko and Schmitty Smith},
-        title        = {OGGM/oggm: v1.0.0},
-        month        = jan,
-        year         = 2018,
-        doi          = {10.5281/zenodo.1149701},
-        url          = {https://doi.org/10.5281/zenodo.1149701}
-        }
-
-
-2. Your modifications to the code belong to you, but if you decide
-   to share these modifications with others you'll have to do so under the same
-   license as OGGM (the GNU General Public License as published by the Free
-   Software Foundation).
-
-See the `wikipedia page about GPL`_ and the `OGGM license`_ for more
-information.
-
-.. _paper in Geoscientific Model Development: https://www.geosci-model-dev-discuss.net/gmd-2018-9/
-
-.. _Zenodo citation: https://zenodo.org/badge/latestdoi/43965645
-
-.. _wikipedia page about GPL: https://en.wikipedia.org/wiki/GNU_General_Public_License
-
-.. _OGGM license: https://github.com/OGGM/oggm/blob/master/LICENSE.rst
+.. _OGGM license: https://github.com/OGGM/oggm/blob/master/LICENSE.txt
 
 About
 -----
@@ -191,7 +155,7 @@ About
 
 :Citation:
     .. image:: https://img.shields.io/badge/Citation-GMD%20paper-orange.svg
-        :target: https://www.geosci-model-dev-discuss.net/gmd-2018-9/
+        :target: https://www.geosci-model-dev.net/12/909/2019/
         :alt: GMD Paper
 
     .. image:: https://zenodo.org/badge/43965645.svg
@@ -221,8 +185,8 @@ About
 
 :License:
     .. image:: https://img.shields.io/pypi/l/oggm.svg
-        :target: http://www.gnu.org/licenses/gpl-3.0.en.html
-        :alt: GNU GPLv3 license
+        :target: https://github.com/OGGM/oggm/blob/master/LICENSE.txt
+        :alt: BSD-3-Clause License
 
 :Authors:
 
