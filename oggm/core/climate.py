@@ -4,14 +4,21 @@ import logging
 import os
 import datetime
 import warnings
+
 # External libs
 import numpy as np
+import xarray as xr
 import netCDF4
 import pandas as pd
-import xarray as xr
 from scipy import stats
-import salem
 from scipy import optimize as optimization
+
+# Optional libs
+try:
+    import salem
+except ImportError:
+    pass
+
 # Locals
 from oggm import cfg
 from oggm import utils
@@ -79,12 +86,13 @@ def process_histalp_nonparallel(gdirs, fpath=None):
                'hydro_yr_0': y0+1, 'hydro_yr_1': y1}
         gdir.write_pickle(out, 'climate_info')
 
-@entity_task(log, writes=['climate_monthly', 'climate_info'])
-def process_custom_climate_data(gdir):
+@entity_task(log, writes=['climate_historical'])
+def process_custom_climate_data(gdir, y0=None, y1=None,
+                                output_filesuffix=None):
     """Processes and writes the climate data from a user-defined climate file.
 
     The input file must have a specific format (see
-    https://github.com/OGGM/oggm-sample-data test-files/histalp_merged_hef.nc
+    https://github.com/OGGM/oggm-sample-data ->test-files/histalp_merged_hef.nc
     for an example).
 
     This is the way OGGM used to do it for HISTALP before it got automatised.
@@ -93,6 +101,17 @@ def process_custom_climate_data(gdir):
     ----------
     gdir : :py:class:`oggm.GlacierDirectory`
         the glacier directory to process
+    y0 : int
+        the starting year of the timeseries to write. The default is to take
+        the entire time period available in the file, but with this kwarg
+        you can shorten it (to save space or to crop bad data)
+    y1 : int
+        the starting year of the timeseries to write. The default is to take
+        the entire time period available in the file, but with this kwarg
+        you can shorten it (to save space or to crop bad data)
+    output_filesuffix : str
+        this add a suffix to the output file (useful to avoid overwriting
+        previous experiments)
     """
 
     if not (('climate_file' in cfg.PATHS) and
@@ -114,11 +133,9 @@ def process_custom_climate_data(gdir):
     sm = cfg.PARAMS['hydro_month_' + gdir.hemisphere]
     em = sm - 1 if (sm > 1) else 12
     yrs = nc_ts.time.year
-    y0, y1 = yrs[0], yrs[-1]
-    if cfg.PARAMS['baseline_y0'] != 0:
-        y0 = cfg.PARAMS['baseline_y0']
-    if cfg.PARAMS['baseline_y1'] != 0:
-        y1 = cfg.PARAMS['baseline_y1']
+    y0 = yrs[0] if y0 is None else y0
+    y1 = yrs[-1] if y1 is None else y1
+
     nc_ts.set_period(t0='{}-{:02d}-01'.format(y0, sm),
                      t1='{}-{:02d}-01'.format(y1, em))
     time = nc_ts.time
@@ -168,189 +185,211 @@ def process_custom_climate_data(gdir):
 
     gdir.write_monthly_climate_file(time, iprcp, itemp, ihgt,
                                     ref_pix_lon, ref_pix_lat,
-                                    gradient=igrad)
-    # metadata
-    out = {'baseline_climate_source': fpath,
-           'baseline_hydro_yr_0': y0+1,
-           'baseline_hydro_yr_1': y1}
-    gdir.write_pickle(out, 'climate_info')
+                                    filesuffix=output_filesuffix,
+                                    gradient=igrad,
+                                    source=fpath)
 
 
-@entity_task(log, writes=['climate_monthly', 'climate_info'])
-def process_cru_data(gdir):
-    """Processes and writes the CRU baseline climate data for this glacier.
+@entity_task(log)
+def process_climate_data(gdir, y0=None, y1=None, output_filesuffix=None,
+                         **kwargs):
+    """Adds the selected climate data to this glacier directory.
 
-    Interpolates the CRU TS data to the high-resolution CL2 climatologies
-    (provided with OGGM) and writes everything to a NetCDF file.
+    Short wrapper deciding on which task to run based on
+    `cfg.PARAMS['baseline_climate']`.
+
+    If you want to make it explicit, simply call the relevant task
+    (e.g. oggm.shop.cru.process_cru_data).
 
     Parameters
     ----------
     gdir : :py:class:`oggm.GlacierDirectory`
         the glacier directory to process
+    y0 : int
+        the starting year of the timeseries to write. The default is to take
+        the entire time period available in the file, but with this kwarg
+        you can shorten it (to save space or to crop bad data)
+    y1 : int
+        the starting year of the timeseries to write. The default is to take
+        the entire time period available in the file, but with this kwarg
+        you can shorten it (to save space or to crop bad data)
+    output_filesuffix : str
+        this add a suffix to the output file (useful to avoid overwriting
+        previous experiments)
+    **kwargs :
+        any other argument relevant to the task that will be called.
     """
 
-    if cfg.PATHS.get('climate_file', None):
-        warnings.warn("You seem to have set a custom climate file for this "
-                      "run, but are using the default CRU climate "
-                      "file instead.")
+    # Which climate should we use?
+    baseline = cfg.PARAMS['baseline_climate']
+    if baseline == 'CRU':
+        from oggm.shop.cru import process_cru_data
+        process_cru_data(gdir, output_filesuffix=output_filesuffix,
+                         y0=y0, y1=y1, **kwargs)
+    elif baseline == 'HISTALP':
+        from oggm.shop.histalp import process_histalp_data
+        process_histalp_data(gdir, output_filesuffix=output_filesuffix,
+                             y0=y0, y1=y1, **kwargs)
+    elif baseline in ['ERA5', 'ERA5L', 'CERA', 'ERA5dr']:
+        from oggm.shop.ecmwf import process_ecmwf_data
+        process_ecmwf_data(gdir, output_filesuffix=output_filesuffix,
+                           dataset=baseline, y0=y0, y1=y1, **kwargs)
+    elif '+' in baseline:
+        # This bit below assumes ECMWF only datasets, but it should be
+        # quite easy to extend for HISTALP+ERA5L for example
+        from oggm.shop.ecmwf import process_ecmwf_data
+        his, ref = baseline.split('+')
+        s = 'tmp_'
+        process_ecmwf_data(gdir, output_filesuffix=s+his, dataset=his,
+                           y0=y0, y1=y1, **kwargs)
+        process_ecmwf_data(gdir, output_filesuffix=s+ref, dataset=ref,
+                           y0=y0, y1=y1, **kwargs)
+        historical_delta_method(gdir,
+                                ref_filesuffix=s+ref,
+                                hist_filesuffix=s+his,
+                                output_filesuffix=output_filesuffix)
+    elif '|' in baseline:
+        from oggm.shop.ecmwf import process_ecmwf_data
+        his, ref = baseline.split('|')
+        s = 'tmp_'
+        process_ecmwf_data(gdir, output_filesuffix=s+his, dataset=his,
+                           y0=y0, y1=y1, **kwargs)
+        process_ecmwf_data(gdir, output_filesuffix=s+ref, dataset=ref,
+                           y0=y0, y1=y1, **kwargs)
+        historical_delta_method(gdir,
+                                ref_filesuffix=s+ref,
+                                hist_filesuffix=s+his,
+                                output_filesuffix=output_filesuffix,
+                                replace_with_ref_data=False)
+    elif baseline == 'CUSTOM':
+        process_custom_climate_data(gdir, y0=y0, y1=y1,
+                                    output_filesuffix=output_filesuffix,
+                                    **kwargs)
+    else:
+        raise ValueError("cfg.PARAMS['baseline_climate'] not understood")
 
-    if cfg.PARAMS['baseline_climate'] != 'CRU':
-        raise InvalidParamsError("cfg.PARAMS['baseline_climate'] should be "
-                                 "set to CRU")
 
-    # read the climatology
-    clfile = utils.get_cru_cl_file()
-    ncclim = salem.GeoNetcdf(clfile)
-    # and the TS data
-    nc_ts_tmp = salem.GeoNetcdf(utils.get_cru_file('tmp'), monthbegin=True)
-    nc_ts_pre = salem.GeoNetcdf(utils.get_cru_file('pre'), monthbegin=True)
+@entity_task(log, writes=['climate_historical'])
+def historical_delta_method(gdir, ref_filesuffix='', hist_filesuffix='',
+                            output_filesuffix='', ref_year_range=None,
+                            delete_input_files=True, scale_stddev=True,
+                            replace_with_ref_data=True):
+    """Applies the anomaly method to historical climate data
 
-    # set temporal subset for the ts data (hydro years)
-    sm = cfg.PARAMS['hydro_month_' + gdir.hemisphere]
-    em = sm - 1 if (sm > 1) else 12
-    yrs = nc_ts_pre.time.year
-    y0, y1 = yrs[0], yrs[-1]
-    if cfg.PARAMS['baseline_y0'] != 0:
-        y0 = cfg.PARAMS['baseline_y0']
-    if cfg.PARAMS['baseline_y1'] != 0:
-        y1 = cfg.PARAMS['baseline_y1']
+    This function can be used to prolongate historical time series,
+    for example by bias-correcting CERA-20C to ERA5 or ERA5-Land.
 
-    nc_ts_tmp.set_period(t0='{}-{:02d}-01'.format(y0, sm),
-                         t1='{}-{:02d}-01'.format(y1, em))
-    nc_ts_pre.set_period(t0='{}-{:02d}-01'.format(y0, sm),
-                         t1='{}-{:02d}-01'.format(y1, em))
-    time = nc_ts_pre.time
-    ny, r = divmod(len(time), 12)
-    assert r == 0
+    The timeseries must be already available in the glacier directory
 
-    lon = gdir.cenlon
-    lat = gdir.cenlat
+    Parameters
+    ----------
+    gdir : :py:class:`oggm.GlacierDirectory`
+        where to write the data
+    ref_filesuffix : str
+        the filesuffix of the historical climate data to take as reference
+    hist_filesuffix : str
+        the filesuffix of the historical climate data to apply to the
+        reference
+    output_filesuffix : str
+        the filesuffix of the output file (usually left empty - i.e. this
+        file will become the default)
+    ref_year_range : tuple of str
+        the year range for which you want to compute the anomalies. The
+        default is to take the entire reference data period, but you could
+         also choose `('1961', '1990')` for example
+    delete_input_files : bool
+        delete the input files after use - useful for operational runs
+        where you don't want to carry too many files
+    scale_stddev : bool
+        whether or not to scale the temperature standard deviation as well
+        (you probably want to do that)
+    replace_with_ref_data : bool
+        the default is to paste the bias-corrected data where no reference
+        data is available, i.e. creating timeseries which are not consistent
+        in time but "better" for recent times (e.g. CERA-20C until 1980,
+        then ERA5). Set this to False to present this and make a consistent
+        time series of CERA-20C (but bias corrected to the reference data,
+        so "better" than CERA-20C out of the box).
+    """
 
-    # This is guaranteed to work because I prepared the file (I hope)
-    ncclim.set_subset(corners=((lon, lat), (lon, lat)), margin=1)
+    if ref_year_range is not None:
+        raise NotImplementedError()
 
-    # get climatology data
-    loc_hgt = ncclim.get_vardata('elev')
-    loc_tmp = ncclim.get_vardata('temp')
-    loc_pre = ncclim.get_vardata('prcp')
-    loc_lon = ncclim.get_vardata('lon')
-    loc_lat = ncclim.get_vardata('lat')
+    # Read input
+    f_ref = gdir.get_filepath('climate_historical', filesuffix=ref_filesuffix)
+    with xr.open_dataset(f_ref) as ds:
+        ref_temp = ds['temp']
+        ref_prcp = ds['prcp']
+        ref_hgt = float(ds.ref_hgt)
+        ref_lon = float(ds.ref_pix_lon)
+        ref_lat = float(ds.ref_pix_lat)
+        source = ds.attrs.get('climate_source')
 
-    # see if the center is ok
-    if not np.isfinite(loc_hgt[1, 1]):
-        # take another candidate where finite
-        isok = np.isfinite(loc_hgt)
+    f_his = gdir.get_filepath('climate_historical', filesuffix=hist_filesuffix)
+    with xr.open_dataset(f_his) as ds:
+        hist_temp = ds['temp']
+        hist_prcp = ds['prcp']
+        # To differentiate both cases
+        if replace_with_ref_data:
+            source = ds.attrs.get('climate_source') + '+' + source
+        else:
+            source = ds.attrs.get('climate_source') + '|' + source
 
-        # wait: some areas are entirely NaNs, make the subset larger
-        _margin = 1
-        while not np.any(isok):
-            _margin += 1
-            ncclim.set_subset(corners=((lon, lat), (lon, lat)), margin=_margin)
-            loc_hgt = ncclim.get_vardata('elev')
-            isok = np.isfinite(loc_hgt)
-        if _margin > 1:
-            log.debug('(%s) I had to look up for far climate pixels: %s',
-                      gdir.rgi_id, _margin)
+    # Common time period
+    cmn_time = (ref_temp + hist_temp)['time']
+    assert len(cmn_time) // 12 == len(cmn_time) / 12
+    # We need an even number of years for this to work
+    if ((len(cmn_time) // 12) % 2) == 1:
+        cmn_time = cmn_time.isel(time=slice(12, len(cmn_time)))
+    assert len(cmn_time) // 12 == len(cmn_time) / 12
+    assert ((len(cmn_time) // 12) % 2) == 0
+    cmn_time_range = cmn_time.values[[0, -1]]
 
-        # Take the first candidate (doesn't matter which)
-        lon, lat = ncclim.grid.ll_coordinates
-        lon = lon[isok][0]
-        lat = lat[isok][0]
-        # Resubset
-        ncclim.set_subset()
-        ncclim.set_subset(corners=((lon, lat), (lon, lat)), margin=1)
-        loc_hgt = ncclim.get_vardata('elev')
-        loc_tmp = ncclim.get_vardata('temp')
-        loc_pre = ncclim.get_vardata('prcp')
-        loc_lon = ncclim.get_vardata('lon')
-        loc_lat = ncclim.get_vardata('lat')
+    # Select ref
+    sref_temp = ref_temp.sel(time=slice(*cmn_time_range))
+    sref_prcp = ref_prcp.sel(time=slice(*cmn_time_range))
 
-    assert np.isfinite(loc_hgt[1, 1])
-    isok = np.isfinite(loc_hgt)
-    hgt_f = loc_hgt[isok].flatten()
-    assert len(hgt_f) > 0.
+    # See if we need to scale the variability
+    if scale_stddev:
+        # This is a bit more arithmetic
+        sm = cfg.PARAMS['hydro_month_' + gdir.hemisphere]
+        tmp_sel = hist_temp.sel(time=slice(*cmn_time_range))
+        tmp_std = tmp_sel.groupby('time.month').std(dim='time')
+        std_fac = sref_temp.groupby('time.month').std(dim='time') / tmp_std
+        std_fac = std_fac.roll(month=13-sm, roll_coords=True)
+        std_fac = np.tile(std_fac.data, len(hist_temp) // 12)
+        win_size = len(cmn_time) + 1
 
-    # Should we compute the gradient?
-    use_grad = cfg.PARAMS['temp_use_local_gradient']
-    ts_grad = None
-    if use_grad and len(hgt_f) >= 5:
-        ts_grad = np.zeros(12) * np.NaN
-        for i in range(12):
-            loc_tmp_mth = loc_tmp[i, ...][isok].flatten()
-            slope, _, _, p_val, _ = stats.linregress(hgt_f, loc_tmp_mth)
-            ts_grad[i] = slope if (p_val < 0.01) else np.NaN
-        # convert to a timeseries and hydrological years
-        ts_grad = ts_grad.tolist()
-        ts_grad = ts_grad[em:] + ts_grad[0:em]
-        ts_grad = np.asarray(ts_grad * ny)
+        def roll_func(x, axis=None):
+            assert axis == 1
+            x = x[:, ::12]
+            n = len(x[0, :]) // 2
+            xm = np.nanmean(x, axis=axis)
+            return xm + (x[:, n] - xm) * std_fac
 
-    # maybe this will throw out of bounds warnings
-    nc_ts_tmp.set_subset(corners=((lon, lat), (lon, lat)), margin=1)
-    nc_ts_pre.set_subset(corners=((lon, lat), (lon, lat)), margin=1)
+        hist_temp = hist_temp.rolling(time=win_size, center=True,
+                                      min_periods=1).reduce(roll_func)
 
     # compute monthly anomalies
     # of temp
-    ts_tmp = nc_ts_tmp.get_vardata('tmp', as_xarray=True)
-    ts_tmp_avg = ts_tmp.sel(time=slice('1961-01-01', '1990-12-01'))
-    ts_tmp_avg = ts_tmp_avg.groupby('time.month').mean(dim='time')
-    ts_tmp = ts_tmp.groupby('time.month') - ts_tmp_avg
-    # of precip
-    ts_pre = nc_ts_pre.get_vardata('pre', as_xarray=True)
-    ts_pre_avg = ts_pre.sel(time=slice('1961-01-01', '1990-12-01'))
+    ts_tmp_sel = hist_temp.sel(time=slice(*cmn_time_range))
+    ts_tmp_avg = ts_tmp_sel.groupby('time.month').mean(dim='time')
+    ts_tmp = hist_temp.groupby('time.month') - ts_tmp_avg
+    # of precip -- scaled anomalies
+    ts_pre_avg = hist_prcp.sel(time=slice(*cmn_time_range))
     ts_pre_avg = ts_pre_avg.groupby('time.month').mean(dim='time')
-    ts_pre_ano = ts_pre.groupby('time.month') - ts_pre_avg
+    ts_pre_ano = hist_prcp.groupby('time.month') - ts_pre_avg
     # scaled anomalies is the default. Standard anomalies above
     # are used later for where ts_pre_avg == 0
-    ts_pre = ts_pre.groupby('time.month') / ts_pre_avg
+    ts_pre = hist_prcp.groupby('time.month') / ts_pre_avg
 
-    # interpolate to HR grid
-    if np.any(~np.isfinite(ts_tmp[:, 1, 1])):
-        # Extreme case, middle pix is not valid
-        # take any valid pix from the 3*3 (and hope there's one)
-        found_it = False
-        for idi in range(2):
-            for idj in range(2):
-                if np.all(np.isfinite(ts_tmp[:, idj, idi])):
-                    ts_tmp[:, 1, 1] = ts_tmp[:, idj, idi]
-                    ts_pre[:, 1, 1] = ts_pre[:, idj, idi]
-                    ts_pre_ano[:, 1, 1] = ts_pre_ano[:, idj, idi]
-                    found_it = True
-        if not found_it:
-            msg = '({}) there is no climate data'.format(gdir.rgi_id)
-            raise MassBalanceCalibrationError(msg)
-    elif np.any(~np.isfinite(ts_tmp)):
-        # maybe the side is nan, but we can do nearest
-        ts_tmp = ncclim.grid.map_gridded_data(ts_tmp.values, nc_ts_tmp.grid,
-                                              interp='nearest')
-        ts_pre = ncclim.grid.map_gridded_data(ts_pre.values, nc_ts_pre.grid,
-                                              interp='nearest')
-        ts_pre_ano = ncclim.grid.map_gridded_data(ts_pre_ano.values,
-                                                  nc_ts_pre.grid,
-                                                  interp='nearest')
-    else:
-        # We can do bilinear
-        ts_tmp = ncclim.grid.map_gridded_data(ts_tmp.values, nc_ts_tmp.grid,
-                                              interp='linear')
-        ts_pre = ncclim.grid.map_gridded_data(ts_pre.values, nc_ts_pre.grid,
-                                              interp='linear')
-        ts_pre_ano = ncclim.grid.map_gridded_data(ts_pre_ano.values,
-                                                  nc_ts_pre.grid,
-                                                  interp='linear')
-
-    # take the center pixel and add it to the CRU CL clim
+    # reference averages
     # for temp
-    loc_tmp = xr.DataArray(loc_tmp[:, 1, 1], dims=['month'],
-                           coords={'month': ts_tmp_avg.month})
-    ts_tmp = xr.DataArray(ts_tmp[:, 1, 1], dims=['time'],
-                          coords={'time': time})
+    loc_tmp = sref_temp.groupby('time.month').mean()
     ts_tmp = ts_tmp.groupby('time.month') + loc_tmp
+
     # for prcp
-    loc_pre = xr.DataArray(loc_pre[:, 1, 1], dims=['month'],
-                           coords={'month': ts_pre_avg.month})
-    ts_pre = xr.DataArray(ts_pre[:, 1, 1], dims=['time'],
-                          coords={'time': time})
-    ts_pre_ano = xr.DataArray(ts_pre_ano[:, 1, 1], dims=['time'],
-                              coords={'time': time})
+    loc_pre = sref_prcp.groupby('time.month').mean()
     # scaled anomalies
     ts_pre = ts_pre.groupby('time.month') * loc_pre
     # standard anomalies
@@ -359,279 +398,124 @@ def process_cru_data(gdir):
     ts_pre.values = np.where(np.isfinite(ts_pre.values),
                              ts_pre.values,
                              ts_pre_ano.values)
-    # The last step might create negative values (unlikely). Clip them
-    ts_pre.values = ts_pre.values.clip(0)
+    # The previous step might create negative values (unlikely). Clip them
+    ts_pre.values = utils.clip_min(ts_pre.values, 0)
 
-    # done
-    loc_hgt = loc_hgt[1, 1]
-    loc_lon = loc_lon[1]
-    loc_lat = loc_lat[1]
-    assert np.isfinite(loc_hgt)
     assert np.all(np.isfinite(ts_pre.values))
     assert np.all(np.isfinite(ts_tmp.values))
 
-    gdir.write_monthly_climate_file(time, ts_pre.values, ts_tmp.values,
-                                    loc_hgt, loc_lon, loc_lat,
-                                    gradient=ts_grad)
+    if not replace_with_ref_data:
+        # Just write what we have
+        gdir.write_monthly_climate_file(ts_tmp.time.values,
+                                        ts_pre.values, ts_tmp.values,
+                                        ref_hgt, ref_lon, ref_lat,
+                                        filesuffix=output_filesuffix,
+                                        source=source)
+    else:
+        # Select all hist data before the ref
+        ts_tmp = ts_tmp.sel(time=slice(ts_tmp.time[0], ref_temp.time[0]))
+        ts_tmp = ts_tmp.isel(time=slice(0, -1))
+        ts_pre = ts_pre.sel(time=slice(ts_tmp.time[0], ref_temp.time[0]))
+        ts_pre = ts_pre.isel(time=slice(0, -1))
+        # Concatenate and write
+        gdir.write_monthly_climate_file(np.append(ts_pre.time, ref_prcp.time),
+                                        np.append(ts_pre, ref_prcp),
+                                        np.append(ts_tmp, ref_temp),
+                                        ref_hgt, ref_lon, ref_lat,
+                                        filesuffix=output_filesuffix,
+                                        source=source)
 
-    source = nc_ts_tmp._nc.title[:10]
-    ncclim._nc.close()
-    nc_ts_tmp._nc.close()
-    nc_ts_pre._nc.close()
-    # metadata
-    out = {'baseline_climate_source': source,
-           'baseline_hydro_yr_0': y0+1,
-           'baseline_hydro_yr_1': y1}
-    gdir.write_pickle(out, 'climate_info')
+    if delete_input_files:
+        # Delete all files without suffix
+        if ref_filesuffix:
+            os.remove(f_ref)
+        if hist_filesuffix:
+            os.remove(f_his)
 
 
-@entity_task(log, writes=['climate_monthly', 'climate_info'])
-def process_dummy_cru_file(gdir, sigma_temp=2, sigma_prcp=0.5, seed=None):
-    """Create a simple baseline climate file for this glacier - for testing!
+@entity_task(log, writes=['climate_historical'])
+def historical_climate_qc(gdir):
+    """"Check the "quality" of climate data and correct it if needed.
 
-    This simply reproduces the climatology with a little randomness in it.
-
-    TODO: extend the functionality by allowing a monthly varying sigma
-
-    Parameters
-    ----------
-    gdir : GlacierDirectory
-        the glacier directory
-    sigma_temp : float
-        the standard deviation of the random timeseries (set to 0 for constant
-        ts)
-    sigma_prcp : float
-        the standard deviation of the random timeseries (set to 0 for constant
-        ts)
-    seed : int
-        the RandomState seed
+    This forces the climate data to have at least one month of melt per year
+    at the terminus of the glacier (i.e. simply shifting temperatures up
+    when necessary), and at least one month where accumulation is possible
+    at the glacier top (i.e. shifting the temperatures down).
     """
 
-    # read the climatology
-    clfile = utils.get_cru_cl_file()
-    ncclim = salem.GeoNetcdf(clfile)
+    # Parameters
+    temp_s = (cfg.PARAMS['temp_all_liq'] + cfg.PARAMS['temp_all_solid']) / 2
+    temp_m = cfg.PARAMS['temp_melt']
+    default_grad = cfg.PARAMS['temp_default_gradient']
+    g_minmax = cfg.PARAMS['temp_local_gradient_bounds']
+    qc_months = cfg.PARAMS['climate_qc_months']
+    if qc_months == 0:
+        return
 
-    # set temporal subset for the ts data (hydro years)
-    sm = cfg.PARAMS['hydro_month_' + gdir.hemisphere]
-    em = sm - 1 if (sm > 1) else 12
-
-    y0, y1 = 1901, 2018
-    if cfg.PARAMS['baseline_y0'] != 0:
-        y0 = cfg.PARAMS['baseline_y0']
-    if cfg.PARAMS['baseline_y1'] != 0:
-        y1 = cfg.PARAMS['baseline_y1']
-
-    time = pd.date_range(start='{}-{:02d}-01'.format(y0, sm),
-                         end='{}-{:02d}-01'.format(y1, em),
-                         freq='MS')
-    ny, r = divmod(len(time), 12)
-    assert r == 0
-
-    lon = gdir.cenlon
-    lat = gdir.cenlat
-
-    # This is guaranteed to work because I prepared the file (I hope)
-    ncclim.set_subset(corners=((lon, lat), (lon, lat)), margin=1)
-
-    # get climatology data
-    loc_hgt = ncclim.get_vardata('elev')
-    loc_tmp = ncclim.get_vardata('temp')
-    loc_pre = ncclim.get_vardata('prcp')
-    loc_lon = ncclim.get_vardata('lon')
-    loc_lat = ncclim.get_vardata('lat')
-
-    # see if the center is ok
-    if not np.isfinite(loc_hgt[1, 1]):
-        # take another candidate where finite
-        isok = np.isfinite(loc_hgt)
-
-        # wait: some areas are entirely NaNs, make the subset larger
-        _margin = 1
-        while not np.any(isok):
-            _margin += 1
-            ncclim.set_subset(corners=((lon, lat), (lon, lat)), margin=_margin)
-            loc_hgt = ncclim.get_vardata('elev')
-            isok = np.isfinite(loc_hgt)
-        if _margin > 1:
-            log.debug('(%s) I had to look up for far climate pixels: %s',
-                      gdir.rgi_id, _margin)
-
-        # Take the first candidate (doesn't matter which)
-        lon, lat = ncclim.grid.ll_coordinates
-        lon = lon[isok][0]
-        lat = lat[isok][0]
-        # Resubset
-        ncclim.set_subset()
-        ncclim.set_subset(corners=((lon, lat), (lon, lat)), margin=1)
-        loc_hgt = ncclim.get_vardata('elev')
-        loc_tmp = ncclim.get_vardata('temp')
-        loc_pre = ncclim.get_vardata('prcp')
-        loc_lon = ncclim.get_vardata('lon')
-        loc_lat = ncclim.get_vardata('lat')
-
-    assert np.isfinite(loc_hgt[1, 1])
-    isok = np.isfinite(loc_hgt)
-    hgt_f = loc_hgt[isok].flatten()
-    assert len(hgt_f) > 0.
-
-    # Should we compute the gradient?
-    use_grad = cfg.PARAMS['temp_use_local_gradient']
-    ts_grad = None
-    if use_grad and len(hgt_f) >= 5:
-        ts_grad = np.zeros(12) * np.NaN
-        for i in range(12):
-            loc_tmp_mth = loc_tmp[i, ...][isok].flatten()
-            slope, _, _, p_val, _ = stats.linregress(hgt_f, loc_tmp_mth)
-            ts_grad[i] = slope if (p_val < 0.01) else np.NaN
-        # convert to a timeseries and hydrological years
-        ts_grad = ts_grad.tolist()
-        ts_grad = ts_grad[em:] + ts_grad[0:em]
-        ts_grad = np.asarray(ts_grad * ny)
-
-    # Make DataArrays
-    rng = np.random.RandomState(seed)
-    loc_tmp = xr.DataArray(loc_tmp[:, 1, 1], dims=['month'],
-                           coords={'month': np.arange(1, 13)})
-    ts_tmp = rng.randn(len(time)) * sigma_temp
-    ts_tmp = xr.DataArray(ts_tmp, dims=['time'],
-                          coords={'time': time})
-
-    loc_pre = xr.DataArray(loc_pre[:, 1, 1], dims=['month'],
-                           coords={'month': np.arange(1, 13)})
-    ts_pre = (rng.randn(len(time)) * sigma_prcp + 1).clip(0)
-    ts_pre = xr.DataArray(ts_pre, dims=['time'],
-                          coords={'time': time})
-
-    # Create the time series
-    ts_tmp = ts_tmp.groupby('time.month') + loc_tmp
-    ts_pre = ts_pre.groupby('time.month') * loc_pre
-
-    # done
-    loc_hgt = loc_hgt[1, 1]
-    loc_lon = loc_lon[1]
-    loc_lat = loc_lat[1]
-    assert np.isfinite(loc_hgt)
-
-    gdir.write_monthly_climate_file(time, ts_pre.values, ts_tmp.values,
-                                    loc_hgt, loc_lon, loc_lat,
-                                    gradient=ts_grad)
-
-    source = 'CRU CL2 and some randomness'
-    ncclim._nc.close()
-    # metadata
-    out = {'baseline_climate_source': source,
-           'baseline_hydro_yr_0': y0+1,
-           'baseline_hydro_yr_1': y1}
-    gdir.write_pickle(out, 'climate_info')
-
-
-@entity_task(log, writes=['climate_monthly', 'climate_info'])
-def process_histalp_data(gdir):
-    """Processes and writes the HISTALP baseline climate data for this glacier.
-
-    Extracts the nearest timeseries and writes everything to a NetCDF file.
-
-    Parameters
-    ----------
-    gdir : :py:class:`oggm.GlacierDirectory`
-        the glacier directory to process
-    """
-
-    if cfg.PATHS.get('climate_file', None):
-        warnings.warn("You seem to have set a custom climate file for this "
-                      "run, but are using the default HISTALP climate file "
-                      "instead.")
-
-    if cfg.PARAMS['baseline_climate'] != 'HISTALP':
-        raise InvalidParamsError("cfg.PARAMS['baseline_climate'] should be "
-                                 "set to HISTALP.")
-
-    # read the time out of the pure netcdf file
-    ft = utils.get_histalp_file('tmp')
-    fp = utils.get_histalp_file('pre')
-    with utils.ncDataset(ft) as nc:
-        vt = nc.variables['time']
-        assert vt[0] == 0
-        assert vt[-1] == vt.shape[0] - 1
-        t0 = vt.units.split(' since ')[1][:7]
-        time_t = pd.date_range(start=t0, periods=vt.shape[0], freq='MS')
-    with utils.ncDataset(fp) as nc:
-        vt = nc.variables['time']
-        assert vt[0] == 0.5
-        assert vt[-1] == vt.shape[0] - .5
-        t0 = vt.units.split(' since ')[1][:7]
-        time_p = pd.date_range(start=t0, periods=vt.shape[0], freq='MS')
-
-    # Now open with salem
-    nc_ts_tmp = salem.GeoNetcdf(ft, time=time_t)
-    nc_ts_pre = salem.GeoNetcdf(fp, time=time_p)
-
-    # set temporal subset for the ts data (hydro years)
-    # the reference time is given by precip, which is shorter
-    sm = cfg.PARAMS['hydro_month_nh']
-    em = sm - 1 if (sm > 1) else 12
-    yrs = nc_ts_pre.time.year
-    y0, y1 = yrs[0], yrs[-1]
-    if cfg.PARAMS['baseline_y0'] != 0:
-        y0 = cfg.PARAMS['baseline_y0']
-    if cfg.PARAMS['baseline_y1'] != 0:
-        y1 = cfg.PARAMS['baseline_y1']
-
-    nc_ts_tmp.set_period(t0='{}-{:02d}-01'.format(y0, sm),
-                         t1='{}-{:02d}-01'.format(y1, em))
-    nc_ts_pre.set_period(t0='{}-{:02d}-01'.format(y0, sm),
-                         t1='{}-{:02d}-01'.format(y1, em))
-    time = nc_ts_pre.time
-    ny, r = divmod(len(time), 12)
-    assert r == 0
-
-    # Units
-    assert nc_ts_tmp._nc.variables['HSURF'].units.lower() in ['m', 'meters',
-                                                              'meter',
-                                                              'metres',
-                                                              'metre']
-    assert nc_ts_tmp._nc.variables['T_2M'].units.lower() in ['degc', 'degrees',
-                                                             'degrees celcius',
-                                                             'degree', 'c']
-    assert nc_ts_pre._nc.variables['TOT_PREC'].units.lower() in ['kg m-2',
-                                                                 'l m-2', 'mm',
-                                                                 'millimeters',
-                                                                 'millimeter']
-
-    # geoloc
-    lon = gdir.cenlon
-    lat = gdir.cenlat
-    nc_ts_tmp.set_subset(corners=((lon, lat), (lon, lat)), margin=1)
-    nc_ts_pre.set_subset(corners=((lon, lat), (lon, lat)), margin=1)
-
-    # read the data
-    temp = nc_ts_tmp.get_vardata('T_2M')
-    prcp = nc_ts_pre.get_vardata('TOT_PREC')
-    hgt = nc_ts_tmp.get_vardata('HSURF')
-    ref_lon = nc_ts_tmp.get_vardata('lon')
-    ref_lat = nc_ts_tmp.get_vardata('lat')
-    source = nc_ts_tmp._nc.title[:7]
-    nc_ts_tmp._nc.close()
-    nc_ts_pre._nc.close()
-
-    # Should we compute the gradient?
-    use_grad = cfg.PARAMS['temp_use_local_gradient']
+    # Read file
+    fpath = gdir.get_filepath('climate_historical')
     igrad = None
-    if use_grad:
-        igrad = np.zeros(len(time)) * np.NaN
-        for t, loct in enumerate(temp):
-            slope, _, _, p_val, _ = stats.linregress(hgt.flatten(),
-                                                     loct.flatten())
-            igrad[t] = slope if (p_val < 0.01) else np.NaN
+    with utils.ncDataset(fpath) as nc:
+        # time
+        # Read timeseries
+        itemp = nc.variables['temp'][:]
+        if 'gradient' in nc.variables:
+            igrad = nc.variables['gradient'][:]
+            # Security for stuff that can happen with local gradients
+            igrad = np.where(~np.isfinite(igrad), default_grad, igrad)
+            igrad = utils.clip_array(igrad, g_minmax[0], g_minmax[1])
+        ref_hgt = nc.ref_hgt
 
-    gdir.write_monthly_climate_file(time, prcp[:, 1, 1], temp[:, 1, 1],
-                                    hgt[1, 1], ref_lon[1], ref_lat[1],
-                                    gradient=igrad)
-    # metadata
-    out = {'baseline_climate_source': source,
-           'baseline_hydro_yr_0': y0 + 1,
-           'baseline_hydro_yr_1': y1}
-    gdir.write_pickle(out, 'climate_info')
+    # Default gradient?
+    if igrad is None:
+        igrad = itemp * 0 + default_grad
+
+    ny = len(igrad) // 12
+    assert ny == len(igrad) / 12
+
+    # Geometry data
+    fls = gdir.read_pickle('inversion_flowlines')
+    heights = np.array([])
+    for fl in fls:
+        heights = np.append(heights, fl.surface_h)
+    top_h = np.max(heights)
+    bot_h = np.min(heights)
+
+    # First check - there should be at least one month of melt every year
+    prev_ref_hgt = ref_hgt
+    while True:
+        ts_bot = itemp + default_grad * (bot_h - ref_hgt)
+        ts_bot = (ts_bot.reshape((ny, 12)) > temp_m).sum(axis=1)
+        if np.all(ts_bot >= qc_months):
+            # Ok all good
+            break
+        # put ref hgt a bit higher so that we warm things a bit
+        ref_hgt += 10
+
+    # If we changed this it makes no sense to lower it down again,
+    # so resume here:
+    if ref_hgt != prev_ref_hgt:
+        with utils.ncDataset(fpath, 'a') as nc:
+            nc.ref_hgt = ref_hgt
+            nc.uncorrected_ref_hgt = prev_ref_hgt
+        gdir.add_to_diagnostics('ref_hgt_qc_diff', int(ref_hgt - prev_ref_hgt))
+        return
+
+    # Second check - there should be at least one month of acc every year
+    while True:
+        ts_top = itemp + default_grad * (top_h - ref_hgt)
+        ts_top = (ts_top.reshape((ny, 12)) < temp_s).sum(axis=1)
+        if np.all(ts_top >= qc_months):
+            # Ok all good
+            break
+        # put ref hgt a bit lower so that we cold things a bit
+        ref_hgt -= 10
+
+    if ref_hgt != prev_ref_hgt:
+        with utils.ncDataset(fpath, 'a') as nc:
+            nc.ref_hgt = ref_hgt
+            nc.uncorrected_ref_hgt = prev_ref_hgt
+        gdir.add_to_diagnostics('ref_hgt_qc_diff', int(ref_hgt - prev_ref_hgt))
 
 
 def mb_climate_on_height(gdir, heights, *, time_range=None, year_range=None):
@@ -682,7 +566,7 @@ def mb_climate_on_height(gdir, heights, *, time_range=None, year_range=None):
 
     # Read file
     igrad = None
-    with utils.ncDataset(gdir.get_filepath('climate_monthly'), mode='r') as nc:
+    with utils.ncDataset(gdir.get_filepath('climate_historical')) as nc:
         # time
         time = nc.variables['time']
         time = netCDF4.num2date(time[:], time.units)
@@ -712,7 +596,7 @@ def mb_climate_on_height(gdir, heights, *, time_range=None, year_range=None):
             igrad = nc.variables['gradient'][p0:p1+1]
             # Security for stuff that can happen with local gradients
             igrad = np.where(~np.isfinite(igrad), default_grad, igrad)
-            igrad = np.clip(igrad, g_minmax[0], g_minmax[1])
+            igrad = utils.clip_array(igrad, g_minmax[0], g_minmax[1])
         ref_hgt = nc.ref_hgt
 
     # Default gradient?
@@ -729,11 +613,11 @@ def mb_climate_on_height(gdir, heights, *, time_range=None, year_range=None):
     grad_temp *= (heights.repeat(len(time)).reshape(grad_temp.shape) - ref_hgt)
     temp2d = np.atleast_2d(itemp).repeat(npix, 0) + grad_temp
     temp2dformelt = temp2d - temp_melt
-    temp2dformelt = np.clip(temp2dformelt, 0, temp2dformelt.max())
+    temp2dformelt = utils.clip_min(temp2dformelt, 0)
     # Compute solid precipitation from total precipitation
     prcpsol = np.atleast_2d(iprcp).repeat(npix, 0)
     fac = 1 - (temp2d - temp_all_solid) / (temp_all_liq - temp_all_solid)
-    fac = np.clip(fac, 0, 1)
+    fac = utils.clip_array(fac, 0, 1)
     prcpsol = prcpsol * fac
 
     return time, temp2dformelt, prcpsol
@@ -838,7 +722,7 @@ def mb_yearly_climate_on_glacier(gdir, *, year_range=None):
     return years, temp, prcp
 
 
-@entity_task(log, writes=['climate_info'])
+@entity_task(log)
 def glacier_mu_candidates(gdir):
     """Computes the mu candidates, glacier wide.
 
@@ -862,7 +746,7 @@ def glacier_mu_candidates(gdir):
 
     # Only get the years were we consider looking for tstar
     y0, y1 = cfg.PARAMS['tstar_search_window']
-    ci = gdir.read_pickle('climate_info')
+    ci = gdir.get_climate_info()
     y0 = y0 or ci['baseline_hydro_yr_0']
     y1 = y1 or ci['baseline_hydro_yr_1']
 
@@ -887,13 +771,11 @@ def glacier_mu_candidates(gdir):
                                           .format(gdir.rgi_id))
 
     # Write
-    ci['mu_candidates_glacierwide'] = pd.Series(data=mu_yr_clim, index=years)
-    gdir.write_pickle(ci, 'climate_info')
+    return pd.Series(data=mu_yr_clim, index=years)
 
 
-@entity_task(log, writes=['climate_info'])
-def t_star_from_refmb(gdir, mbdf=None, glacierwide=None,
-                      write_diagnostics=False):
+@entity_task(log)
+def t_star_from_refmb(gdir, mbdf=None, glacierwide=None):
     """Computes the ref t* for the glacier, given a series of MB measurements.
 
     Parameters
@@ -904,7 +786,7 @@ def t_star_from_refmb(gdir, mbdf=None, glacierwide=None,
 
     Returns
     -------
-    A dict: {t_star:[], bias:[]}
+    A dict: {t_star:[], bias:[], 'avg_mb_per_mu': [], 'avg_ref_mb': []}
     """
 
     from oggm.core.massbalance import MultipleFlowlineMassBalance
@@ -913,7 +795,7 @@ def t_star_from_refmb(gdir, mbdf=None, glacierwide=None,
         glacierwide = cfg.PARAMS['tstar_search_glacierwide']
 
     # Be sure we have no marine terminating glacier
-    assert gdir.terminus_type == 'Land-terminating'
+    assert not gdir.is_tidewater
 
     # Reference time series
     if mbdf is None:
@@ -928,7 +810,7 @@ def t_star_from_refmb(gdir, mbdf=None, glacierwide=None,
     # Compute one mu candidate per year and the associated statistics
     # Only get the years were we consider looking for tstar
     y0, y1 = cfg.PARAMS['tstar_search_window']
-    ci = gdir.read_pickle('climate_info')
+    ci = gdir.get_climate_info()
     y0 = y0 or ci['baseline_hydro_yr_0']
     y1 = y1 or ci['baseline_hydro_yr_1']
     years = np.arange(y0, y1+1)
@@ -1005,16 +887,13 @@ def t_star_from_refmb(gdir, mbdf=None, glacierwide=None,
     amin = np.abs(diff).idxmin()
 
     # Write
-    d = gdir.read_pickle('climate_info')
+    d = gdir.get_climate_info()
     d['t_star'] = amin
     d['bias'] = diff[amin]
-    if write_diagnostics:
-        d['avg_mb_per_mu'] = mb_per_mu
-        d['avg_ref_mb'] = ref_mb
+    gdir.write_json(d, 'climate_info')
 
-    gdir.write_pickle(d, 'climate_info')
-
-    return {'t_star': amin, 'bias': diff[amin]}
+    return {'t_star': amin, 'bias': diff[amin],
+            'avg_mb_per_mu': mb_per_mu, 'avg_ref_mb': ref_mb}
 
 
 def calving_mb(gdir):
@@ -1053,7 +932,8 @@ def _fallback_local_t_star(gdir):
     gdir.write_json(df, 'local_mustar')
 
 
-@entity_task(log, writes=['local_mustar'], fallback=_fallback_local_t_star)
+@entity_task(log, writes=['local_mustar', 'climate_info'],
+             fallback=_fallback_local_t_star)
 def local_t_star(gdir, *, ref_df=None, tstar=None, bias=None):
     """Compute the local t* and associated glacier-wide mu*.
 
@@ -1077,14 +957,14 @@ def local_t_star(gdir, *, ref_df=None, tstar=None, bias=None):
 
     # Relevant mb params
     params = ['temp_default_gradient', 'temp_all_solid', 'temp_all_liq',
-              'temp_melt', 'prcp_scaling_factor']
+              'temp_melt', 'prcp_scaling_factor', 'climate_qc_months']
 
     if tstar is None or bias is None:
         # Do our own interpolation
         if ref_df is None:
             if not cfg.PARAMS['run_mb_calibration']:
                 # Make some checks and use the default one
-                climate_info = gdir.read_pickle('climate_info')
+                climate_info = gdir.get_climate_info()
                 source = climate_info['baseline_climate_source']
                 ok_source = ['CRU TS4.01', 'CRU TS3.23', 'HISTALP']
                 if not np.any(s in source.upper() for s in ok_source):
@@ -1094,15 +974,18 @@ def local_t_star(gdir, *, ref_df=None, tstar=None, bias=None):
                 v = gdir.rgi_version[0]  # major version relevant
 
                 # Check that the params are fine
-                str_s = 'cru4' if 'CRU' in source else 'histalp'
-                vn = 'ref_tstars_rgi{}_{}_calib_params'.format(v, str_s)
+                s = 'cru4' if 'CRU' in source else 'histalp'
+                vn = 'oggm_ref_tstars_rgi{}_{}_calib_params'.format(v, s)
+                # This is for as long as the old files are around
+                if 'climate_qc_months' not in cfg.PARAMS[vn]:
+                    params.remove('climate_qc_months')
                 for k in params:
                     if cfg.PARAMS[k] != cfg.PARAMS[vn][k]:
                         msg = ('The reference t* you are trying to use was '
                                'calibrated with different MB parameters. You '
                                'might have to run the calibration manually.')
                         raise MassBalanceCalibrationError(msg)
-                ref_df = cfg.PARAMS['ref_tstars_rgi{}_{}'.format(v, str_s)]
+                ref_df = cfg.PARAMS['oggm_ref_tstars_rgi{}_{}'.format(v, s)]
             else:
                 # Use the the local calibration
                 fp = os.path.join(cfg.PATHS['working_dir'], 'ref_tstars.csv')
@@ -1122,14 +1005,14 @@ def local_t_star(gdir, *, ref_df=None, tstar=None, bias=None):
             tstar = amin.tstar.iloc[0]
             bias = amin.bias.iloc[0]
         else:
-            tstar = int(np.average(amin.tstar, weights=1./distances))
+            tstar = int(np.average(amin.tstar, weights=1./distances).round())
             bias = np.average(amin.bias, weights=1./distances)
 
     # Add the climate related params to the GlacierDir to make sure
     # other tools cannot fool around without re-calibration
-    out = gdir.read_pickle('climate_info')
+    out = gdir.get_climate_info()
     out['mb_calib_params'] = {k: cfg.PARAMS[k] for k in params}
-    gdir.write_pickle(out, 'climate_info')
+    gdir.write_json(out, 'climate_info')
 
     # We compute the overall mu* here but this is mostly for testing
     # Climate period
@@ -1153,12 +1036,12 @@ def local_t_star(gdir, *, ref_df=None, tstar=None, bias=None):
 
     # Clip it?
     if cfg.PARAMS['clip_mu_star']:
-        mustar = np.clip(mustar, 0, None)
+        mustar = utils.clip_min(mustar, 0)
 
     # If mu out of bounds, raise
     if not (cfg.PARAMS['min_mu_star'] <= mustar <= cfg.PARAMS['max_mu_star']):
-        raise MassBalanceCalibrationError('mu* out of specified bounds: '
-                                          '{:.2f}'.format(mustar))
+        raise MassBalanceCalibrationError('{}: mu* out of specified bounds: '
+                                          '{:.2f}'.format(gdir.rgi_id, mustar))
 
     # Scalars in a small dict for later
     df = dict()
@@ -1213,8 +1096,15 @@ def _recursive_mu_star_calibration(gdir, fls, t_star, first_call=True,
                                           args=(fls, cmb, temp, prcp, widths),
                                           xtol=1e-5)
         except ValueError:
-            raise MassBalanceCalibrationError('{} mu* out of specified '
-                                              'bounds.'.format(gdir.rgi_id))
+            # This happens in very rare cases
+            _mu_lim = _mu_star_per_minimization(cfg.PARAMS['min_mu_star'],
+                                                fls, cmb, temp, prcp, widths)
+            if _mu_lim < 0 and np.allclose(_mu_lim, 0):
+                mu_star = 0.
+            else:
+                raise MassBalanceCalibrationError('{} mu* out of specified '
+                                                  'bounds.'.format(gdir.rgi_id)
+                                                  )
 
         if not np.isfinite(mu_star):
             raise MassBalanceCalibrationError('{} '.format(gdir.rgi_id) +
@@ -1239,7 +1129,7 @@ def _recursive_mu_star_calibration(gdir, fls, t_star, first_call=True,
     # Mass-balance. These tributaries wouldn't exist with a single
     # glacier-wide mu*, and therefore need a specific calibration.
     # All other mus may be affected
-    if cfg.PARAMS['correct_for_neg_flux']:
+    if cfg.PARAMS['correct_for_neg_flux'] and (len(fls) > 1):
         if np.any([fl.flux_needs_correction for fl in fls]):
 
             # We start with the highest Strahler number that needs correction
@@ -1350,8 +1240,8 @@ def mu_star_calibration(gdir):
     # If not marine and a bit far from zero, warning
     cmb = calving_mb(gdir)
     if cmb == 0 and not np.allclose(fls[-1].flux[-1], 0., atol=0.01):
-        log.warning('(%s) flux should be zero, but is: '
-                    '%.4f km3 ice yr-1', gdir.rgi_id, aflux)
+        log.info('(%s) flux should be zero, but is: '
+                 '%.4f km3 ice yr-1', gdir.rgi_id, aflux)
     # If not marine and quite far from zero, error
     if cmb == 0 and not np.allclose(fls[-1].flux[-1], 0., atol=1):
         msg = ('({}) flux should be zero, but is: {:.4f} km3 ice yr-1'
@@ -1381,7 +1271,7 @@ def mu_star_calibration(gdir):
 
 
 @entity_task(log, writes=['inversion_flowlines', 'linear_mb_params'])
-def apparent_mb_from_linear_mb(gdir, mb_gradient=3.):
+def apparent_mb_from_linear_mb(gdir, mb_gradient=3., ela_h=None):
     """Compute apparent mb from a linear mass-balance assumption (for testing).
 
     This is for testing currently, but could be used as alternative method
@@ -1407,8 +1297,10 @@ def apparent_mb_from_linear_mb(gdir, mb_gradient=3.):
         smb = mbmod.get_specific_mb(heights=h, widths=w)
         return (smb - cmb)**2
 
-    ela_h = optimization.minimize(to_minimize, [0.], bounds=((0, 10000), ))
-    ela_h = ela_h['x'][0]
+    if ela_h is None:
+        ela_h = optimization.minimize(to_minimize, [0.], bounds=((0, 10000), ))
+        ela_h = ela_h['x'][0]
+
     mbmod = LinearMassBalance(ela_h, grad=mb_gradient)
 
     # For each flowline compute the apparent MB
@@ -1428,8 +1320,8 @@ def apparent_mb_from_linear_mb(gdir, mb_gradient=3.):
     aflux = fls[-1].flux[-1] * 1e-9 / rho * gdir.grid.dx**2
     # If not marine and a bit far from zero, warning
     if cmb == 0 and not np.allclose(fls[-1].flux[-1], 0., atol=0.01):
-        log.warning('(%s) flux should be zero, but is: '
-                    '%.4f km3 ice yr-1', gdir.rgi_id, aflux)
+        log.info('(%s) flux should be zero, but is: '
+                 '%.4f km3 ice yr-1', gdir.rgi_id, aflux)
     # If not marine and quite far from zero, error
     if cmb == 0 and not np.allclose(fls[-1].flux[-1], 0., atol=1):
         msg = ('({}) flux should be zero, but is: {:.4f} km3 ice yr-1'
@@ -1438,6 +1330,66 @@ def apparent_mb_from_linear_mb(gdir, mb_gradient=3.):
     gdir.write_pickle(fls, 'inversion_flowlines')
     gdir.write_pickle({'ela_h': ela_h, 'grad': mb_gradient},
                       'linear_mb_params')
+
+
+@entity_task(log, writes=['inversion_flowlines'])
+def apparent_mb_from_any_mb(gdir, mb_model=None, mb_years=None):
+    """Compute apparent mb from an arbitrary mass-balance profile.
+
+    This searches for a mass-balance residual to add to the mass-balance
+    profile so that the average specific MB is zero.
+
+    Parameters
+    ----------
+    gdir : :py:class:`oggm.GlacierDirectory`
+        the glacier directory to process
+    mb_model : :py:class:`oggm.core.massbalance.MassBalanceModel`
+        the mass-balance model to use (superseedes mb_list)
+    mb_years : array
+        the array of years from which you want to average the MB for (for
+        mb_model only).
+    """
+
+    # Do we have a calving glacier?
+    cmb = calving_mb(gdir)
+
+    # For each flowline compute the apparent MB
+    fls = gdir.read_pickle('inversion_flowlines')
+
+    def to_minimize(residual):
+        smb = mb_model.get_specific_mb(fls=fls, year=mb_years)
+        smb = np.mean(smb) + residual[0]
+        return (smb - cmb)**2
+
+    residual = optimization.minimize(to_minimize, [0.], bounds=((-1e5, 1e5), ))
+    residual = residual['x'][0]
+
+    # Reset flux
+    for fl in fls:
+        fl.flux = np.zeros(len(fl.surface_h))
+
+    # Flowlines in order to be sure
+    rho = cfg.PARAMS['ice_density']
+    for fl_id, fl in enumerate(fls):
+        mbz = 0
+        for yr in mb_years:
+            mbz += mb_model.get_annual_mb(fl.surface_h, year=yr,
+                                          fls=fls, fl_id=fl_id)
+        mbz = mbz / len(mb_years)
+        fl.set_apparent_mb(mbz * cfg.SEC_IN_YEAR * rho + residual)
+
+    # Check and write
+    aflux = fls[-1].flux[-1] * 1e-9 / rho * gdir.grid.dx**2
+    # If not marine and a bit far from zero, warning
+    if cmb == 0 and not np.allclose(fls[-1].flux[-1], 0., atol=0.01):
+        log.info('(%s) flux should be zero, but is: '
+                 '%.4f km3 ice yr-1', gdir.rgi_id, aflux)
+    # If not marine and quite far from zero, error
+    if cmb == 0 and not np.allclose(fls[-1].flux[-1], 0., atol=1):
+        msg = ('({}) flux should be zero, but is: {:.4f} km3 ice yr-1'
+               .format(gdir.rgi_id, aflux))
+        raise MassBalanceCalibrationError(msg)
+    gdir.write_pickle(fls, 'inversion_flowlines')
 
 
 @global_task
@@ -1463,6 +1415,9 @@ def compute_ref_t_stars(gdirs):
 
     log.info('Compute the reference t* and mu* for WGMS glaciers')
 
+    # Should be iterable
+    gdirs = utils.tolist(gdirs)
+
     # Reference glaciers only if in the list and period is good
     ref_gdirs = utils.get_ref_mb_glaciers(gdirs)
 
@@ -1473,6 +1428,15 @@ def compute_ref_t_stars(gdirs):
     # Loop write
     df = pd.DataFrame()
     for gdir, res in zip(ref_gdirs, out):
+        if res is None:
+            # For certain parameters there is no valid mu candidate on certain
+            # glaciers. E.g. if temp is to low for melt. This will raise an
+            # error in t_star_from_refmb and should only get here if
+            # continue_on_error = True
+            # Do not add this glacier to the ref_tstar.csv
+            # Think of better solution later
+            continue
+
         # list of mus compatibles with refmb
         rid = gdir.rgi_id
         df.loc[rid, 'lon'] = gdir.cenlon

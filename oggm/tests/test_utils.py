@@ -5,43 +5,33 @@ import unittest
 import os
 import shutil
 import time
-import gzip
-import bz2
 import hashlib
+import tarfile
 import pytest
+import itertools
 from unittest import mock
 
-import salem
 import numpy as np
 import pandas as pd
-import geopandas as gpd
 from numpy.testing import assert_array_equal, assert_allclose
+
+salem = pytest.importorskip('salem')
+gpd = pytest.importorskip('geopandas')
 
 import oggm
 from oggm import utils, workflow, tasks
 from oggm.utils import _downloads
 from oggm import cfg
-from oggm.tests.funcs import (get_test_dir, patch_url_retrieve_github,
-                              init_hef, TempEnvironmentVariable)
+from oggm.tests.funcs import get_test_dir, init_hef, TempEnvironmentVariable
 from oggm.utils import shape_factor_adhikari
-from oggm.exceptions import (InvalidParamsError,
+from oggm.exceptions import (InvalidParamsError, InvalidDEMError,
                              DownloadVerificationFailedException)
 
 
 pytestmark = pytest.mark.test_env("utils")
-_url_retrieve = None
 
-TEST_GDIR_URL = ('https://cluster.klima.uni-bremen.de/~fmaussion/'
+TEST_GDIR_URL = ('https://cluster.klima.uni-bremen.de/~oggm/'
                  'test_gdirs/oggm_v1.1/')
-
-
-def setup_module(module):
-    module._url_retrieve = utils.oggm_urlretrieve
-    oggm.utils._downloads.oggm_urlretrieve = patch_url_retrieve_github
-
-
-def teardown_module(module):
-    oggm.utils._downloads.oggm_urlretrieve = module._url_retrieve
 
 
 def clean_dir(testdir):
@@ -173,32 +163,35 @@ class TestFuncs(unittest.TestCase):
     def test_hydro_convertion(self):
 
         # October
-        y, m = utils.hydrodate_to_calendardate(1, 1)
+        y, m = utils.hydrodate_to_calendardate(1, 1, start_month=10)
         assert (y, m) == (0, 10)
-        y, m = utils.hydrodate_to_calendardate(1, 4)
+        y, m = utils.hydrodate_to_calendardate(1, 4, start_month=10)
         assert (y, m) == (1, 1)
-        y, m = utils.hydrodate_to_calendardate(1, 12)
+        y, m = utils.hydrodate_to_calendardate(1, 12, start_month=10)
         assert (y, m) == (1, 9)
 
-        y, m = utils.hydrodate_to_calendardate([1, 1, 1], [1, 4, 12])
+        y, m = utils.hydrodate_to_calendardate([1, 1, 1], [1, 4, 12],
+                                               start_month=10)
         np.testing.assert_array_equal(y, [0, 1, 1])
         np.testing.assert_array_equal(m, [10, 1, 9])
 
-        y, m = utils.calendardate_to_hydrodate(1, 1)
+        y, m = utils.calendardate_to_hydrodate(1, 1, start_month=10)
         assert (y, m) == (1, 4)
-        y, m = utils.calendardate_to_hydrodate(1, 9)
+        y, m = utils.calendardate_to_hydrodate(1, 9, start_month=10)
         assert (y, m) == (1, 12)
-        y, m = utils.calendardate_to_hydrodate(1, 10)
+        y, m = utils.calendardate_to_hydrodate(1, 10, start_month=10)
         assert (y, m) == (2, 1)
 
-        y, m = utils.calendardate_to_hydrodate([1, 1, 1], [1, 9, 10])
+        y, m = utils.calendardate_to_hydrodate([1, 1, 1], [1, 9, 10],
+                                               start_month=10)
         np.testing.assert_array_equal(y, [1, 1, 2])
         np.testing.assert_array_equal(m, [4, 12, 1])
 
         # Roundtrip
         time = pd.period_range('0001-01', '1000-12', freq='M')
-        y, m = utils.calendardate_to_hydrodate(time.year, time.month)
-        y, m = utils.hydrodate_to_calendardate(y, m)
+        y, m = utils.calendardate_to_hydrodate(time.year, time.month,
+                                               start_month=10)
+        y, m = utils.hydrodate_to_calendardate(y, m, start_month=10)
         np.testing.assert_array_equal(y, time.year)
         np.testing.assert_array_equal(m, time.month)
 
@@ -246,12 +239,82 @@ class TestFuncs(unittest.TestCase):
         np.testing.assert_equal(shape_factor_adhikari(w, h, is_rect*0.),
                                 factors_parabolic)
 
+    def test_clips(self):
+
+        a = np.arange(50) - 5
+        assert_array_equal(np.clip(a, None, 10), utils.clip_max(a, 10))
+        assert_array_equal(np.clip(a, 0, None), utils.clip_min(a, 0))
+        assert_array_equal(np.clip(a, 0, 10), utils.clip_array(a, 0, 10))
+
+        for a in [-1, 2, 12]:
+            assert_array_equal(np.clip(a, 0, 10), utils.clip_scalar(a, 0, 10))
+            assert_array_equal(np.clip(a, None, 10), utils.clip_max(a, 10))
+            assert_array_equal(np.clip(a, 0, None), utils.clip_min(a, 0))
+
+    def test_clips_performance(self):
+        import timeit
+
+        n = int(1e5)
+
+        # Scalar
+        s1 = 'import numpy as np'
+        s2 = 'from oggm import utils'
+
+        t1 = timeit.timeit('np.clip(1, 0, 10)', number=n, setup=s1)
+        t2 = timeit.timeit('utils.clip_scalar(1, 0, 10)', number=n, setup=s2)
+        assert t2 < t1
+
+        t1 = timeit.timeit('np.clip(12, None, 10)', number=n, setup=s1)
+        t2 = timeit.timeit('utils.clip_max(12, 10)', number=n, setup=s2)
+        assert t2 < t1
+
+        t1 = timeit.timeit('np.clip(12, 15, None)', number=n, setup=s1)
+        t2 = timeit.timeit('utils.clip_min(12, 15)', number=n, setup=s2)
+        assert t2 < t1
+
+        # Array
+        s1 = 'import numpy as np; a = np.arange(50) - 5'
+        s2 = 'from oggm import utils; import numpy as np; a = np.arange(50)-5'
+
+        t1 = timeit.timeit('np.clip(a, 0, 10)', number=n, setup=s1)
+        t2 = timeit.timeit('utils.clip_array(a, 0, 10)', number=n, setup=s2)
+        # This usually fails as advertised by numpy
+        # (although with np 1.17 not)
+        # assert t2 < t1
+
+        t1 = timeit.timeit('np.clip(a, None, 10)', number=n, setup=s1)
+        t2 = timeit.timeit('utils.clip_max(a, 10)', number=n, setup=s2)
+        assert t2 < t1
+
+        t1 = timeit.timeit('np.clip(a, 15, None)', number=n, setup=s1)
+        t2 = timeit.timeit('utils.clip_min(a, 15)', number=n, setup=s2)
+        assert t2 < t1
+
 
 class TestInitialize(unittest.TestCase):
 
     def setUp(self):
         cfg.initialize()
         self.homedir = os.path.expanduser('~')
+
+    def test_env_var(self):
+        with TempEnvironmentVariable(OGGM_USE_MULTIPROCESSING='1',
+                                     OGGM_USE_MP_SPAWN=None):
+            cfg.initialize()
+            assert cfg.PARAMS['use_multiprocessing']
+            assert cfg.PARAMS['mp_processes'] >= 1
+            assert not cfg.PARAMS['use_mp_spawn']
+        with TempEnvironmentVariable(OGGM_USE_MULTIPROCESSING='1',
+                                     OGGM_USE_MP_SPAWN='1',
+                                     SLURM_JOB_CPUS_PER_NODE='13'):
+            cfg.initialize()
+            assert cfg.PARAMS['use_multiprocessing']
+            assert cfg.PARAMS['mp_processes'] == 13
+            assert cfg.PARAMS['use_mp_spawn']
+        with TempEnvironmentVariable(OGGM_USE_MULTIPROCESSING='0'):
+            cfg.initialize()
+            assert not cfg.PARAMS['use_multiprocessing']
+            assert cfg.PARAMS['mp_processes'] >= 1
 
     def test_defaults(self):
         self.assertFalse(cfg.PATHS['working_dir'])
@@ -280,6 +343,7 @@ class TestWorkflowTools(unittest.TestCase):
 
         hef_file = utils.get_demo_file('Hintereisferner_RGI5.shp')
         entity = gpd.read_file(hef_file).iloc[0]
+        cfg.PARAMS['use_intersects'] = False
         gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
 
         df = gdir.get_ref_length_data()
@@ -292,7 +356,6 @@ class TestWorkflowTools(unittest.TestCase):
 
         df = utils.compile_glacier_statistics([gdir], path=False)
         assert len(df) == 1
-        assert np.all(~df.isnull())
         df = df.iloc[0]
         np.testing.assert_allclose(df['dem_mean_elev'],
                                    df['flowline_mean_elev'], atol=5)
@@ -347,14 +410,15 @@ class TestStartFromTar(unittest.TestCase):
     def test_to_and_from_tar(self):
 
         # Go - initialize working directories
-        gdirs = workflow.init_glacier_regions(self.rgidf)
+        gdirs = workflow.init_glacier_directories(self.rgidf)
+        workflow.execute_entity_task(tasks.define_glacier_region, gdirs)
 
         # End - compress all
         workflow.execute_entity_task(utils.gdir_to_tar, gdirs)
 
         # Test - reopen form tar
-        gdirs = workflow.init_glacier_regions(self.rgidf, from_tar=True,
-                                              delete_tar=True)
+        gdirs = workflow.init_glacier_directories(self.rgidf, from_tar=True,
+                                                  delete_tar=True)
         for gdir in gdirs:
             assert gdir.has_file('dem')
             assert not os.path.exists(gdir.dir + '.tar.gz')
@@ -362,7 +426,32 @@ class TestStartFromTar(unittest.TestCase):
 
         workflow.execute_entity_task(utils.gdir_to_tar, gdirs)
 
-        gdirs = workflow.init_glacier_regions(self.rgidf, from_tar=True)
+        gdirs = workflow.init_glacier_directories(self.rgidf, from_tar=True)
+        for gdir in gdirs:
+            assert gdir.has_file('gridded_data')
+            assert os.path.exists(gdir.dir + '.tar.gz')
+
+    def test_to_and_from_basedir_tar(self):
+
+        # Go - initialize working directories
+        gdirs = workflow.init_glacier_directories(self.rgidf)
+        workflow.execute_entity_task(tasks.define_glacier_region, gdirs)
+
+        # End - compress all
+        workflow.execute_entity_task(utils.gdir_to_tar, gdirs)
+        utils.base_dir_to_tar()
+
+        # Test - reopen form tar
+        gdirs = workflow.init_glacier_directories(self.rgidf, from_tar=True)
+
+        for gdir in gdirs:
+            assert gdir.has_file('dem')
+            assert not os.path.exists(gdir.dir + '.tar.gz')
+        workflow.execute_entity_task(tasks.glacier_masks, gdirs)
+
+        workflow.execute_entity_task(utils.gdir_to_tar, gdirs)
+
+        gdirs = workflow.init_glacier_directories(self.rgidf, from_tar=True)
         for gdir in gdirs:
             assert gdir.has_file('gridded_data')
             assert os.path.exists(gdir.dir + '.tar.gz')
@@ -370,7 +459,8 @@ class TestStartFromTar(unittest.TestCase):
     def test_to_and_from_tar_new_dir(self):
 
         # Go - initialize working directories
-        gdirs = workflow.init_glacier_regions(self.rgidf)
+        gdirs = workflow.init_glacier_directories(self.rgidf)
+        workflow.execute_entity_task(tasks.define_glacier_region, gdirs)
 
         # End - compress all
         base_dir = os.path.join(self.testdir, 'new_base_dir')
@@ -382,8 +472,9 @@ class TestStartFromTar(unittest.TestCase):
             assert base_dir in p
             shutil.copyfile(p, os.path.normpath(gdir.dir) + '.tar.gz')
 
-        gdirs = workflow.init_glacier_regions(self.rgidf, from_tar=True,
-                                              delete_tar=True)
+        gdirs = workflow.init_glacier_directories(self.rgidf,
+                                                  from_tar=True,
+                                                  delete_tar=True)
         for gdir in gdirs:
             assert gdir.has_file('dem')
             assert not os.path.exists(gdir.dir + '.tar.gz')
@@ -393,7 +484,8 @@ class TestStartFromTar(unittest.TestCase):
     def test_to_and_from_tar_string(self):
 
         # Go - initialize working directories
-        gdirs = workflow.init_glacier_regions(self.rgidf)
+        gdirs = workflow.init_glacier_directories(self.rgidf)
+        workflow.execute_entity_task(tasks.define_glacier_region, gdirs)
 
         # End - compress all
         base_dir = os.path.join(self.testdir, 'new_base_dir')
@@ -448,11 +540,11 @@ class TestStartFromOnlinePrepro(unittest.TestCase):
     def test_start_from_level_1(self):
 
         # Go - initialize working directories
-        gdirs = workflow.init_glacier_regions(self.rgidf.iloc[:2],
-                                              from_prepro_level=1,
-                                              prepro_rgi_version='61',
-                                              prepro_border=20,
-                                              use_demo_glaciers=False)
+        gdirs = workflow.init_glacier_directories(self.rgidf.iloc[:2],
+                                                  from_prepro_level=1,
+                                                  prepro_rgi_version='61',
+                                                  prepro_border=20,
+                                                  use_demo_glaciers=False)
         n_intersects = 0
         for gdir in gdirs:
             assert gdir.has_file('dem')
@@ -466,9 +558,9 @@ class TestStartFromOnlinePrepro(unittest.TestCase):
         # Go - initialize working directories
         entitites = self.rgidf.iloc[:2].RGIId
         cfg.PARAMS['border'] = 20
-        gdirs = workflow.init_glacier_regions(entitites,
-                                              from_prepro_level=1,
-                                              use_demo_glaciers=False)
+        gdirs = workflow.init_glacier_directories(entitites,
+                                                  from_prepro_level=1,
+                                                  use_demo_glaciers=False)
         n_intersects = 0
         for gdir in gdirs:
             assert gdir.has_file('dem')
@@ -478,9 +570,9 @@ class TestStartFromOnlinePrepro(unittest.TestCase):
 
         # One string
         cfg.PARAMS['border'] = 20
-        gdirs = workflow.init_glacier_regions('RGI60-11.00897',
-                                              from_prepro_level=1,
-                                              use_demo_glaciers=False)
+        gdirs = workflow.init_glacier_directories('RGI60-11.00897',
+                                                  from_prepro_level=1,
+                                                  use_demo_glaciers=False)
         n_intersects = 0
         for gdir in gdirs:
             assert gdir.has_file('dem')
@@ -492,15 +584,15 @@ class TestStartFromOnlinePrepro(unittest.TestCase):
     def test_start_from_level_2(self):
 
         # Go - initialize working directories
-        gdirs = workflow.init_glacier_regions(self.rgidf.iloc[:2],
-                                              from_prepro_level=2,
-                                              prepro_rgi_version='61',
-                                              prepro_border=20,
-                                              use_demo_glaciers=False)
+        gdirs = workflow.init_glacier_directories(self.rgidf.iloc[:2],
+                                                  from_prepro_level=2,
+                                                  prepro_rgi_version='61',
+                                                  prepro_border=20,
+                                                  use_demo_glaciers=False)
         n_intersects = 0
         for gdir in gdirs:
             assert gdir.has_file('dem')
-            assert gdir.has_file('climate_monthly')
+            assert gdir.has_file('climate_historical')
             n_intersects += gdir.has_file('intersects')
         assert n_intersects > 0
         workflow.execute_entity_task(tasks.glacier_masks, gdirs)
@@ -509,18 +601,28 @@ class TestStartFromOnlinePrepro(unittest.TestCase):
     def test_start_from_level_3(self):
 
         # Go - initialize working directories
-        gdirs = workflow.init_glacier_regions(self.rgidf.iloc[:2],
-                                              from_prepro_level=3,
-                                              prepro_rgi_version='61',
-                                              prepro_border=20,
-                                              use_demo_glaciers=False)
+        gdirs = workflow.init_glacier_directories(self.rgidf.iloc[:2],
+                                                  from_prepro_level=3,
+                                                  prepro_rgi_version='61',
+                                                  prepro_border=20,
+                                                  use_demo_glaciers=False)
         n_intersects = 0
         for gdir in gdirs:
             assert gdir.has_file('dem')
             assert gdir.has_file('gridded_data')
-            assert gdir.has_file('climate_monthly')
+            assert gdir.has_file('climate_historical')
+            assert gdir.has_file('climate_info')
             n_intersects += gdir.has_file('intersects')
         assert n_intersects > 0
+
+        assert gdir.get_climate_info()
+        assert gdir.read_pickle('climate_info')
+        fls = gdir.read_pickle('inversion_flowlines')
+        with pytest.raises(AttributeError):
+            # This is going to raise as long as we keep the "old" prepro gdirs
+            # remove this test after update.
+            # At least we can read the old pickles
+            fls[0].widths_m
 
         df = utils.compile_glacier_statistics(gdirs)
         assert 'dem_med_elev' in df
@@ -537,46 +639,54 @@ class TestStartFromOnlinePrepro(unittest.TestCase):
     def test_start_from_level_4(self):
 
         # Go - initialize working directories
-        gdirs = workflow.init_glacier_regions(self.rgidf.iloc[:2],
-                                              from_prepro_level=4,
-                                              prepro_rgi_version='61',
-                                              prepro_border=20,
-                                              use_demo_glaciers=False)
+        gdirs = workflow.init_glacier_directories(self.rgidf.iloc[:2],
+                                                  from_prepro_level=4,
+                                                  prepro_rgi_version='61',
+                                                  prepro_border=20,
+                                                  use_demo_glaciers=False)
         workflow.execute_entity_task(tasks.run_random_climate, gdirs,
                                      nyears=10)
 
     def test_start_from_demo(self):
 
         # Go - initialize working directories
-        gdirs = workflow.init_glacier_regions(['kwf', 'hef'],
-                                              from_prepro_level=4,
-                                              prepro_rgi_version='61',
-                                              prepro_border=10)
+        gdirs = workflow.init_glacier_directories(['kwf', 'hef'],
+                                                  from_prepro_level=4,
+                                                  prepro_rgi_version='61',
+                                                  prepro_border=10)
         workflow.execute_entity_task(tasks.run_random_climate, gdirs,
                                      nyears=10)
 
     def test_corrupted_file(self):
 
         # Go - initialize working directories
-        gdirs = workflow.init_glacier_regions(['hef'],
-                                              from_prepro_level=4,
-                                              prepro_rgi_version='61',
-                                              prepro_border=10)
+        gdirs = workflow.init_glacier_directories(['hef'],
+                                                  from_prepro_level=4,
+                                                  prepro_rgi_version='61',
+                                                  prepro_border=10)
 
         cfile = utils.get_prepro_gdir('61', 'RGI60-11.00787', 10, 4,
-                                      demo_url=True)
-        assert 'cluster.klima.uni-bremen.de/~fmaussion/' in cfile
+                                      base_url=utils.DEMO_GDIR_URL)
+        assert 'cluster.klima.uni-bremen.de/~oggm/' in cfile
 
         # Replace with a dummy file
         os.remove(cfile)
         with open(cfile, 'w') as f:
             f.write('ups')
 
+        # Since we already verified this will error
+        with pytest.raises(tarfile.ReadError):
+            gdirs = workflow.init_glacier_directories(['hef'],
+                                                      from_prepro_level=4,
+                                                      prepro_rgi_version='61',
+                                                      prepro_border=10)
+
         # This should retrigger a download and just work
-        gdirs = workflow.init_glacier_regions(['hef'],
-                                              from_prepro_level=4,
-                                              prepro_rgi_version='61',
-                                              prepro_border=10)
+        cfg.DL_VERIFIED.clear()
+        gdirs = workflow.init_glacier_directories(['hef'],
+                                                  from_prepro_level=4,
+                                                  prepro_rgi_version='61',
+                                                  prepro_border=10)
         workflow.execute_entity_task(tasks.run_random_climate, gdirs,
                                      nyears=10)
 
@@ -584,6 +694,8 @@ class TestStartFromOnlinePrepro(unittest.TestCase):
 class TestPreproCLI(unittest.TestCase):
 
     def setUp(self):
+        from _pytest.monkeypatch import MonkeyPatch
+        self.monkeypatch = MonkeyPatch()
         self.testdir = os.path.join(get_test_dir(), 'tmp_prepro_levs')
         self.reset_dir()
 
@@ -642,20 +754,25 @@ class TestPreproCLI(unittest.TestCase):
         assert 'local' in kwargs['output_folder']
         assert kwargs['rgi_version'] is None
         assert kwargs['rgi_reg'] == '00'
+        assert kwargs['dem_source'] == ''
         assert kwargs['border'] == 160
         assert not kwargs['is_test']
         assert kwargs['demo']
+        assert not kwargs['disable_mp']
+        assert kwargs['max_level'] == 4
 
         kwargs = prepro_levels.parse_args(['--rgi-reg', '1',
                                            '--map-border', '160',
                                            '--output', 'local/out',
                                            '--working-dir', 'local/work',
+                                           '--dem-source', 'ALL',
                                            ])
 
         assert 'working_dir' in kwargs
         assert 'output_folder' in kwargs
         assert 'local' in kwargs['working_dir']
         assert 'local' in kwargs['output_folder']
+        assert kwargs['dem_source'] == 'ALL'
         assert kwargs['rgi_version'] is None
         assert kwargs['rgi_reg'] == '01'
         assert kwargs['border'] == 160
@@ -740,17 +857,23 @@ class TestPreproCLI(unittest.TestCase):
         run_prepro_levels(rgi_version=None, rgi_reg='11', border=20,
                           output_folder=odir, working_dir=wdir, is_test=True,
                           test_rgidf=rgidf, test_intersects_file=inter,
-                          test_topofile=topof,
-                          test_crudir=os.path.dirname(cru_file))
+                          test_topofile=topof)
+
+        df = pd.read_csv(os.path.join(odir, 'RGI61', 'b_020', 'L0', 'summary',
+                                      'glacier_statistics_11.csv'))
+        assert 'glacier_type' in df
 
         df = pd.read_csv(os.path.join(odir, 'RGI61', 'b_020', 'L1', 'summary',
                                       'glacier_statistics_11.csv'))
         assert 'dem_source' in df
 
+        df = pd.read_csv(os.path.join(odir, 'RGI61', 'b_020', 'L2', 'summary',
+                                      'glacier_statistics_11.csv'))
+        assert 'main_flowline_length' in df
+
         df = pd.read_csv(os.path.join(odir, 'RGI61', 'b_020', 'L3', 'summary',
                                       'glacier_statistics_11.csv'))
         assert 'inv_volume_km3' in df
-
         df = pd.read_csv(os.path.join(odir, 'RGI61', 'b_020', 'L3', 'summary',
                                       'climate_statistics_11.csv'))
         assert '1945-1975_avg_prcp' in df
@@ -784,7 +907,7 @@ class TestPreproCLI(unittest.TestCase):
                             rid[:8], rid[:11], rid + '.tar.gz')
         assert not os.path.isfile(tarf)
         gdir = oggm.GlacierDirectory(entity, from_tar=tarf)
-        tasks.glacier_masks(gdir)
+        assert gdir.has_file('inversion_flowlines')
         with pytest.raises(FileNotFoundError):
             tasks.init_present_time_glacier(gdir)
 
@@ -793,7 +916,6 @@ class TestPreproCLI(unittest.TestCase):
                             rid[:8], rid[:11], rid + '.tar.gz')
         assert not os.path.isfile(tarf)
         gdir = oggm.GlacierDirectory(entity, from_tar=tarf)
-        tasks.init_present_time_glacier(gdir)
         model = tasks.run_random_climate(gdir, nyears=10)
         assert isinstance(model, FlowlineModel)
 
@@ -806,6 +928,45 @@ class TestPreproCLI(unittest.TestCase):
         assert isinstance(model, FlowlineModel)
         with pytest.raises(FileNotFoundError):
             tasks.init_present_time_glacier(gdir)
+
+    def test_source_run(self):
+
+        self.monkeypatch.setattr(oggm.utils, 'DEM_SOURCES', ['USER'])
+
+        from oggm.cli.prepro_levels import run_prepro_levels
+
+        # Read in the RGI file
+        inter = gpd.read_file(utils.get_demo_file('rgi_intersect_oetztal.shp'))
+        rgidf = gpd.read_file(utils.get_demo_file('rgi_oetztal.shp'))
+
+        rgidf['RGIId'] = [rid.replace('RGI50', 'RGI60') for rid in rgidf.RGIId]
+        inter['RGIId_1'] = [rid.replace('RGI50', 'RGI60')
+                            for rid in inter.RGIId_1]
+        inter['RGIId_2'] = [rid.replace('RGI50', 'RGI60')
+                            for rid in inter.RGIId_2]
+        rgidf = rgidf.iloc[:4]
+
+        wdir = os.path.join(self.testdir, 'wd')
+        utils.mkdir(wdir)
+        odir = os.path.join(self.testdir, 'my_levs')
+        topof = utils.get_demo_file('srtm_oetztal.tif')
+        run_prepro_levels(rgi_version=None, rgi_reg='11', border=20,
+                          output_folder=odir, working_dir=wdir, is_test=True,
+                          test_rgidf=rgidf, test_intersects_file=inter,
+                          test_topofile=topof, dem_source='ALL')
+
+        rid = rgidf.iloc[0].RGIId
+        tarf = os.path.join(odir, 'RGI61', 'b_020', 'L1',
+                            rid[:8], rid[:8] + '.00.tar')
+        assert os.path.isfile(tarf)
+
+        tarf = os.path.join(odir, 'RGI61', 'b_020', 'L1',
+                            rid[:8], rid[:11], rid + '.tar.gz')
+        assert not os.path.isfile(tarf)
+
+        entity = rgidf.iloc[0]
+        gdir = oggm.GlacierDirectory(entity, from_tar=tarf)
+        assert os.path.isfile(os.path.join(gdir.dir, 'USER', 'dem.tif'))
 
 
 class TestBenchmarkCLI(unittest.TestCase):
@@ -951,8 +1112,7 @@ class TestBenchmarkCLI(unittest.TestCase):
         run_benchmark(rgi_version=None, rgi_reg='11', border=80,
                       output_folder=odir, working_dir=wdir, is_test=True,
                       test_rgidf=rgidf, test_intersects_file=inter,
-                      test_topofile=topof,
-                      test_crudir=os.path.dirname(cru_file))
+                      test_topofile=topof)
 
         df = pd.read_csv(os.path.join(odir, 'benchmarks_b080.csv'),
                          index_col=0)
@@ -966,13 +1126,14 @@ def touch(path):
     return path
 
 
-def make_fake_zipdir(dir_path, fakefile=None):
+def make_fake_zipdir(dir_path, fakefile=None, base_dir=None,
+                     archiv='zip', extension='.zip'):
     """Creates a directory with a file in it if asked to, then compresses it"""
     utils.mkdir(dir_path)
     if fakefile:
         touch(os.path.join(dir_path, fakefile))
-    shutil.make_archive(dir_path, 'zip', dir_path)
-    return dir_path + '.zip'
+    shutil.make_archive(dir_path, archiv, dir_path, base_dir)
+    return dir_path + extension
 
 
 class FakeDownloadManager():
@@ -1006,7 +1167,6 @@ class TestFakeDownloads(unittest.TestCase):
         cfg.PATHS['working_dir'] = os.path.join(self.dldir, 'wd')
         cfg.PATHS['tmp_dir'] = os.path.join(self.dldir, 'extract')
         cfg.PATHS['rgi_dir'] = os.path.join(self.dldir, 'rgi_test')
-        cfg.PATHS['cru_dir'] = os.path.join(self.dldir, 'cru_test')
         self.reset_dir()
 
     def tearDown(self):
@@ -1021,11 +1181,14 @@ class TestFakeDownloads(unittest.TestCase):
         utils.mkdir(cfg.PATHS['working_dir'])
         utils.mkdir(cfg.PATHS['tmp_dir'])
         utils.mkdir(cfg.PATHS['rgi_dir'])
-        utils.mkdir(cfg.PATHS['cru_dir'])
 
-    def prepare_verify_test(self, valid_size=True, valid_crc32=True):
+    def prepare_verify_test(self, valid_size=True, valid_crc32=True,
+                            reset_dl_dict=True):
         self.reset_dir()
         cfg.PARAMS['dl_verify'] = True
+
+        if reset_dl_dict:
+            cfg.DL_VERIFIED.clear()
 
         tgt_path = os.path.join(cfg.PATHS['dl_cache_dir'], 'test.com',
                                 'test.txt')
@@ -1046,8 +1209,11 @@ class TestFakeDownloads(unittest.TestCase):
 
         file_sha256 = file_sha256.digest()
 
-        data = utils.get_dl_verify_data()
-        data['test.com/test.txt'] = (file_size, file_sha256)
+        data = utils.get_dl_verify_data('cluster.klima.uni-bremen.de')
+        s = pd.Series({'size': file_size, 'sha256': file_sha256},
+                      name='test.txt')
+        data = data.append(s)
+        cfg.DATA['dl_verify_data_test.com'] = data
 
         return 'https://test.com/test.txt'
 
@@ -1070,7 +1236,6 @@ class TestFakeDownloads(unittest.TestCase):
             url = self.prepare_verify_test(False, False)
             with self.assertRaises(DownloadVerificationFailedException):
                 utils.oggm_urlretrieve(url)
-
 
     def test_github_no_internet(self):
         self.reset_dir()
@@ -1101,7 +1266,7 @@ class TestFakeDownloads(unittest.TestCase):
                          fakefile='test.txt')
         rgi_f = make_fake_zipdir(rgi_dir, fakefile='000_rgi50_manifest.txt')
 
-        def down_check(url, cache_name=None, reset=False, auth=None):
+        def down_check(url, *args, **kwargs):
             expected = 'http://www.glims.org/RGI/rgi50_files/rgi50.zip'
             self.assertEqual(url, expected)
             return rgi_f
@@ -1120,7 +1285,7 @@ class TestFakeDownloads(unittest.TestCase):
                          fakefile='01_rgi60_Region.shp')
         rgi_f = make_fake_zipdir(rgi_dir, fakefile='000_rgi60_manifest.txt')
 
-        def down_check(url, cache_name=None, reset=False, auth=None):
+        def down_check(url, *args, **kwargs):
             expected = 'http://www.glims.org/RGI/rgi60_files/00_rgi60.zip'
             self.assertEqual(url, expected)
             return rgi_f
@@ -1152,7 +1317,7 @@ class TestFakeDownloads(unittest.TestCase):
                          fakefile='intersects_rgi50_AllRegs.shp')
         rgi_f = make_fake_zipdir(rgi_dir)
 
-        def down_check(url, cache_name=None, reset=False, auth=None):
+        def down_check(url, *args, **kwargs):
             expected = ('https://cluster.klima.uni-bremen.de/data/rgi/' +
                         'RGI_V50_Intersects.zip')
             self.assertEqual(url, expected)
@@ -1174,7 +1339,7 @@ class TestFakeDownloads(unittest.TestCase):
                          fakefile='Intersects_OGGM_Manifest.txt')
         rgi_f = make_fake_zipdir(rgi_dir)
 
-        def down_check(url, cache_name=None, reset=False, auth=None):
+        def down_check(url, *args, **kwargs):
             expected = ('https://cluster.klima.uni-bremen.de/data/rgi/' +
                         'RGI_V60_Intersects.zip')
             self.assertEqual(url, expected)
@@ -1187,50 +1352,13 @@ class TestFakeDownloads(unittest.TestCase):
         assert os.path.exists(os.path.join(rgi,
                                            'Intersects_OGGM_Manifest.txt'))
 
-    def test_cru(self):
-
-        # Create fake cru file
-        cf = os.path.join(self.dldir, 'cru_ts4.01.1901.2016.tmp.dat.nc.gz')
-        with gzip.open(cf, 'wb') as gz:
-            gz.write(b'dummy')
-
-        def down_check(url, cache_name=None, reset=False, auth=None):
-            expected = ('https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.01/'
-                        'cruts.1709081022.v4.01/tmp/'
-                        'cru_ts4.01.1901.2016.tmp.dat.nc.gz')
-            self.assertEqual(url, expected)
-            return cf
-
-        with FakeDownloadManager('_progress_urlretrieve', down_check):
-            tf = utils.get_cru_file('tmp')
-
-        assert os.path.exists(tf)
-
-    def test_histalp(self):
-
-        # Create fake histalp file
-        cf = os.path.join(self.dldir, 'HISTALP_temperature_1780-2014.nc.bz2')
-        with bz2.open(cf, 'wb') as gz:
-            gz.write(b'dummy')
-
-        def down_check(url, cache_name=None, reset=False, auth=None):
-            expected = ('http://www.zamg.ac.at/histalp/download/grid5m/'
-                        'HISTALP_temperature_1780-2014.nc.bz2')
-            self.assertEqual(url, expected)
-            return cf
-
-        with FakeDownloadManager('_progress_urlretrieve', down_check):
-            tf = utils.get_histalp_file('tmp')
-
-        assert os.path.exists(tf)
-
     def test_srtm(self):
 
         # Make a fake topo file
         tf = make_fake_zipdir(os.path.join(self.dldir, 'srtm_39_03'),
                               fakefile='srtm_39_03.tif')
 
-        def down_check(url, cache_name=None, reset=False, auth=None):
+        def down_check(url, *args, **kwargs):
             expected = ('http://srtm.csi.cgiar.org/wp-content/uploads/files/'
                         'srtm_5x5/TIFF/srtm_39_03.zip')
             self.assertEqual(url, expected)
@@ -1242,9 +1370,28 @@ class TestFakeDownloads(unittest.TestCase):
         assert os.path.exists(of[0])
         assert source == 'SRTM'
 
+    def test_nasadem(self):
+
+        # Make a fake topo file
+        tf = make_fake_zipdir(os.path.join(self.dldir, 'NASADEM_HGT_n47e011'),
+                              fakefile='n47e011.hgt')
+
+        def down_check(url, *args, **kwargs):
+            expected = ('https://e4ftl01.cr.usgs.gov/MEASURES/NASADEM_HGT.001/'
+                        '2000.02.11/NASADEM_HGT_n47e011.zip')
+            self.assertEqual(url, expected)
+            return tf
+
+        with FakeDownloadManager('_progress_urlretrieve', down_check):
+            of, source = utils.get_topo_file([11.3, 11.3], [47.1, 47.1],
+                                             source='NASADEM')
+
+        assert os.path.exists(of[0])
+        assert source == 'NASADEM'
+
     def test_dem3(self):
 
-        def down_check(url, cache_name=None, reset=False, auth=None):
+        def down_check(url, *args, **kwargs):
             expected = 'http://viewfinderpanoramas.org/dem3/T10.zip'
             self.assertEqual(url, expected)
             return self.dem3_testfile
@@ -1255,9 +1402,92 @@ class TestFakeDownloads(unittest.TestCase):
         assert os.path.exists(of[0])
         assert source == 'DEM3'
 
+        def down_check(url, *args, **kwargs):
+            expected = ('https://cluster.klima.uni-bremen.de/~oggm/dem/'
+                        'DEM3_MERGED/ISL.tif')
+            self.assertEqual(url, expected)
+            return self.dem3_testfile
+
+        with FakeDownloadManager('_progress_urlretrieve', down_check):
+            of, source = utils.get_topo_file(-22.26, 66.16, source='DEM3')
+
+        assert os.path.exists(of[0])
+        assert source == 'DEM3'
+
+    def test_mapzen(self):
+
+        # Make a fake topo file
+        tf = touch(os.path.join(self.dldir, 'file.tif'))
+
+        def down_check(url, *args, **kwargs):
+            expected = ('http://s3.amazonaws.com/elevation-tiles-prod/'
+                        'geotiff/10/170/160.tif')
+            self.assertEqual(url, expected)
+            return tf
+
+        with FakeDownloadManager('_progress_urlretrieve', down_check):
+            of, source = utils.get_topo_file([-120.2, -120.2], [76.8, 76.8],
+                                             source='MAPZEN', dx_meter=100)
+
+        assert os.path.exists(of[0])
+        assert source == 'MAPZEN'
+
+    def test_aw3d30(self):
+
+        # Make a fake topo file
+        deep_path = os.path.join(self.dldir, 'N049W006', 'N049W006')
+        utils.mkdir(deep_path)
+        upper_path = os.path.dirname(deep_path)
+        fakefile = os.path.join(deep_path, 'N049W006_AVE_DSM.tif')
+        tf = make_fake_zipdir(upper_path, fakefile=fakefile,
+                              archiv='gztar', extension='.tar.gz')
+
+        def down_check(url, *args, **kwargs):
+            expected = ('ftp://ftp.eorc.jaxa.jp/pub/ALOS/ext1/AW3D30/' +
+                        'release_v1804/N045W010/N049W006.tar.gz')
+            self.assertEqual(expected, url)
+            return tf
+
+        with FakeDownloadManager('_progress_urlretrieve', down_check):
+            of, source = utils.get_topo_file([-5.3, -5.2], [49.5, 49.6],
+                                             source='AW3D30')
+
+        assert os.path.exists(of[0])
+        assert source == 'AW3D30'
+
+    def test_copdem(self):
+
+        # Make a fake topo file
+        deep_path = os.path.join(self.dldir,
+                                 'DEM1_SAR_DGE_90_20110517T170701_20140817T170'
+                                 '857_ADS_000000_4723.DEM',
+                                 'Copernicus_DSM_30_N46_00_E010_00', 'DEM')
+        utils.mkdir(deep_path)
+        upper_path = os.path.dirname(os.path.dirname(deep_path))
+        fakefile = os.path.join(deep_path,
+                                'Copernicus_DSM_30_N46_00_E010_00_DEM.tif')
+        tf = make_fake_zipdir(upper_path, fakefile=fakefile,
+                              base_dir='Copernicus_DSM_30_N46_00_E010_00',
+                              archiv='tar', extension='.tar')
+
+        def down_check(url, *args, **kwargs):
+            expected = ('ftps://cdsdata.copernicus.eu:990/datasets/'
+                        'COP-DEM_GLO-90-DGED/2019_1/'
+                        'DEM1_SAR_DGE_90_20110517T170701_20140817T170857_ADS_'
+                        '000000_4723.DEM.tar')
+            self.assertEqual(expected, url)
+            return tf
+
+        with FakeDownloadManager('download_with_authentication', down_check):
+            of, source = utils.get_topo_file([10.5, 10.8], [46.6, 46.8],
+                                             source='COPDEM')
+
+        assert os.path.exists(of[0])
+        assert source == 'COPDEM'
+
     def test_ramp(self):
 
-        def down_check(url, cache_name=None, reset=False, auth=None):
+        def down_check(url, *args, **kwargs):
             expected = 'AntarcticDEM_wgs84.tif'
             self.assertEqual(url, expected)
             return 'yo'
@@ -1271,9 +1501,81 @@ class TestFakeDownloads(unittest.TestCase):
         assert of[0] == 'yo'
         assert source == 'RAMP'
 
+    def test_rema(self):
+
+        # Make a fake topo file
+        tf = touch(os.path.join(self.dldir, 'file.tif'))
+
+        def down_check(url, *args, **kwargs):
+            expected = ('https://cluster.klima.uni-bremen.de/~oggm/dem/'
+                        'REMA_100m_v1.1/'
+                        '40_10_100m_v1.1/40_10_100m_v1.1_reg_dem.tif')
+            self.assertEqual(expected, url)
+            return tf
+
+        with FakeDownloadManager('_progress_urlretrieve', down_check):
+            of, source = utils.get_topo_file(-65., -69., source='REMA')
+
+        assert os.path.exists(of[0])
+        assert source == 'REMA'
+
+        with FakeDownloadManager('_progress_urlretrieve', down_check):
+            of, source = utils.get_topo_file([-65.1, -65.],
+                                             [-69.1, -69.],
+                                             source='REMA')
+
+        assert os.path.exists(of[0])
+        assert source == 'REMA'
+
+    def test_alaska(self):
+
+        # Make a fake topo file
+        tf = touch(os.path.join(self.dldir, 'file.tif'))
+
+        def down_check(url, *args, **kwargs):
+            expected = ('https://cluster.klima.uni-bremen.de/~oggm/dem/'
+                        'Alaska_albers_V3/008_004_Alaska_albers_V3/'
+                        '008_004_Alaska_albers_V3.tif')
+            self.assertEqual(expected, url)
+            return tf
+
+        with FakeDownloadManager('_progress_urlretrieve', down_check):
+            of, source = utils.get_topo_file([-140.428, -140.428],
+                                             [60.177, 60.177],
+                                             source='ALASKA')
+
+        assert os.path.exists(of[0])
+        assert source == 'ALASKA'
+
+    def test_arcticdem(self):
+
+        # Make a fake topo file
+        tf = touch(os.path.join(self.dldir, 'file.tif'))
+
+        def down_check(url, *args, **kwargs):
+            expected = ('https://cluster.klima.uni-bremen.de/~oggm/dem/'
+                        'ArcticDEM_100m_v3.0/'
+                        '14_52_100m_v3.0/14_52_100m_v3.0_reg_dem.tif')
+            self.assertEqual(expected, url)
+            return tf
+
+        with FakeDownloadManager('_progress_urlretrieve', down_check):
+            of, source = utils.get_topo_file(-21.93, 64.13, source='ARCTICDEM')
+
+        assert os.path.exists(of[0])
+        assert source == 'ARCTICDEM'
+
+        with FakeDownloadManager('_progress_urlretrieve', down_check):
+            of, source = utils.get_topo_file([-21.93, -21.92],
+                                             [64.13, 64.14],
+                                             source='ARCTICDEM')
+
+        assert os.path.exists(of[0])
+        assert source == 'ARCTICDEM'
+
     def test_gimp(self):
 
-        def down_check(url, cache_name=None, reset=False, auth=None):
+        def down_check(url, *args, **kwargs):
             expected = 'gimpdem_90m_v01.1.tif'
             self.assertEqual(url, expected)
             return 'yo'
@@ -1289,26 +1591,87 @@ class TestFakeDownloads(unittest.TestCase):
     def test_aster(self):
 
         # Make a fake topo file
-        tf = make_fake_zipdir(os.path.join(self.dldir, 'ASTGTM2_S88W121'),
-                              fakefile='ASTGTM2_S88W121_dem.tif')
+        tf = make_fake_zipdir(os.path.join(self.dldir, 'ASTGTMV003_S88W121'),
+                              fakefile='ASTGTMV003_S89W121_dem.tif')
 
-        def down_check(url, cache_name=None, reset=False, auth=None):
-            expected = 'ASTGTM_V2/UNIT_S90W125/ASTGTM2_S88W121.zip'
-            self.assertEqual(url, expected)
+        def down_check(url, *args, **kwargs):
+            expect = ('https://e4ftl01.cr.usgs.gov/ASTER_B/ASTT/ASTGTM.003/' +
+                      '2000.03.01/ASTGTMV003_S89W121.zip')
+            self.assertEqual(url, expect)
             return tf
 
-        with FakeDownloadManager('_aws_file_download_unlocked', down_check):
-            of, source = utils.get_topo_file([-120.2, -120.2], [-88, -88],
+        with FakeDownloadManager('download_with_authentication', down_check):
+            of, source = utils.get_topo_file([-120.2, -120.2], [-88.1, -88.9],
                                              source='ASTER')
 
         assert os.path.exists(of[0])
         assert source == 'ASTER'
 
+    def test_tandem(self):
+        # Make a fake topo file
+        tf = make_fake_zipdir(os.path.join(self.dldir, 'TDM1_DEM__30_N60W146'),
+                              fakefile='TDM1_DEM__30_N60W146.tif')
+
+        def down_check(url, *args, **kwargs):
+            expect = ('https://download.geoservice.dlr.de/TDM90/files/N60/' +
+                      'W140/' + 'TDM1_DEM__30_N60W146.zip')
+            self.assertEqual(url, expect)
+            return tf
+
+        with FakeDownloadManager('download_with_authentication', down_check):
+            of, source = utils.get_topo_file([-145.2, -145.3], [60.1, 60.9],
+                                             source='TANDEM')
+
+        assert os.path.exists(of[0])
+        assert source == 'TANDEM'
+
+    def test_tandem_invalid(self):
+        # If the TanDEM-X tile does not exist, a invalid file is created.
+        # See https://github.com/OGGM/oggm/issues/893 for more details
+
+        # Make a fake topo file
+        tf = {'TDM1_DEM__30_N60W144.zip':
+              make_fake_zipdir(os.path.join(self.dldir,
+                                            'TDM1_DEM__30_N60W144'),
+                               fakefile='TDM1_DEM__30_N60W146.tif'),
+              'TDM1_DEM__30_N60W145.zip':
+              touch(os.path.join(self.dldir, 'TDM1_DEM__30_N60W145.zip')),
+              'TDM1_DEM__30_N60W146.zip':
+              make_fake_zipdir(os.path.join(self.dldir,
+                                            'TDM1_DEM__30_N60W146'),
+                               fakefile='TDM1_DEM__30_N60W146.tif')
+              }
+
+        def down_check(url, *args, **kwargs):
+            file = tf.get(url.split('/')[-1])
+            self.assertIsNotNone(file)
+
+            expect = 'https://download.geoservice.dlr.de/TDM90/files/N60/W140/'
+            expect += file.split('/')[-1].replace('tif', '.zip')
+            self.assertEqual(url, expect)
+
+            return file
+
+        with FakeDownloadManager('download_with_authentication', down_check):
+            of, source = utils.get_topo_file([-144.1, -143.9], [60.5, 60.6],
+                                             source='TANDEM')
+
+        self.assertTrue(len(of) == 2)
+        self.assertTrue(os.path.exists(of[0]))
+        self.assertTrue(os.path.exists(of[1]))
+        self.assertTrue(source == 'TANDEM')
+
+        # check files
+        files = [os.path.basename(f) for f in of]
+        self.assertTrue('TDM1_DEM__30_N60W144_DEM.tif' in files)
+        self.assertTrue('TDM1_DEM__30_N60W146_DEM.tif' in files)
+        self.assertFalse('TDM1_DEM__30_N60W145_DEM.tif' in files)
+
     def test_cmip5(self):
 
         fn = 'pr_mon_NorESM1-M_historicalNat_r1i1p1_g025.nc'
 
-        def down_check(url, cache_name=None, reset=False, auth=None):
+        def down_check(url, *args, **kwargs):
             expected = ('https://cluster.klima.uni-bremen.de/~nicolas/cmip5-ng'
                         '/pr/pr_mon_NorESM1-M_historicalNat_r1i1p1_g025.nc')
             self.assertEqual(url, expected)
@@ -1319,7 +1682,7 @@ class TestFakeDownloads(unittest.TestCase):
 
         fn = 'tas_mon_CCSM4_historicalNat_r1i1p1_g025.nc'
 
-        def down_check(url, cache_name=None, reset=False, auth=None):
+        def down_check(url, *args, **kwargs):
             expected = ('https://cluster.klima.uni-bremen.de/~nicolas/cmip5-ng'
                         '/tas/tas_mon_CCSM4_historicalNat_r1i1p1_g025.nc')
             self.assertEqual(url, expected)
@@ -1339,12 +1702,10 @@ class TestDataFiles(unittest.TestCase):
         cfg.PATHS['working_dir'] = os.path.join(self.dldir, 'wd')
         cfg.PATHS['tmp_dir'] = os.path.join(self.dldir, 'extract')
         self.reset_dir()
-        oggm.utils._downloads.oggm_urlretrieve = _url_retrieve
 
     def tearDown(self):
         if os.path.exists(self.dldir):
             shutil.rmtree(self.dldir)
-        utils.oggm_urlretrieve = patch_url_retrieve_github
 
     def reset_dir(self):
         if os.path.exists(self.dldir):
@@ -1369,6 +1730,43 @@ class TestDataFiles(unittest.TestCase):
 
         lf = utils.get_glathida_file()
         self.assertTrue(os.path.exists(lf))
+
+    def test_file_extractor(self):
+
+        tmp_file = os.path.join(cfg.PATHS['working_dir'], 'f.nc')
+        touch(tmp_file)
+
+        # writing file to a zipfile
+        tmp_comp = os.path.join(cfg.PATHS['working_dir'], 'f.nc.zip')
+        import zipfile
+        with zipfile.ZipFile(tmp_comp, 'w') as zip:
+            zip.write(tmp_file, arcname='f.nc')
+        of = utils.file_extractor(tmp_comp)
+        assert of == os.path.join(cfg.PATHS['tmp_dir'], 'f.nc')
+        os.remove(of)
+
+        # writing file to a gzip
+        tmp_comp = os.path.join(cfg.PATHS['working_dir'], 'f.nc.gz')
+        import gzip
+        with gzip.GzipFile(tmp_comp, 'w') as zip:
+            with open(tmp_file, 'rb') as f_in:
+                shutil.copyfileobj(f_in, zip)
+        of = utils.file_extractor(tmp_comp)
+        assert of == os.path.join(cfg.PATHS['tmp_dir'], 'f.nc')
+        os.remove(of)
+
+        # writing file to a tar.gz
+        tmp_comp = os.path.join(cfg.PATHS['working_dir'], 'f.nc.tar.gz')
+        import tarfile
+        with tarfile.open(tmp_comp, 'w:gz') as zip:
+            zip.add(tmp_file, arcname='f.nc')
+        of = utils.file_extractor(tmp_comp)
+        assert of == os.path.join(cfg.PATHS['tmp_dir'], 'f.nc')
+        os.remove(of)
+
+        # Raise error if nothing to extract
+        with pytest.raises(InvalidParamsError):
+            utils.file_extractor(tmp_file)
 
     def test_srtmzone(self):
 
@@ -1425,63 +1823,145 @@ class TestDataFiles(unittest.TestCase):
         self.assertTrue(len(z) == len(ref))
         self.assertEqual(ref, z)
 
+        z = utils.tandem_zone(lon_ex=[-144.1, -143.9], lat_ex=[60.5, 60.6])
+        self.assertTrue(len(z) == 3)
+        self.assertEqual('N60/W140/TDM1_DEM__30_N60W145', z[1])
+
     def test_asterzone(self):
 
-        z, u = utils.aster_zone(lon_ex=[137.5, 137.5],
-                                lat_ex=[-72.5, -72.5])
+        z = utils.aster_zone(lon_ex=[137.5, 137.5],
+                             lat_ex=[-72.5, -72.5])
         self.assertTrue(len(z) == 1)
-        self.assertTrue(len(u) == 1)
-        self.assertEqual('S73E137', z[0])
-        self.assertEqual('S75E135', u[0])
+        self.assertEqual('ASTGTMV003_S73E137', z[0])
 
-        z, u = utils.aster_zone(lon_ex=[-95.5, -95.5],
-                                lat_ex=[30.5, 30.5])
+        z = utils.aster_zone(lon_ex=[-95.5, -95.5],
+                             lat_ex=[30.5, 30.5])
         self.assertTrue(len(z) == 1)
-        self.assertTrue(len(u) == 1)
-        self.assertEqual('N30W096', z[0])
-        self.assertEqual('N30W100', u[0])
+        self.assertEqual('ASTGTMV003_N30W096', z[0])
 
-        z, u = utils.aster_zone(lon_ex=[-96.5, -95.5],
-                                lat_ex=[30.5, 30.5])
-        self.assertTrue(len(z) == 2)
-        self.assertTrue(len(u) == 2)
-        self.assertEqual('N30W096', z[1])
-        self.assertEqual('N30W100', u[1])
-        self.assertEqual('N30W097', z[0])
-        self.assertEqual('N30W100', u[0])
+        z = utils.aster_zone(lon_ex=[-96.5, -94.5],
+                             lat_ex=[30.5, 30.5])
+        self.assertTrue(len(z) == 3)
+        self.assertEqual('ASTGTMV003_N30W095', z[0])
+        self.assertEqual('ASTGTMV003_N30W096', z[1])
+        self.assertEqual('ASTGTMV003_N30W097', z[2])
+
+    def test_nasazone(self):
+
+        z = utils.nasadem_zone(lon_ex=[137.5, 137.5],
+                               lat_ex=[-72.5, -72.5])
+        self.assertTrue(len(z) == 1)
+        self.assertEqual('s73e137', z[0])
+
+        z = utils.nasadem_zone(lon_ex=[-95.5, -95.5],
+                               lat_ex=[30.5, 30.5])
+        self.assertTrue(len(z) == 1)
+        self.assertEqual('n30w096', z[0])
+
+        z = utils.nasadem_zone(lon_ex=[-96.5, -94.5],
+                               lat_ex=[30.5, 30.5])
+        self.assertTrue(len(z) == 3)
+        self.assertEqual('n30w095', z[0])
+        self.assertEqual('n30w096', z[1])
+        self.assertEqual('n30w097', z[2])
+
+    def test_mapzen_zone(self):
+
+        z = utils.mapzen_zone(lon_ex=[137.5, 137.5], lat_ex=[45, 45],
+                              zoom=10)
+        self.assertTrue(len(z) == 1)
+        self.assertEqual('10/903/368.tif', z[0])
+
+        z = utils.mapzen_zone(lon_ex=[137.5, 137.5], lat_ex=[45, 45],
+                              dx_meter=110)
+        self.assertTrue(len(z) == 1)
+        self.assertEqual('10/903/368.tif', z[0])
+
+        z = utils.mapzen_zone(lon_ex=[137.5, 137.5], lat_ex=[-45, -45],
+                              zoom=10)
+        self.assertTrue(len(z) == 1)
+        self.assertEqual('10/903/655.tif', z[0])
+
+        z = utils.mapzen_zone(lon_ex=[137.5, 137.5], lat_ex=[-45, -45],
+                              dx_meter=110)
+        self.assertTrue(len(z) == 1)
+        self.assertEqual('10/903/655.tif', z[0])
+
+        # Check the minimum zoom level
+        dx = 200
+        for lat in np.arange(10) * 10:
+            z = utils.mapzen_zone(lon_ex=[137.5, 137.5], lat_ex=[lat, lat],
+                                  dx_meter=dx)
+            assert int(z[0].split('/')[0]) > 9
+            z = utils.mapzen_zone(lon_ex=[181, 181], lat_ex=[-lat, -lat],
+                                  dx_meter=dx)
+            assert int(z[0].split('/')[0]) > 9
 
     def test_dem3_viewpano_zone(self):
 
-        test_loc = {'ISL': [-25., -12., 63., 67.],  # Iceland
-                    'SVALBARD': [10., 34., 76., 81.],
-                    'JANMAYEN': [-10., -7., 70., 72.],
-                    'FJ': [36., 66., 79., 82.],  # Franz Josef Land
-                    'FAR': [-8., -6., 61., 63.],  # Faroer
-                    'BEAR': [18., 20., 74., 75.],  # Bear Island
-                    'SHL': [-3., 0., 60., 61.],  # Shetland
-                    # Antarctica tiles as UTM zones, FILES ARE LARGE!!!!!
-                    # '01-15': [-180., -91., -90, -60.],
-                    # '16-30': [-91., -1., -90., -60.],
-                    # '31-45': [-1., 89., -90., -60.],
-                    # '46-60': [89., 189., -90., -60.],
-                    # Greenland tiles
-                    # 'GL-North': [-78., -11., 75., 84.],
-                    # 'GL-West': [-68., -42., 64., 76.],
-                    # 'GL-South': [-52., -40., 59., 64.],
-                    # 'GL-East': [-42., -17., 64., 76.]
-                    }
-        # special names
-        for key in test_loc:
-            z = utils.dem3_viewpano_zone([test_loc[key][0], test_loc[key][1]],
-                                         [test_loc[key][2], test_loc[key][3]])
-            self.assertTrue(len(z) == 1)
+        lon_ex = -22.26
+        lat_ex = 66.16
+        assert utils.dem3_viewpano_zone(lon_ex, lat_ex) == ['ISL']
 
-            self.assertEqual(key, z[0])
+        lon_ex = 17
+        lat_ex = 80
+        assert utils.dem3_viewpano_zone(lon_ex, lat_ex) == ['SVALBARD']
 
-        # weird Antarctica tile
-        # z = utils.dem3_viewpano_zone([-91., -90.], [-72., -68.])
-        # self.assertTrue(len(z) == 1)
-        # self.assertEqual('SR15', z[0])
+        lon_ex = -8
+        lat_ex = 71
+        assert utils.dem3_viewpano_zone(lon_ex, lat_ex) == ['JANMAYEN']
+
+        lon_ex = 60
+        lat_ex = 80
+        assert utils.dem3_viewpano_zone(lon_ex, lat_ex) == ['FJ']
+
+        lon_ex = -7
+        lat_ex = 62
+        assert utils.dem3_viewpano_zone(lon_ex, lat_ex) == ['FAR']
+
+        lon_ex = 19
+        lat_ex = 74.5
+        assert utils.dem3_viewpano_zone(lon_ex, lat_ex) == ['BEAR']
+
+        lon_ex = -1
+        lat_ex = 60.5
+        assert utils.dem3_viewpano_zone(lon_ex, lat_ex) == ['SHL']
+
+        lon_ex = -30.733021
+        lat_ex = 82.930238
+        assert utils.dem3_viewpano_zone(lon_ex, lat_ex) == ['GL-North']
+
+        lon_ex = -52
+        lat_ex = 70
+        assert utils.dem3_viewpano_zone(lon_ex, lat_ex) == ['GL-West']
+
+        lon_ex = -43
+        lat_ex = 60
+        assert utils.dem3_viewpano_zone(lon_ex, lat_ex) == ['GL-South']
+
+        lon_ex = -24.7
+        lat_ex = 69.8
+        assert utils.dem3_viewpano_zone(lon_ex, lat_ex) == ['GL-East']
+
+        lon_ex = -22.26
+        lat_ex = 66.16
+        assert utils.dem3_viewpano_zone(lon_ex, lat_ex) == ['ISL']
+
+        lon_ex = -127.592802
+        lat_ex = -74.479523
+        assert utils.dem3_viewpano_zone(lon_ex, lat_ex) == ['01-15']
+
+        lat_ex = -72.383226
+        lon_ex = -60.648126
+        assert utils.dem3_viewpano_zone(lon_ex, lat_ex) == ['16-30']
+
+        lat_ex = -67.993527
+        lon_ex = 65.482151
+        assert utils.dem3_viewpano_zone(lon_ex, lat_ex) == ['31-45']
+
+        lat_ex = -71.670896
+        lon_ex = 166.878916
+        assert utils.dem3_viewpano_zone(lon_ex, lat_ex) == ['46-60']
 
         # normal tile
         z = utils.dem3_viewpano_zone([-179., -178.], [65., 65.])
@@ -1499,6 +1979,54 @@ class TestDataFiles(unittest.TestCase):
         z = utils.dem3_viewpano_zone([6, 14], [41, 48])
         self.assertTrue(len(z) == 9)
         self.assertEqual(ref, z)
+
+    def test_copdemzone(self):
+        z = utils.copdem_zone(lat_ex=[-9.8, -9.5], lon_ex=[-77.6, -77.3])
+        self.assertTrue(len(z) == 1)
+        self.assertEqual(('DEM1_SAR_DGE_90_20110427T104941_20140819T105300_'
+                          'ADS_000000_2733.DEM.tar'), z[0][0])
+        self.assertEqual('Copernicus_DSM_30_S10_00_W078_00', z[0][1])
+
+        z = utils.copdem_zone(lat_ex=[46.37, 46.59], lon_ex=[7.89, 8.12])
+        self.assertTrue(len(z) == 2)
+        self.assertTrue('Copernicus_DSM_30_N46_00_E008_00' in
+                        [z[0][1], z[1][1]])
+        self.assertTrue('Copernicus_DSM_30_N46_00_E007_00' in
+                        [z[0][1], z[1][1]])
+
+        # we want an error if copdem does not find all or any
+        self.assertRaises(InvalidDEMError, utils.copdem_zone,
+                          lat_ex=[0, 1], lon_ex=[0, 1])
+
+    def test_is_dem_source_available(self):
+        assert utils.is_dem_source_available('SRTM', [11, 11], [47, 47])
+        assert utils.is_dem_source_available('GIMP', [-25, -25], [71, 71])
+        assert not utils.is_dem_source_available('GIMP', [11, 11], [47, 47])
+        assert utils.is_dem_source_available('ARCTICDEM', [-25, -25], [71, 71])
+        assert utils.is_dem_source_available('RAMP', [-25, -25], [-71, -71])
+        assert utils.is_dem_source_available('REMA', [-25, -25], [-71, -71])
+        assert not utils.is_dem_source_available('AW3D30', [5, 5], [-60, -60])
+
+        for s in ['TANDEM', 'AW3D30', 'MAPZEN', 'DEM3', 'ASTER', 'AW3D30']:
+            assert utils.is_dem_source_available(s, [11, 11], [47, 47])
+
+    def test_find_dem_zone(self):
+
+        # Somewhere in the Alps: SRTM
+        assert utils.default_dem_source(11, 47) == 'SRTM'
+        # High Lats: DEM3
+        assert utils.default_dem_source(11, 65) == 'DEM3'
+        # Eastern russia: DEM3
+        assert utils.default_dem_source(170.1, 59.1) == 'DEM3'
+        # Greenland
+        assert utils.default_dem_source(0, 0, rgi_region='5') == 'GIMP'
+        # Antarctica
+        with pytest.raises(InvalidParamsError):
+            utils.default_dem_source(0, 0, rgi_region='19')
+        assert utils.default_dem_source(0, 0, rgi_region='19',
+                                        rgi_subregion='19-06') == 'RAMP'
+        assert utils.default_dem_source(0, 0, rgi_region='19',
+                                        rgi_subregion='19-01') == 'DEM3'
 
     def test_lrufilecache(self):
 
@@ -1533,25 +2061,39 @@ class TestDataFiles(unittest.TestCase):
 
     def test_lruhandler(self):
 
+        # initiate some files in empty directory
         self.reset_dir()
-        f1 = os.path.join(self.dldir, 'f1.txt')
-        f2 = os.path.join(self.dldir, 'f2.txt')
-        f3 = os.path.join(self.dldir, 'f3.txt')
-        open(f1, 'a').close()
-        time.sleep(0.1)
-        open(f2, 'a').close()
-        time.sleep(0.1)
-        open(f3, 'a').close()
+        foo = []
+        bar = []
+        for i, e in itertools.product(range(1, 4), ['foo', 'bar']):
+            f = os.path.join(self.dldir, 'f{}.{}'.format(i, e))
+            open(f, 'a').close()
+            (foo.append(f) if e == 'foo' else bar.append(f))
+            time.sleep(0.1)
 
-        cfg.get_lru_handler(self.dldir, maxsize=3, ending='.txt')
-        assert os.path.exists(f1)
-        assert os.path.exists(f2)
-        assert os.path.exists(f3)
+        # init handler for dldir and ending 'foo'
+        lru_foo = cfg.get_lru_handler(self.dldir, ending='.foo')
+        # no maxsize specified: use default
+        self.assertTrue(lru_foo.maxsize == cfg.PARAMS['lru_maxsize'])
+        # all files should exist
+        self.assertTrue(all([os.path.exists(f) for f in foo]))
 
-        cfg.get_lru_handler(self.dldir, maxsize=2, ending='.txt')
-        assert not os.path.exists(f1)
-        assert os.path.exists(f2)
-        assert os.path.exists(f3)
+        # init handler for dldir and ending bar
+        cfg.get_lru_handler(self.dldir, maxsize=3, ending='.bar')
+        # all files should exist
+        self.assertTrue(all([os.path.exists(b) for b in bar]))
+
+        # update foo handler, decresing maxsize should delete first file
+        lru_foo2 = cfg.get_lru_handler(self.dldir, maxsize=2, ending='.foo')
+        self.assertFalse(os.path.exists(foo[0]))
+        self.assertTrue(os.path.exists(foo[1]))
+        self.assertTrue(os.path.exists(foo[2]))
+        # but this should be the same handler instance as above:
+        self.assertTrue(lru_foo is lru_foo2)
+        self.assertTrue(lru_foo.maxsize == 2)
+
+        # And bar files should not be affected by decreased cache size of foo
+        self.assertTrue(all([os.path.exists(b) for b in bar]))
 
     @pytest.mark.download
     def test_srtmdownload(self):
@@ -1573,6 +2115,25 @@ class TestDataFiles(unittest.TestCase):
         self.assertTrue(_download_srtm_file(zone) is None)
 
     @pytest.mark.download
+    def test_nasadownload(self):
+        from oggm.utils._downloads import _download_nasadem_file
+
+        # this zone does exist and file should be small enough for download
+        zone = 'n01e119'
+        fp = _download_nasadem_file(zone)
+        self.assertTrue(os.path.exists(fp))
+        fp = _download_nasadem_file(zone)
+        self.assertTrue(os.path.exists(fp))
+
+    @pytest.mark.download
+    def test_nasademdownloadfails(self):
+        from oggm.utils._downloads import _download_nasadem_file
+
+        # this zone does not exist
+        zone = 'n80w100'
+        self.assertTrue(_download_nasadem_file(zone) is None)
+
+    @pytest.mark.download
     @pytest.mark.creds
     def test_tandemdownload(self):
         from oggm.utils._downloads import _download_tandem_file
@@ -1584,14 +2145,44 @@ class TestDataFiles(unittest.TestCase):
         fp = _download_tandem_file(zone)
         self.assertTrue(os.path.exists(fp))
 
+    @pytest.mark.download
+    @pytest.mark.creds
+    def test_tandemdownloadfails(self):
+        from oggm.utils._downloads import _download_tandem_file
+
+        # this zone does not exist, so it should return None
+        zone = 'N47/E010/TDM1_DEM__30_NxxExxx'
+        fp = _download_tandem_file(zone)
+        self.assertIsNone(fp)
+
+    @pytest.mark.download
+    @pytest.mark.creds
+    def test_copdemdownload(self):
+        from oggm.utils._downloads import _download_copdem_file
+
+        # this zone does exist and file should be small enough for download
+        cppfile = ('DEM1_SAR_DGE_90_20110109T094723_20140326T001716_ADS_'
+                   '000000_5845.DEM.tar')
+        tilename = 'Copernicus_DSM_30_N78_00_E102_00'
+        fp = _download_copdem_file(cppfile, tilename)
+        self.assertTrue(os.path.exists(fp))
+
     @pytest.mark.creds
     def test_asterdownload(self):
         from oggm.utils._downloads import _download_aster_file
 
         # this zone does exist and file should be small enough for download
-        zone = 'S73E137'
-        unit = 'S75E135'
-        fp = _download_aster_file(zone, unit)
+        zone = 'ASTGTMV003_S73E137'
+        fp = _download_aster_file(zone)
+        self.assertTrue(os.path.exists(fp))
+
+    @pytest.mark.download
+    def test_mapzen_download(self):
+        from oggm.utils._downloads import _download_mapzen_file
+
+        # this zone does exist and file should be small enough for download
+        zone = '10/903/368.tif'
+        fp = _download_mapzen_file(zone)
         self.assertTrue(os.path.exists(fp))
 
     @pytest.mark.download
@@ -1610,33 +2201,17 @@ class TestDataFiles(unittest.TestCase):
         from oggm.utils._downloads import _download_aster_file
 
         # this zone does not exist
-        zone = 'bli'
-        unit = 'S75E135'
-        self.assertTrue(_download_aster_file(zone, unit) is None)
-
-    @pytest.mark.download
-    def test_download_cru(self):
-
-        tmp = cfg.PATHS['cru_dir']
-        cfg.PATHS['cru_dir'] = os.path.join(self.dldir, 'cru_extract')
-
-        of = utils.get_cru_file('tmp')
-        self.assertTrue(os.path.exists(of))
-
-        cfg.PATHS['cru_dir'] = tmp
+        zone = 'ASTGTMV003_S99E010'
+        self.assertTrue(_download_aster_file(zone) is None)
 
     @pytest.mark.download
     def test_download_histalp(self):
 
-        tmp = cfg.PATHS['cru_dir']
-        cfg.PATHS['cru_dir'] = os.path.join(self.dldir, 'cru_extract')
-
-        of = utils.get_histalp_file('tmp')
+        from oggm.shop.histalp import get_histalp_file
+        of = get_histalp_file('tmp')
         self.assertTrue(os.path.exists(of))
-        of = utils.get_histalp_file('pre')
+        of = get_histalp_file('pre')
         self.assertTrue(os.path.exists(of))
-
-        cfg.PATHS['cru_dir'] = tmp
 
     @pytest.mark.download
     def test_download_rgi5(self):
@@ -1722,6 +2297,27 @@ class TestDataFiles(unittest.TestCase):
         self.assertTrue(fp is None)
 
     @pytest.mark.download
+    def test_download_aw3d30(self):
+        from oggm.utils._downloads import _download_aw3d30_file
+
+        # this zone does exist and file should be small enough for download
+        zone = 'N000E105/N002E107'
+        fp = _download_aw3d30_file(zone)
+        self.assertTrue(os.path.exists(fp))
+        zone = 'S085W050/S081W048'
+        fp = _download_aw3d30_file(zone)
+        self.assertTrue(os.path.exists(fp))
+
+    @pytest.mark.download
+    def test_download_aw3d30_fails(self):
+        from oggm.utils._downloads import _download_aw3d30_file
+        from urllib.error import URLError
+
+        # this zone does not exist
+        zone = 'N000E005/N000E005'
+        self.assertRaises(URLError, _download_aw3d30_file, zone)
+
+    @pytest.mark.download
     def test_download_cmip5(self):
         fn = 'pr_mon_NorESM1-M_historicalNat_r1i1p1_g025.nc'
         fp = utils.get_cmip5_file(fn)
@@ -1752,11 +2348,11 @@ class TestDataFiles(unittest.TestCase):
                           for rid in rgidf.RGIId]
 
         # Go - initialize working directories
-        gdirs = workflow.init_glacier_regions(rgidf.iloc[:2],
-                                              from_prepro_level=1,
-                                              prepro_rgi_version='61',
-                                              prepro_border=10,
-                                              use_demo_glaciers=False)
+        gdirs = workflow.init_glacier_directories(rgidf.iloc[:2],
+                                                  from_prepro_level=1,
+                                                  prepro_rgi_version='61',
+                                                  prepro_border=10,
+                                                  use_demo_glaciers=False)
         n_intersects = 0
         for gdir in gdirs:
             assert gdir.has_file('dem')
@@ -1781,8 +2377,9 @@ class TestSkyIsFalling(unittest.TestCase):
         srs = ('+units=m +proj=lcc +lat_1=29.0 +lat_2=29.0 '
                '+lat_0=29.0 +lon_0=89.8')
 
-        proj_out = pyproj.Proj("+init=EPSG:4326", preserve_units=True)
+        proj_out = pyproj.Proj("EPSG:4326", preserve_units=True)
         proj_in = pyproj.Proj(srs, preserve_units=True)
 
-        lon, lat = pyproj.transform(proj_in, proj_out, -2235000, -2235000)
+        from salem.gis import transform_proj
+        lon, lat = transform_proj(proj_in, proj_out, -2235000, -2235000)
         np.testing.assert_allclose(lon, 70.75731, atol=1e-5)

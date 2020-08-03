@@ -2,7 +2,6 @@ import os
 import shutil
 from distutils.util import strtobool
 
-import geopandas as gpd
 import numpy as np
 import shapely.geometry as shpg
 from scipy import optimize as optimization
@@ -10,10 +9,11 @@ from scipy import optimize as optimization
 # Local imports
 import oggm
 import oggm.cfg as cfg
-from oggm.core import gis, inversion, climate, centerlines, flowline
 from oggm.utils import get_demo_file, mkdir
 from oggm.workflow import execute_entity_task
-from oggm.utils import oggm_urlretrieve
+from oggm.core import flowline
+from oggm import tasks
+from oggm.core.flowline import RectangularBedFlowline
 
 
 def dummy_constant_bed(hmax=3000., hmin=1000., nx=200, map_dx=100.,
@@ -189,7 +189,7 @@ def dummy_width_bed():
                                             bed_h, widths)]
 
 
-def dummy_width_bed_tributary(map_dx=100.):
+def dummy_width_bed_tributary(map_dx=100., n_trib=1):
     # bed with tributary glacier
     dx = 1.
     nx = 200
@@ -197,6 +197,8 @@ def dummy_width_bed_tributary(map_dx=100.):
     surface_h = np.linspace(3000, 1000, nx)
     bed_h = surface_h
     widths = surface_h * 0. + 3.
+    widths[0:20] = 6 / (n_trib + 1)
+
     coords = np.arange(0, nx - 0.5, 1)
     line = shpg.LineString(np.vstack([coords, coords * 0.]).T)
 
@@ -204,20 +206,88 @@ def dummy_width_bed_tributary(map_dx=100.):
                                            widths)
     coords = np.arange(0, 19.1, 1)
     line = shpg.LineString(np.vstack([coords, coords * 0. + 1]).T)
-    fl_1 = flowline.RectangularBedFlowline(line, dx, map_dx, surface_h[0:20],
-                                           bed_h[0:20], widths[0:20])
-    fl_1.set_flows_to(fl_0)
-    return [fl_1, fl_0]
+
+    out = [fl_0]
+    for i in range(n_trib):
+        fl_1 = flowline.RectangularBedFlowline(line, dx, map_dx,
+                                               surface_h[0:20],
+                                               bed_h[0:20],
+                                               widths[0:20])
+        fl_1.set_flows_to(fl_0)
+        out.append(fl_1)
+
+    return out[::-1]
 
 
-def patch_url_retrieve_github(url, *args, **kwargs):
-    """A simple patch to OGGM's download function to make sure we don't
-    download elsewhere than expected."""
+def dummy_bed_tributary_tail_to_head(map_dx=100., n_trib=1, small_cliff=False):
+    # bed with tributary glacier(s) flowing directly into their top
+    # (for splitted flowline experiments)
+    dx = 1.
+    nx = 200
 
-    assert ('github' in url or
-            'cluster.klima.uni-bremen.de/~fmaussion/test_gdirs/' in url or
-            'cluster.klima.uni-bremen.de/~fmaussion/demo_gdirs/' in url)
-    return oggm_urlretrieve(url, *args, **kwargs)
+    surface_h = np.linspace(3000, 1000, nx)
+    bed_h = surface_h
+    widths = surface_h * 0. + 3.
+
+    pix_id = np.linspace(20, 180, n_trib).round().astype(int)
+
+    fls = [flowline.RectangularBedFlowline(dx=dx, map_dx=map_dx,
+                                           surface_h=surface_h[:pix_id[0]],
+                                           bed_h=bed_h[:pix_id[0]],
+                                           widths=widths[:pix_id[0]])]
+
+    for i, pid in enumerate(pix_id):
+        if i == (len(pix_id) - 1):
+            eid = nx + 1
+        else:
+            eid = pix_id[i + 1]
+        dh = -100 if small_cliff else 0
+
+        fl = flowline.RectangularBedFlowline(dx=dx, map_dx=map_dx,
+                                             surface_h=surface_h[pid:eid] + dh,
+                                             bed_h=bed_h[pid:eid] + dh,
+                                             widths=widths[pid:eid])
+        fls[-1].set_flows_to(fl, to_head=True, check_tail=False)
+        fls.append(fl)
+
+    return fls
+
+
+def bu_tidewater_bed(gridsize=200, gridlength=6e4, widths_m=600,
+                     b_0=260, alpha=0.017, b_1=350, x_0=4e4, sigma=1e4,
+                     water_level=0, split_flowline_before_water=None):
+
+    # Bassis & Ultee bed profile
+    dx_meter = gridlength / gridsize
+    x = np.arange(gridsize+1) * dx_meter
+    bed_h = b_0 - alpha * x + b_1 * np.exp(-((x - x_0) / sigma)**2)
+    bed_h += water_level
+    surface_h = bed_h
+    widths = surface_h * 0. + widths_m / dx_meter
+
+    if split_flowline_before_water is not None:
+        bs = np.min(np.nonzero(bed_h < 0)[0]) - split_flowline_before_water
+        fls = [RectangularBedFlowline(dx=1, map_dx=dx_meter,
+                                      surface_h=surface_h[:bs],
+                                      bed_h=bed_h[:bs],
+                                      widths=widths[:bs]),
+               RectangularBedFlowline(dx=1, map_dx=dx_meter,
+                                      surface_h=surface_h[bs:],
+                                      bed_h=bed_h[bs:],
+                                      widths=widths[bs:]),
+               ]
+        fls[0].set_flows_to(fls[1], check_tail=False, to_head=True)
+        return fls
+    else:
+        return [
+            RectangularBedFlowline(dx=1, map_dx=dx_meter, surface_h=surface_h,
+                                   bed_h=bed_h, widths=widths)]
+
+
+def patch_minimal_download_oggm_files(*args, **kwargs):
+    """A simple patch to make sure we don't download."""
+
+    raise RuntimeError('We should not be there in minimal mode')
 
 
 def use_multiprocessing():
@@ -249,7 +319,10 @@ def get_test_dir():
     return out
 
 
-def init_hef(reset=False, border=40):
+def init_hef(reset=False, border=40, logging_level='INFO'):
+
+    from oggm.core import gis, inversion, climate, centerlines, flowline
+    import geopandas as gpd
 
     # test directory
     testdir = os.path.join(get_test_dir(), 'tmp_border{}'.format(border))
@@ -258,7 +331,7 @@ def init_hef(reset=False, border=40):
         reset = True
 
     # Init
-    cfg.initialize()
+    cfg.initialize(logging_level=logging_level)
     cfg.set_intersects_db(get_demo_file('rgi_intersect_oetztal.shp'))
     cfg.PATHS['dem_file'] = get_demo_file('hef_srtm.tif')
     cfg.PATHS['climate_file'] = get_demo_file('histalp_merged_hef.nc')
@@ -277,7 +350,7 @@ def init_hef(reset=False, border=40):
     if not reset:
         return gdir
 
-    gis.define_glacier_region(gdir, entity=entity)
+    gis.define_glacier_region(gdir)
     execute_entity_task(gis.glacier_masks, [gdir])
     execute_entity_task(centerlines.compute_centerlines, [gdir])
     centerlines.initialize_flowlines(gdir)
@@ -334,6 +407,42 @@ def init_hef(reset=False, border=40):
     return gdir
 
 
+def init_columbia(reset=False):
+
+    from oggm.core import gis, climate, centerlines
+    import geopandas as gpd
+
+    # test directory
+    testdir = os.path.join(get_test_dir(), 'tmp_columbia')
+    if not os.path.exists(testdir):
+        os.makedirs(testdir)
+        reset = True
+
+    # Init
+    cfg.initialize()
+    cfg.PATHS['working_dir'] = testdir
+    cfg.PARAMS['use_intersects'] = False
+    cfg.PATHS['dem_file'] = get_demo_file('dem_Columbia.tif')
+    cfg.PARAMS['border'] = 10
+
+    entity = gpd.read_file(get_demo_file('01_rgi60_Columbia.shp')).iloc[0]
+    gdir = oggm.GlacierDirectory(entity, reset=reset)
+    if gdir.has_file('climate_historical'):
+        return gdir
+
+    gis.define_glacier_region(gdir)
+    gis.glacier_masks(gdir)
+    centerlines.compute_centerlines(gdir)
+    centerlines.initialize_flowlines(gdir)
+    centerlines.compute_downstream_line(gdir)
+    centerlines.catchment_area(gdir)
+    centerlines.catchment_intersections(gdir)
+    centerlines.catchment_width_geom(gdir)
+    centerlines.catchment_width_correction(gdir)
+    tasks.process_dummy_cru_file(gdir, seed=0)
+    return gdir
+
+
 class TempEnvironmentVariable:
     """Context manager for environment variables
 
@@ -346,11 +455,14 @@ class TempEnvironmentVariable:
         self.old_envs = {}
         for k, v in self.envs.items():
             self.old_envs[k] = os.environ.get(k)
-            os.environ[k] = v
+            if v is not None:
+                os.environ[k] = v
+            elif k in os.environ:
+                del os.environ[k]
 
     def __exit__(self, *args):
         for k, v in self.old_envs.items():
-            if v:
+            if v is not None:
                 os.environ[k] = v
-            else:
+            elif k in os.environ:
                 del os.environ[k]

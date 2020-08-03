@@ -3,6 +3,10 @@ class InvalidParamsError(ValueError):
     pass
 
 
+class InvalidWorkflowError(ValueError):
+    pass
+
+
 class MassBalanceCalibrationError(RuntimeError):
     pass
 
@@ -37,6 +41,11 @@ class HttpDownloadError(Exception):
     def __init__(self, code, url):
         self.code = code
         self.url = url
+
+
+class FTPSDownloadError(Exception):
+    def __init__(self, orgerr):
+        self.orgerr = orgerr
 
 
 class HttpContentTooShortError(Exception):

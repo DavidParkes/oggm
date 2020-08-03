@@ -4,38 +4,55 @@ import functools
 import logging
 from collections import OrderedDict
 import itertools
+import textwrap
 
 import matplotlib.colors as colors
 import matplotlib.pyplot as plt
 import numpy as np
-import salem
 import shapely.geometry as shpg
 from matplotlib import cm as colormap
 
 try:
+    import salem
+except ImportError:
+    pass
+
+OGGM_CMAPS = dict()
+
+try:
     # optional python-colorspace dependency for better (HCL-based) colormaps
     from colorspace import sequential_hcl
-    USE_HCL_CMAP = True
+    HAS_HCL_CMAP = True
 except ImportError:
-    USE_HCL_CMAP = False
+    HAS_HCL_CMAP = False
 
 from oggm.core.flowline import FileModel
 from oggm import cfg, utils
+from oggm.core import gis
 
 # Module logger
 log = logging.getLogger(__name__)
 
-# Set global colormaps
-ALTITUDE_CMAP = colormap.terrain
-if USE_HCL_CMAP:
-    CMAP_DIVS = 100  # number of discrete colours from continuous colormaps
-    THICKNESS_CMAP = sequential_hcl("Blue-Yellow", rev=True).cmap(CMAP_DIVS)
-    SECTION_THICKNESS_CMAP = THICKNESS_CMAP
-    GLACIER_THICKNESS_CMAP = THICKNESS_CMAP
-else:
-    SECTION_THICKNESS_CMAP = plt.cm.get_cmap('YlOrRd')
-    GLACIER_THICKNESS_CMAP = plt.get_cmap('viridis')
 
+def set_oggm_cmaps(use_hcl=None):
+    # Set global colormaps
+    global OGGM_CMAPS
+
+    if use_hcl is None:
+        use_hcl = HAS_HCL_CMAP
+
+    OGGM_CMAPS['terrain'] = colormap.terrain
+    if HAS_HCL_CMAP and use_hcl:
+        cm_divs = 100  # number of discrete colours from continuous colormaps
+        tcmap = sequential_hcl("Blue-Yellow", rev=True).cmap(cm_divs)
+        OGGM_CMAPS['section_thickness'] = tcmap
+        OGGM_CMAPS['glacier_thickness'] = tcmap
+    else:
+        OGGM_CMAPS['section_thickness'] = plt.cm.get_cmap('YlOrRd')
+        OGGM_CMAPS['glacier_thickness'] = plt.get_cmap('viridis')
+
+
+set_oggm_cmaps()
 
 def truncate_colormap(cmap, minval=0.0, maxval=1.0, n=256):
     """Remove extreme colors from a colormap."""
@@ -223,19 +240,69 @@ def plot_googlemap(gdirs, ax=None, figsize=None):
 
 
 @_plot_map
-def plot_domain(gdirs, ax=None, smap=None):
-    """Plot the glacier directory."""
+def plot_raster(gdirs, var_name=None, cmap='viridis', ax=None, smap=None):
+    """Plot any raster from the gridded_data file."""
 
     # Files
     gdir = gdirs[0]
 
-    topo = salem.GeoTiff(gdir.get_filepath('dem')).get_vardata()
+    with utils.ncDataset(gdir.get_filepath('gridded_data')) as nc:
+        var = nc.variables[var_name]
+        data = var[:]
+        description = var.long_name
+        description += ' [{}]'.format(var.units)
+
+    smap.set_data(data)
+
+    smap.set_cmap(cmap)
+
+    for gdir in gdirs:
+        crs = gdir.grid.center_grid
+
+        try:
+            geom = gdir.read_pickle('geometries')
+            # Plot boundaries
+            poly_pix = geom['polygon_pix']
+            smap.set_geometry(poly_pix, crs=crs, fc='none',
+                              alpha=0.3, zorder=2, linewidth=.2)
+            poly_pix = utils.tolist(poly_pix)
+            for _poly in poly_pix:
+                for l in _poly.interiors:
+                    smap.set_geometry(l, crs=crs, color='black', linewidth=0.5)
+        except FileNotFoundError:
+            smap.set_shapefile(gdir.read_shapefile('outlines'))
+
+    smap.plot(ax)
+
+    return dict(cbar_label='\n'.join(textwrap.wrap(description, 30)))
+
+
+@_plot_map
+def plot_domain(gdirs, ax=None, smap=None, use_netcdf=False):
+    """Plot the glacier directory.
+
+    Parameters
+    ----------
+    gdirs
+    ax
+    smap
+    use_netcdf : bool
+        use output of glacier_masks instead of geotiff DEM
+    """
+
+    # Files
+    gdir = gdirs[0]
+    if use_netcdf:
+        with utils.ncDataset(gdir.get_filepath('gridded_data')) as nc:
+            topo = nc.variables['topo'][:]
+    else:
+        topo = gis.read_geotiff_dem(gdir)
     try:
         smap.set_data(topo)
     except ValueError:
         pass
 
-    cm = truncate_colormap(ALTITUDE_CMAP, minval=0.25, maxval=1.0, n=256)
+    cm = truncate_colormap(OGGM_CMAPS['terrain'], minval=0.25, maxval=1.0)
     smap.set_cmap(cm)
     smap.set_plot_params(nlevels=256)
 
@@ -249,8 +316,10 @@ def plot_domain(gdirs, ax=None, smap=None):
             poly_pix = geom['polygon_pix']
             smap.set_geometry(poly_pix, crs=crs, fc='white',
                               alpha=0.3, zorder=2, linewidth=.2)
-            for l in poly_pix.interiors:
-                smap.set_geometry(l, crs=crs, color='black', linewidth=0.5)
+            poly_pix = utils.tolist(poly_pix)
+            for _poly in poly_pix:
+                for l in _poly.interiors:
+                    smap.set_geometry(l, crs=crs, color='black', linewidth=0.5)
         except FileNotFoundError:
             smap.set_shapefile(gdir.read_shapefile('outlines'))
 
@@ -279,7 +348,7 @@ def plot_centerlines(gdirs, ax=None, smap=None, use_flowlines=False,
     with utils.ncDataset(gdir.get_filepath('gridded_data')) as nc:
         topo = nc.variables['topo'][:]
 
-    cm = truncate_colormap(ALTITUDE_CMAP, minval=0.25, maxval=1.0, n=256)
+    cm = truncate_colormap(OGGM_CMAPS['terrain'], minval=0.25, maxval=1.0)
     smap.set_cmap(cm)
     smap.set_plot_params(nlevels=256)
     smap.set_data(topo)
@@ -292,9 +361,10 @@ def plot_centerlines(gdirs, ax=None, smap=None, use_flowlines=False,
 
         smap.set_geometry(poly_pix, crs=crs, fc='white',
                           alpha=0.3, zorder=2, linewidth=.2)
-        for l in poly_pix.interiors:
-            smap.set_geometry(l, crs=crs,
-                              color='black', linewidth=0.5)
+        poly_pix = utils.tolist(poly_pix)
+        for _poly in poly_pix:
+            for l in _poly.interiors:
+                smap.set_geometry(l, crs=crs, color='black', linewidth=0.5)
 
         # plot Centerlines
         cls = gdir.read_pickle(filename)
@@ -487,7 +557,7 @@ def plot_inversion(gdirs, ax=None, smap=None, linewidth=3, vmax=None):
                 toplot_crs.append(crs)
             vol.extend(c['volume'])
 
-    dl = salem.DataLevels(cmap=SECTION_THICKNESS_CMAP, nlevels=256,
+    dl = salem.DataLevels(cmap=OGGM_CMAPS['section_thickness'], nlevels=256,
                           data=toplot_th, vmin=0, vmax=vmax)
     colors = dl.to_rgb()
     for l, c, crs in zip(toplot_lines, colors, toplot_crs):
@@ -508,40 +578,37 @@ def plot_distributed_thickness(gdirs, ax=None, smap=None, varname_suffix=''):
     """
 
     gdir = gdirs[0]
-    if len(gdirs) > 1:
-        raise NotImplementedError('Cannot plot a list of gdirs (yet)')
 
     with utils.ncDataset(gdir.get_filepath('gridded_data')) as nc:
         topo = nc.variables['topo'][:]
-        mask = nc.variables['glacier_mask'][:]
-
-    grids_file = gdir.get_filepath('gridded_data')
-    with utils.ncDataset(grids_file) as nc:
-        import warnings
-        with warnings.catch_warnings():
-            # https://github.com/Unidata/netcdf4-python/issues/766
-            warnings.filterwarnings("ignore", category=RuntimeWarning)
-            vn = 'distributed_thickness' + varname_suffix
-            thick = nc.variables[vn][:]
-
-    thick = np.where(mask, thick, np.NaN)
 
     smap.set_topography(topo)
 
-    crs = gdir.grid.center_grid
+    for gdir in gdirs:
+        grids_file = gdir.get_filepath('gridded_data')
+        with utils.ncDataset(grids_file) as nc:
+            import warnings
+            with warnings.catch_warnings():
+                # https://github.com/Unidata/netcdf4-python/issues/766
+                warnings.filterwarnings("ignore", category=RuntimeWarning)
+                vn = 'distributed_thickness' + varname_suffix
+                thick = nc.variables[vn][:]
+                mask = nc.variables['glacier_mask'][:]
 
-    geom = gdir.read_pickle('geometries')
+        thick = np.where(mask, thick, np.NaN)
 
-    # Plot boundaries
-    poly_pix = geom['polygon_pix']
-    smap.set_geometry(poly_pix, crs=crs, fc='none', zorder=2, linewidth=.2)
-    for l in poly_pix.interiors:
-        smap.set_geometry(l, crs=crs, color='black', linewidth=0.5)
+        crs = gdir.grid.center_grid
+        geom = gdir.read_pickle('geometries')
 
-    smap.set_cmap(GLACIER_THICKNESS_CMAP)
+        # Plot boundaries
+        poly_pix = geom['polygon_pix']
+        smap.set_geometry(poly_pix, crs=crs, fc='none', zorder=2, linewidth=.2)
+        for l in poly_pix.interiors:
+            smap.set_geometry(l, crs=crs, color='black', linewidth=0.5)
+        smap.set_data(thick, crs=crs, overplot=True)
+
+    smap.set_cmap(OGGM_CMAPS['glacier_thickness'])
     smap.set_plot_params(nlevels=256)
-    smap.set_data(thick)
-
     smap.plot(ax)
 
     return dict(cbar_label='Glacier thickness [m]')
@@ -583,12 +650,9 @@ def plot_modeloutput_map(gdirs, ax=None, smap=None, model=None,
         crs = gdir.grid.center_grid
         smap.set_geometry(poly_pix, crs=crs, fc='none', zorder=2, linewidth=.2)
 
-        if isinstance(poly_pix, shpg.MultiPolygon):
-            for _poly in poly_pix:
-                for l in _poly.interiors:
-                    smap.set_geometry(l, crs=crs, color='black', linewidth=0.5)
-        else:
-            for l in poly_pix.interiors:
+        poly_pix = utils.tolist(poly_pix)
+        for _poly in poly_pix:
+            for l in _poly.interiors:
                 smap.set_geometry(l, crs=crs, color='black', linewidth=0.5)
 
         # plot Centerlines
@@ -605,7 +669,7 @@ def plot_modeloutput_map(gdirs, ax=None, smap=None, model=None,
                 toplot_lines.append(line)
                 toplot_crs.append(crs)
 
-    dl = salem.DataLevels(cmap=SECTION_THICKNESS_CMAP, nlevels=256,
+    dl = salem.DataLevels(cmap=OGGM_CMAPS['section_thickness'], nlevels=256,
                           data=toplot_th, vmin=0, vmax=vmax)
     colors = dl.to_rgb()
     for l, c, crs in zip(toplot_lines, colors, toplot_crs):
@@ -691,6 +755,9 @@ def plot_modeloutput_section(model=None, ax=None, title=''):
             ax.plot(x[i], cls.surface_h[i], 's', markerfacecolor='w',
                     markeredgecolor='k',
                     label='Tributary (inactive)')
+    if getattr(model, 'do_calving', False):
+        ax.hlines(model.water_level, x[0], x[-1], linestyles=':', color='C0')
+
 
     ax.set_ylim(ylim)
 

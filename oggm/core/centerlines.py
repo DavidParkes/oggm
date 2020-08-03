@@ -19,26 +19,40 @@ import logging
 import copy
 from itertools import groupby
 from collections import Counter
+from distutils.version import LooseVersion
+
 # External libs
 import numpy as np
 import pandas as pd
-import salem
 import shapely.ops
-import geopandas as gpd
 import scipy.signal
 import shapely.geometry as shpg
-from skimage import measure
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage.filters import gaussian_filter1d
 from scipy.ndimage.morphology import distance_transform_edt
 from scipy.ndimage.measurements import label, find_objects
-from skimage.graph import route_through_array
+
+# Optional libs
+try:
+    import salem
+except ImportError:
+    pass
+try:
+    import geopandas as gpd
+except ImportError:
+    pass
+try:
+    from skimage import measure
+    from skimage.graph import route_through_array
+except ImportError:
+    pass
+
 # Locals
 import oggm.cfg as cfg
 from oggm.cfg import GAUSSIAN_KERNEL
-from salem import lazy_property
 from oggm import utils
-from oggm.utils import tuple2int, line_interpol, interp_nans
+from oggm.utils import (tuple2int, line_interpol, interp_nans, lazy_property,
+                        SuperclassMeta)
 from oggm import entity_task
 from oggm.exceptions import (InvalidParamsError, InvalidGeometryError,
                              GeometryError)
@@ -52,23 +66,42 @@ LABEL_STRUCT = np.array([[0, 1, 0],
                          [0, 1, 0]])
 
 
-class Centerline(object):
+class Centerline(object, metaclass=SuperclassMeta):
     """A Centerline has geometrical and flow rooting properties.
 
     It is instanciated and updated by _join_lines() exclusively
     """
 
     def __init__(self, line, dx=None, surface_h=None, orig_head=None,
-                 rgi_id=None):
-        """ Instantiate."""
+                 rgi_id=None, map_dx=None):
+        """ Initialize a Centerline
+
+        Parameters
+        ----------
+        line : :py:class:`shapely.geometry.LineString`
+            The geometrically calculated centerline
+        dx : float
+            Grid spacing of the initialised flowline in pixel coordinates
+        surface_h :  :py:class:`numpy.ndarray`
+            elevation [m] of the points on ``line``
+        orig_head : :py:class:`shapely.geometry.Point`
+            geometric point of the lines head
+        rgi_id : str
+            The glacier's RGI identifier
+        map_dx : float
+            the map's grid resolution. Centerline.dx_meter = dx * map_dx
+        """
 
         self.line = None  # Shapely LineString
         self.head = None  # Shapely Point
         self.tail = None  # Shapely Point
-        self.dis_on_line = None  # Shapely Point
-        self.nx = None  # Shapely Point
-        self.is_glacier = None  # Shapely Point
-        self.set_line(line)  # Init all previous properties
+        self.dis_on_line = None
+        self.nx = None
+        if line is not None:
+            self.set_line(line)  # Init all previous properties
+        else:
+            self.nx = len(surface_h)
+            self.dis_on_line = np.arange(self.nx) * dx
 
         self.order = None  # Hydrological flow level (~ Strahler number)
 
@@ -80,6 +113,12 @@ class Centerline(object):
 
         # Optional attrs
         self.dx = dx  # dx in pixels (assumes the line is on constant dx
+        self.map_dx = map_dx  # the pixel spacing
+        try:
+            self.dx_meter = self.dx * self.map_dx
+        except TypeError:
+            # For backwards compatibility we allow this for now
+            self.dx_meter = None
         self._surface_h = surface_h
         self._widths = None
         self.is_rectangular = None
@@ -92,13 +131,14 @@ class Centerline(object):
         self.flux_needs_correction = False  # whether this branch was baaad
         self.rgi_id = rgi_id  # Usefull if line is used with another glacier
 
-    def set_flows_to(self, other, check_tail=True, last_point=False):
+    def set_flows_to(self, other, check_tail=True, to_head=False):
         """Find the closest point in "other" and sets all the corresponding
         attributes. Btw, it modifies the state of "other" too.
 
         Parameters
         ----------
-        other: an other centerline
+        other : :py:class:`oggm.Centerline`
+            another flowline where self should flow to
         """
 
         self.flows_to = other
@@ -109,15 +149,15 @@ class Centerline(object):
             ind_closest = np.argmin(np.abs(other.dis_on_line - prdis)).item()
             n = len(other.dis_on_line)
             if n >= 9:
-                ind_closest = np.clip(ind_closest, 4, n-5)
+                ind_closest = utils.clip_scalar(ind_closest, 4, n-5)
             elif n >= 7:
-                ind_closest = np.clip(ind_closest, 3, n-4)
+                ind_closest = utils.clip_scalar(ind_closest, 3, n-4)
             elif n >= 5:
-                ind_closest = np.clip(ind_closest, 2, n-3)
+                ind_closest = utils.clip_scalar(ind_closest, 2, n-3)
             p = shpg.Point(other.line.coords[int(ind_closest)])
             self.flows_to_point = p
-        elif last_point:
-            self.flows_to_point = other.tail
+        elif to_head:
+            self.flows_to_point = other.head
         else:
             # just the closest
             self.flows_to_point = _projection_point(other, self.tail)
@@ -129,7 +169,7 @@ class Centerline(object):
 
         Parameters
         ----------
-        line: a shapely.geometry.LineString
+        line : :py:class`shapely.geometry.LineString`
         """
 
         self.nx = len(line.coords)
@@ -144,12 +184,13 @@ class Centerline(object):
     def flows_to_indice(self):
         """Indices instead of geometry"""
 
+        ind = []
         tofind = self.flows_to_point.coords[0]
         for i, p in enumerate(self.flows_to.line.coords):
             if p == tofind:
-                ind = i
-        assert ind is not None
-        return ind
+                ind.append(i)
+        assert len(ind) == 1, 'We expect exactly one point to be found here.'
+        return ind[0]
 
     @lazy_property
     def inflow_indices(self):
@@ -160,7 +201,10 @@ class Centerline(object):
             ind = [i for (i, pi) in enumerate(self.line.coords)
                    if (p.coords[0] == pi)]
             inds.append(ind[0])
-        assert len(inds) == len(self.inflow_points)
+        assert len(inds) == len(self.inflow_points), ('For every inflow point '
+                                                      'there should be '
+                                                      'exactly one inflow '
+                                                      'indice')
         return inds
 
     @lazy_property
@@ -200,6 +244,10 @@ class Centerline(object):
     def widths(self):
         """Needed for overriding later"""
         return self._widths
+
+    @property
+    def widths_m(self):
+        return self.widths * self.map_dx
 
     @widths.setter
     def widths(self, value):
@@ -473,8 +521,11 @@ def _filter_lines_slope(lines, heads, topo, gdir):
         # Finally slope
         slope = np.arctan(-np.gradient(hgts, dx_cls*gdir.grid.dx))
 
+        # And altitude range
+        z_range = np.max(hgts) - np.min(hgts)
+
         # arbitrary threshold with which we filter the lines, otherwise bye bye
-        if np.sum(slope >= min_slope) >= 5:
+        if np.sum(slope >= min_slope) >= 5 and z_range > 10:
             olines.append(line)
             oheads.append(head)
 
@@ -571,12 +622,14 @@ def line_order(line):
         return np.max(levels) + 1
 
 
-def line_inflows(line):
+def line_inflows(line, keep=True):
     """Recursive search for all inflows of the given line.
 
     Parameters
     ----------
     line: a Centerline instance
+    keep : bool
+        whether or not the line itself should be kept
 
     Returns
     -------
@@ -588,7 +641,10 @@ def line_inflows(line):
         out = out.union(line_inflows(l))
 
     out = np.array(list(out))
-    return list(out[np.argsort([o.order for o in out])])
+    out = list(out[np.argsort([o.order for o in out])])
+    if not keep:
+        out.remove(line)
+    return out
 
 
 def _make_costgrid(mask, ext, z):
@@ -687,9 +743,9 @@ def _get_centerlines_heads(gdir, ext_yx, zoutline, single_fl,
 
     # Size of the half window to use to look for local maximas
     maxorder = np.rint(cfg.PARAMS['localmax_window'] / gdir.grid.dx)
-    maxorder = np.clip(maxorder, 5., np.rint((len(zoutline) / 5.)))
+    maxorder = utils.clip_scalar(maxorder, 5., np.rint((len(zoutline) / 5.)))
     heads_idx = scipy.signal.argrelmax(zoutline, mode='wrap',
-                                       order=maxorder.astype(np.int64))
+                                       order=int(maxorder))
     if single_fl or len(heads_idx[0]) <= 1:
         # small glaciers with one or less heads: take the absolute max
         heads_idx = (np.atleast_1d(np.argmax(zoutline)),)
@@ -710,7 +766,7 @@ def _get_centerlines_heads(gdir, ext_yx, zoutline, single_fl,
 
     # get radius of the buffer according to Kienholz eq. (1)
     radius = cfg.PARAMS['q1'] * geom['polygon_area'] + cfg.PARAMS['q2']
-    radius = np.clip(radius, 0, cfg.PARAMS['rmax'])
+    radius = utils.clip_scalar(radius, 0, cfg.PARAMS['rmax'])
     radius /= gdir.grid.dx  # in raster coordinates
     # Plus our criteria, quite useful to remove short lines:
     radius += cfg.PARAMS['flowline_junction_pix'] * cfg.PARAMS['flowline_dx']
@@ -895,11 +951,17 @@ def compute_downstream_line(gdir):
 
     with utils.ncDataset(gdir.get_filepath('gridded_data')) as nc:
         topo = nc.variables['topo_smoothed'][:]
-        glacier_ext = nc.variables['glacier_ext'][:]
+        glacier_ext = nc.variables['glacier_ext'][:] == 1
 
     # Look for the starting points
-    p = gdir.read_pickle('centerlines')[-1].tail
-    head = (int(p.y), int(p.x))
+    try:
+        # Normal OGGM flowlines
+        p = gdir.read_pickle('centerlines')[-1].tail
+        head = (int(p.y), int(p.x))
+    except FileNotFoundError:
+        # Squeezes lines
+        p = np.where((topo[glacier_ext].min() == topo) & glacier_ext)
+        head = (p[0][0], p[1][0])
 
     # Make going up very costy
     topo = topo**4
@@ -939,8 +1001,13 @@ def compute_downstream_line(gdir):
         raise GeometryError('Downstream line not found')
 
     cl = gdir.read_pickle('inversion_flowlines')[-1]
-    lline, dline = _line_extend(cl.line, line, cl.dx)
-    out = dict(full_line=lline, downstream_line=dline)
+    if cl.line is not None:
+        # normal OGGM lines
+        lline, dline = _line_extend(cl.line, line, cl.dx)
+        out = dict(full_line=lline, downstream_line=dline)
+    else:
+        out = dict(full_line=None, downstream_line=line)
+
     gdir.write_pickle(out, 'downstream_line')
 
 
@@ -1092,7 +1159,7 @@ def _parabolic_bed_from_topo(gdir, idl, interpolator):
     # We forbid super small shapes (important! This can lead to huge volumes)
     # Sometimes the parabola fits in flat areas are very good, implying very
     # flat parabolas.
-    bed_int = bed_int.clip(cfg.PARAMS['downstream_min_shape'])
+    bed_int = utils.clip_min(bed_int, cfg.PARAMS['downstream_min_shape'])
 
     # Smoothing
     bed_ma = pd.Series(bed_int)
@@ -1119,7 +1186,7 @@ def compute_downstream_bedshape(gdir):
     # We make a flowline out of the downstream for simplicity
     tpl = gdir.read_pickle('inversion_flowlines')[-1]
     cl = gdir.read_pickle('downstream_line')['downstream_line']
-    cl = Centerline(cl, dx=tpl.dx)
+    cl = Centerline(cl, dx=tpl.dx, map_dx=gdir.grid.dx)
 
     # Topography
     with utils.ncDataset(gdir.get_filepath('gridded_data')) as nc:
@@ -1179,7 +1246,7 @@ def _mask_to_polygon(mask, gdir=None):
         sr = region_sizes.pop(am)
         for ss in region_sizes:
             if (ss / sr) > 0.2:
-                log.warning('(%s) this blob was unusually large', rid)
+                log.info('(%s) this blob was unusually large', rid)
         mask[:] = 0
         mask[np.where(regions == (am+1))] = 1
 
@@ -1331,7 +1398,7 @@ def _filter_for_altitude_range(widths, wlines, topo):
             break
         else:
             alt_range_th += 20
-            log.warning('Set altitude threshold to {}'.format(alt_range_th))
+            log.debug('Set altitude threshold to {}'.format(alt_range_th))
         if alt_range_th > 2000:
             raise GeometryError('Problem by altitude filter.')
 
@@ -1516,10 +1583,21 @@ def catchment_intersections(gdir):
 
     # We project them onto the mercator proj before writing. This is a bit
     # inefficient (they'll be projected back later), but it's more sustainable
-    gdfc.crs = gdir.grid
-    gdfi.crs = gdir.grid
-    salem.transform_geopandas(gdfc, gdir.grid.proj, inplace=True)
-    salem.transform_geopandas(gdfi, gdir.grid.proj, inplace=True)
+    try:
+        # salem for geopandas > 0.7
+        salem.transform_geopandas(gdfc, from_crs=gdir.grid,
+                                  to_crs=gdir.grid.proj, inplace=True)
+        salem.transform_geopandas(gdfi, from_crs=gdir.grid,
+                                  to_crs=gdir.grid.proj, inplace=True)
+    except TypeError:
+        # from_crs not available yet
+        if LooseVersion(gpd.__version__) >= LooseVersion('0.7.0'):
+            raise ImportError('You have installed geopandas v0.7 or higher. '
+                              'Please also update salem for compatibility.')
+        gdfc.crs = gdir.grid
+        gdfi.crs = gdir.grid
+        salem.transform_geopandas(gdfc, to_crs=gdir.grid.proj, inplace=True)
+        salem.transform_geopandas(gdfi, to_crs=gdir.grid.proj, inplace=True)
     if hasattr(gdfc.crs, 'srs'):
         # salem uses pyproj
         gdfc.crs = gdfc.crs.srs
@@ -1587,6 +1665,14 @@ def initialize_flowlines(gdir):
         # If smoothing, this is the moment
         hgts = gaussian_filter1d(hgts, sw)
 
+        # Clip topography to 0 m a.s.l.
+        utils.clip_min(hgts, 0, out=hgts)
+
+        # Last safeguard here
+        if ic == (len(cls)-1) and ((np.max(hgts) - np.min(hgts)) < 10):
+            raise RuntimeError('Altitude range of main flowline too small: '
+                               '{}'.format(np.max(hgts) - np.min(hgts)))
+
         # Check for min slope issues and correct if needed
         if do_filter:
             # Correct only where glacier
@@ -1598,9 +1684,9 @@ def initialize_flowlines(gdir):
             diag_n_pix += len(isfin)
             perc_bad = np.sum(~isfin) / len(isfin)
             if perc_bad > 0.8:
-                log.warning('({}) more than {:.0%} of the flowline is cropped '
-                            'due to negative slopes.'.format(gdir.rgi_id,
-                                                             perc_bad))
+                log.info('({}) more than {:.0%} of the flowline is cropped '
+                         'due to negative slopes.'.format(gdir.rgi_id,
+                                                          perc_bad))
 
             sp = np.min(np.where(np.isfinite(hgts))[0])
             while len(hgts[sp:]) < 5:
@@ -1611,7 +1697,8 @@ def initialize_flowlines(gdir):
             new_line = shpg.LineString(points[sp:])
 
         sl = Centerline(new_line, dx=dx, surface_h=hgts,
-                        orig_head=cl.orig_head, rgi_id=gdir.rgi_id)
+                        orig_head=cl.orig_head, rgi_id=gdir.rgi_id,
+                        map_dx=gdir.grid.dx)
         sl.order = cl.order
         fls.append(sl)
 
@@ -1661,12 +1748,12 @@ def catchment_width_geom(gdir):
     if gdir.has_file('catchments_intersects'):
         # read and transform to grid
         gdf = gdir.read_shapefile('catchments_intersects')
-        salem.transform_geopandas(gdf, gdir.grid, inplace=True)
+        salem.transform_geopandas(gdf, to_crs=gdir.grid, inplace=True)
         gdfi = pd.concat([gdfi, gdf[['geometry']]])
     if gdir.has_file('intersects'):
         # read and transform to grid
         gdf = gdir.read_shapefile('intersects')
-        salem.transform_geopandas(gdf, gdir.grid, inplace=True)
+        salem.transform_geopandas(gdf, to_crs=gdir.grid, inplace=True)
         gdfi = pd.concat([gdfi, gdf[['geometry']]])
 
     # apply a buffer to be sure we get the intersects right. Be generous
@@ -1714,15 +1801,15 @@ def catchment_width_geom(gdir):
 
         # Filter +- widths at junction points
         for fid in fl.inflow_indices:
-            i0 = np.clip(fid-jpix, jpix/2, n-jpix/2).astype(np.int64)
-            i1 = np.clip(fid+jpix+1, jpix/2, n-jpix/2).astype(np.int64)
+            i0 = int(utils.clip_scalar(fid-jpix, jpix/2, n-jpix/2))
+            i1 = int(utils.clip_scalar(fid+jpix+1, jpix/2, n-jpix/2))
             fil_widths[i0:i1] = np.NaN
 
         valid = np.where(np.isfinite(fil_widths))
         if len(valid[0]) == 0:
             # This happens very rarely. Just pick the middle and
             # the correction task should do the rest
-            log.warning('({}) width filtering too strong.'.format(gdir.rgi_id))
+            log.info('({}) width filtering too strong.'.format(gdir.rgi_id))
             fil_widths = widths[np.int(len(widths) / 2.)]
 
         # Special treatment for tidewater glaciers
@@ -1783,7 +1870,7 @@ def catchment_width_correction(gdir):
 
         # Interpolate widths
         widths = utils.interp_nans(fl.widths)
-        widths = np.clip(widths, 0.1, np.max(widths))
+        widths = utils.clip_min(widths, 0.1)
 
         # Get topo per catchment and per flowline point
         fhgt = fl.surface_h
@@ -1794,11 +1881,11 @@ def catchment_width_correction(gdir):
 
         # Sometimes, the centerline does not reach as high as each pix on the
         # glacier. (e.g. RGI40-11.00006)
-        catch_h = np.clip(catch_h, np.min(catch_h), maxh)
+        catch_h = utils.clip_max(catch_h, maxh)
         # Same for min
         if fl.flows_to is None:
             # We clip only for main flowline (this has reasons)
-            catch_h = np.clip(catch_h, minh, np.max(catch_h))
+            catch_h = utils.clip_min(catch_h, minh)
 
         # Now decide on a binsize which ensures at least N element per bin
         bsize = cfg.PARAMS['base_binsize']
@@ -1841,13 +1928,13 @@ def catchment_width_correction(gdir):
             if bsize > 500:
                 nmin -= 1
                 bsize = cfg.PARAMS['base_binsize']
-                log.warning('(%s) reduced min n per bin to %d', gdir.rgi_id,
-                            nmin)
+                log.info('(%s) reduced min n per bin to %d', gdir.rgi_id,
+                         nmin)
                 if nmin == 0:
                     raise GeometryError('({}) no binsize could be chosen '
                                         .format(gdir.rgi_id))
         if bsize > 150:
-            log.warning('(%s) chosen binsize %d', gdir.rgi_id, bsize)
+            log.info('(%s) chosen binsize %d', gdir.rgi_id, bsize)
         else:
             log.debug('(%s) chosen binsize %d', gdir.rgi_id, bsize)
 
@@ -1893,7 +1980,7 @@ def catchment_width_correction(gdir):
 def terminus_width_correction(gdir, new_width=None):
     """Sets a new value for the terminus width.
 
-    This can be useful for e.g. tiddewater glaciers where we know the width
+    This can be useful for e.g. tidewater glaciers where we know the width
     and don't like the OGGM one.
 
     This task preserves the glacier area but will change the fit of the
@@ -1932,7 +2019,6 @@ def terminus_width_correction(gdir, new_width=None):
     gdir.write_pickle(fls, 'inversion_flowlines')
 
 
-@entity_task(log)
 def intersect_downstream_lines(gdir, candidates=None):
     """Find tributaries to a main glacier by intersecting downstream lines
 
@@ -1950,8 +2036,8 @@ def intersect_downstream_lines(gdir, candidates=None):
 
     Returns
     -------
-    tributaries: dict
-        Key is the main glacier rgi_id, values is a list of tributary rgi_ids
+    tributaries: list
+        list of tributary rgi_ids
     """
 
     # make sure tributaries are iteratable
@@ -1984,4 +2070,153 @@ def intersect_downstream_lines(gdir, candidates=None):
         if dline.intersects(_trans_dline.buffer(buffer)):
             tributaries.append(trib)
 
-    return {gdir.rgi_id: tributaries}
+    return tributaries
+
+
+@entity_task(log, writes=['elevation_band_flowline'])
+def elevation_band_flowline(gdir):
+    """Compute "squeezed" or "collapsed" glacier flowlines from Huss 2012.
+
+    This writes out a table of along glacier bins, strictly following the
+    method described in Werder, M. A., Huss, M., Paul, F., Dehecq, A. and
+    Farinotti, D.: A Bayesian ice thickness estimation model for large-scale
+    applications, J. Glaciol., 1–16, doi:10.1017/jog.2019.93, 2019.
+
+    The only parameter is cfg.PARAMS['elevation_band_flowline_binsize'],
+    which is 30m in Werder et al and 10m in Huss&Farinotti2012.
+
+    Currently the bands are assumed to have a rectangular bed.
+
+    Before calling this task you should run `tasks.define_glacier_region`
+    and `gis.simple_glacier_masks`. The logical following task is
+    `fixed_dx_elevation_band_flowline` to convert this to an OGGM flowline.
+
+    Parameters
+    ----------
+    gdir : :py:class:`oggm.GlacierDirectory`
+        where to write the data
+    """
+
+    # variables
+    grids_file = gdir.get_filepath('gridded_data')
+    with utils.ncDataset(grids_file) as nc:
+        # Variables
+        glacier_mask = nc.variables['glacier_mask'][:] == 1
+        topo = nc.variables['topo_smoothed'][:]
+
+    # slope
+    sy, sx = np.gradient(topo, gdir.grid.dx)
+    slope = np.arctan(np.sqrt(sx ** 2 + sy ** 2))
+
+    # clip following Werder et al 2019
+    slope = utils.clip_array(slope, np.deg2rad(0.4), np.deg2rad(60))
+
+    topo = topo[glacier_mask]
+    slope = slope[glacier_mask]
+
+    bsize = cfg.PARAMS['elevation_band_flowline_binsize']
+
+    # Make nice bins ensureing to cover the full range with the given bin size
+    maxb = utils.nicenumber(np.max(topo), bsize)
+    minb = utils.nicenumber(np.min(topo), bsize, lower=True)
+    bins = np.arange(minb, maxb + 0.01, bsize)
+
+    # Go - binning
+    df = pd.DataFrame()
+    topo_digi = np.digitize(topo, bins) - 1  # I prefer the left
+    for bi in range(len(bins) - 1):
+        # the coordinates of the current bin
+        bin_coords = topo_digi == bi
+
+        # bin area
+        bin_area = np.sum(bin_coords) * gdir.grid.dx ** 2
+        if bin_area == 0:
+            # Ignored in this case - which I believe is strange because deltaH
+            # should be larger for the previous bin, but this is what they do
+            # according to Zekollari 2019 review
+            continue
+        df.loc[bi, 'area'] = bin_area
+
+        # bin average elevation
+        df.loc[bi, 'mean_elevation'] = np.mean(topo[bin_coords])
+
+        # bin averge slope
+        # there are a few more shneanigans here described in Werder et al 2019
+        s_bin = slope[bin_coords]
+        # between the 5% percentile and the x% percentile where x is some magic
+        qmin = np.quantile(s_bin, 0.05)
+        x = max(2 * np.quantile(s_bin, 0.2) / np.quantile(s_bin, 0.8), 0.55)
+        x = min(x, 0.95)
+        qmax = np.quantile(s_bin, x)
+        df.loc[bi, 'slope'] = np.mean(s_bin[(s_bin >= qmin) & (s_bin <= qmax)])
+
+    # The grid point's grid spacing and widths
+    df['bin_elevation'] = (bins[1:] + bins[:-1]) / 2
+    df['dx'] = bsize / np.tan(df['slope'])
+    df['width'] = df['area'] / df['dx']
+
+    # In OGGM we go from top to bottom
+    df = df[::-1]
+
+    # The x coordinate in meter - this is a bit arbitrary but we put it at the
+    # center of the irregular grid (better for interpolation later
+    dx = df['dx'].values
+    dx_points = np.append(dx[0]/2, (dx[:-1] + dx[1:]) / 2)
+    df.index = np.cumsum(dx_points)
+    df.index.name = 'dis_along_flowline'
+
+    # Store and return
+    df.to_csv(gdir.get_filepath('elevation_band_flowline'))
+
+
+@entity_task(log, writes=['inversion_flowlines'])
+def fixed_dx_elevation_band_flowline(gdir):
+    """Converts the "collapsed" flowline into a regular "inversion flowline".
+
+    You need to run `tasks.elevation_band_flowline` first. It then interpolates
+    onto a regular grid with the same dx as the one that OGGM would choose
+    (cfg.PARAMS['flowline_dx'] * map_dx).
+.
+    Parameters
+    ----------
+    gdir : :py:class:`oggm.GlacierDirectory`
+        where to write the data
+    """
+
+    df = pd.read_csv(gdir.get_filepath('elevation_band_flowline'), index_col=0)
+
+    map_dx = gdir.grid.dx
+    dx = cfg.PARAMS['flowline_dx']
+    dx_meter = dx * map_dx
+    nx = int(df.dx.sum() / dx_meter)
+    dis_along_flowline = dx_meter / 2 + np.arange(nx) * dx_meter
+
+    while dis_along_flowline[-1] > df.index[-1]:
+        # do not extrapolate
+        dis_along_flowline = dis_along_flowline[:-1]
+
+    while dis_along_flowline[0] < df.index[0]:
+        # do not extrapolate
+        dis_along_flowline = dis_along_flowline[1:]
+
+    nx = len(dis_along_flowline)
+
+    # Interpolate the data we need
+    hgts = np.interp(dis_along_flowline, df.index, df['mean_elevation'])
+    widths_m = np.interp(dis_along_flowline, df.index, df['width'])
+
+    # Correct the widths - area preserving
+    area = np.sum(widths_m * dx_meter)
+    fac = gdir.rgi_area_m2 / area
+    log.debug('(%s) corrected widths with a factor %.2f', gdir.rgi_id, fac)
+    widths_m *= fac
+
+    # Write as a Centerline object
+    fl = Centerline(None, dx=dx, surface_h=hgts, rgi_id=gdir.rgi_id,
+                    map_dx=map_dx)
+    fl.order = 0
+    fl.widths = widths_m / map_dx
+    # TODO - this we don't know yet: rectangular for now
+    fl.is_rectangular = np.ones(nx, dtype=bool)
+
+    gdir.write_pickle([fl], 'inversion_flowlines')

@@ -33,33 +33,25 @@ Calibration data and testing: the ``~/.oggm`` directory
 At the first import, OGGM will create a cached ``.oggm`` directory in your
 ``$HOME`` folder. This directory contains all data obtained from the
 `oggm sample data`_ repository. It contains several files needed only for
-testing, but also some important files needed for calibration and validation.
-For example:
-
-- The CRU `baseline climatology`_ (CL v2.0, obtained from
-  `crudata.uea.ac.uk/ <https://crudata.uea.ac.uk/cru/data/hrg/>`_ and prepared
-  for OGGM),
-- The `reference mass-balance data`_ from WGMS with
-  `links to the respective RGI polygons`_,
-- The `reference ice thickness data`_ from WGMS (`GlaThiDa`_ database).
+testing, but also some important files needed for calibration and validation
+(e.g. the `reference mass-balance data`_ from WGMS with
+`links to the respective RGI polygons`_).
 
 .. _oggm sample data: https://github.com/OGGM/oggm-sample-data
-.. _baseline climatology: https://github.com/OGGM/oggm-sample-data/tree/master/cru
 .. _reference mass-balance data: https://github.com/OGGM/oggm-sample-data/tree/master/wgms
 .. _links to the respective RGI polygons: http://fabienmaussion.info/2017/02/19/wgms-rgi-links/
-.. _reference ice thickness data: https://github.com/OGGM/oggm-sample-data/tree/master/glathida
-.. _GlaThiDa: http://www.gtn-g.ch/data_catalogue_glathida/
 
 The ``~/.oggm`` directory should be updated automatically when you update OGGM,
 but if you encounter any problems with it, simply delete the directory (it will
 be re-downloaded automatically at the next import).
 
+.. _oggm-config:
 
 All other data: auto-downloads and the ``~/.oggm_config`` file
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Unlike runtime parameters (such as physical constants or working directories),
-the input data is shared accross runs and even accross computers if you want
+the input data is shared across runs and even across computers if you want
 to. Therefore, the paths to previously downloaded data are stored in a
 configuration file that you'll find in your ``$HOME`` folder:
 the ``~/.oggm_config`` file.
@@ -69,7 +61,6 @@ The file should look like::
     dl_cache_dir = /path/to/download_cache
     dl_cache_readonly = False
     tmp_dir = /path/to/tmp_dir
-    cru_dir = /path/to/cru_dir
     rgi_dir = /path/to/rgi_dir
     test_dir = /path/to/test_dir
     has_internet = True
@@ -80,31 +71,33 @@ Some explanations:
   downloaded will be cached for later use. Most of the users won't need to
   explore this folder (it is organized as a list of urls) but you have to make
   sure to set this path to a folder with sufficient disk space available. This
-  folder can be shared across computers if needed. Once a file is stored
-  in this cache folder, OGGM won't download it again.
+  folder can be shared across compute nodes if needed (it is even recommended
+  for HPC setups). Once a file is stored in this cache folder (e.g. a specific
+  DEM tile), OGGM won't download it again.
 - ``dl_cache_readonly`` indicates if writing is allowed in this folder (this is
   the default). Setting this to ``True`` will prevent any further download in
   this directory (useful for cluster environments, where this data might be
-  available on a readonly folder).
-- ``tmp_dir`` is a path to OGGM's temporary directory. Most of the topography
-  files used by OGGM are downloaded and cached in a compressed (zip) format.
-  They will be extracted in ``tmp_dir`` before use. OGGM will never allow more
-  than 100 ``.tif`` files to exist in this directory by deleting the oldest ones
+  available on a readonly folder): in this case, OGGM will use a fall back
+  directory in your current working directory.
+- ``tmp_dir`` is a path to OGGM's temporary directory. Most of the
+  files used by OGGM are downloaded and cached in a compressed format (zip,
+  bz, gz...).
+  These files are extracted in ``tmp_dir`` before use. OGGM will never allow more
+  than 100 ``.tif`` (or 100 ``.nc``) files to exist in this directory by
+  deleting the oldest ones
   following the rule of the `Least Recently Used (LRU)`_ item. Nevertheless,
   this directory might still grow to quite a large size. Simply delete it
   if you want to get this space back.
-- ``cru_dir`` is the location where the CRU climate files are extracted if
-  needed. They are quite large! (approx. 6Gb)
 - ``rgi_dir`` is the location where the RGI shapefiles are extracted.
 - ``test_dir`` is the location where OGGM will write some of its output during
   tests. It can be set to ``tmp_dir`` if you want to, but it can also be
-  another directory (for example a fast SSD disk). This folder shouldn't become
-  too large but here again, don't hesitate to delete it if you need to.
+  another directory (for example a fast SSD disk). This folder shouldn't take
+  too much disk space but here again, don't hesitate to delete it if you need to.
 
 .. note::
 
-  For advanced users or cluster configuration:
-  ``tmp_dir``, ``cru_dir`` and ``rgi_dir`` can be overridden and set to a
+  For advanced users or cluster configuration: the user's
+  ``tmp_dir`` and ``rgi_dir`` settings can be overridden and set to a
   specific directory by defining an environment variable ``OGGM_EXTRACT_DIR``
   to a directory path. Similarly, the environment variables
   ``OGGM_DOWNLOAD_CACHE`` and ``OGGM_DOWNLOAD_CACHE_RO`` override the
@@ -126,7 +119,7 @@ of the current stable OGGM version. If you want to change these parameters,
 you'll have to do a full run from scratch using the :ref:`rawdata`.
 
 To start from a pre-processed state, simply use the
-:py:func:`workflow.init_glacier_regions` function with the
+:py:func:`workflow.init_glacier_directories` function with the
 ``from_prepro_level`` and ``prepro_border`` keyword arguments set to the
 values of your choice.
 
@@ -177,9 +170,9 @@ Here is an example with the Hintereisferner in the Alps:
 
     f, axs = plt.subplots(2, 2, figsize=(8, 6))
     for ax, border in zip(np.array(axs).flatten(), [10, 80, 160, 250]):
-        gdir = workflow.init_glacier_regions('RGI60-11.00897',
-                                             from_prepro_level=1,
-                                             prepro_border=border)
+        gdir = workflow.init_glacier_directories('RGI60-11.00897',
+                                                 from_prepro_level=1,
+                                                 prepro_border=border)
         graphics.plot_domain(gdir, ax=ax, title='Border: {}'.format(border),
                              add_colorbar=False,
                              lonlat_contours_kwargs={'add_tick_labels':False})
@@ -228,6 +221,8 @@ These data are used to create the pre-processed directories explained above.
 If you want to run your own workflow from A to Z, or if you would like
 to know which data are used in OGGM, read further!
 
+.. _outlines:
+
 Glacier outlines and intersects
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -237,7 +232,8 @@ and type:
 
 .. code-block:: python
 
-    from oggm import utils
+    from oggm import cfg, utils
+    cfg.initialize()
     utils.get_rgi_intersects_dir()
     utils.get_rgi_dir()
 
@@ -252,7 +248,69 @@ determine which bed shape should be used (rectangular or parabolic). See the
 `rgi tools <https://rgitools.readthedocs.io/en/latest/tools.html#glacier-intersects>`_
 documentation for more information about the intersects.
 
+The following table summarizes the attributes from the RGI used by OGGM. It
+can be useful to refer to this list if you use your own glacier outlines
+with OGGM.
+
+==================  ===========================  ======================
+RGI attribute       Equivalent OGGM variable     Comments
+==================  ===========================  ======================
+RGIId               ``gdir.rgi_id``              [#f1]_
+GLIMSId             ``gdir.glims_id``            not used
+CenLon              ``gdir.cenlon``              [#f2]_
+CenLat              ``gdir.cenlat``              [#f2]_
+O1Region            ``gdir.rgi_region``          not used
+O2Region            ``gdir.rgi_subregion``       not used
+Name                ``gdir.name``                used for graphics only
+BgnDate             ``gdir.rgi_date``            [#f3]_
+Form                ``gdir.glacier_type``        [#f4]_
+TermType            ``gdir.terminus_type``       [#f5]_
+Status              ``gdir.status``              [#f6]_
+Area                ``gdir.rgi_area_km2``        [#f7]_
+Zmin                ``glacier_statistics.csv``   recomputed by OGGM
+Zmax                ``glacier_statistics.csv``   recomputed by OGGM
+Zmed                ``glacier_statistics.csv``   recomputed by OGGM
+Slope               ``glacier_statistics.csv``   recomputed by OGGM
+Aspect              ``glacier_statistics.csv``   recomputed by OGGM
+Lmax                ``glacier_statistics.csv``   recomputed by OGGM
+Connect             not included
+Surging             not included
+Linkages            not included
+EndDate             not included
+==================  ===========================  ======================
+
+For Greenland and Antarctica, OGGM does not take into account the
+connectivity level between the Glaciers and the Ice sheets.
+We recommend to the users to think about this before they
+run the task: ``workflow.init_glacier_directories``.
+
 .. _Randolph Glacier Inventory (RGI): https://www.glims.org/RGI/
+
+.. rubric:: Comments
+
+.. [#f1] The RGI id needs to be unique for each entity. It should resemble the
+         RGI, but can have longer ids. Here are example of valid IDs:
+         ``RGI60-11.00897``, ``RGI60-11.00897a``, ``RGI60-11.00897_d01``.
+.. [#f2] ``CenLon`` and ``CenLat`` are used to center the glacier local map and DEM.
+.. [#f3] The date is the acquisition year, stored as an integer.
+.. [#f4] Glacier type: ``'Glacier'``, ``'Ice cap'``, ``'Perennial snowfield'``,
+         ``'Seasonal snowfield'``, ``'Not assigned'``. Ice caps are treated
+         differently than glaciers in OGGM: we force use a single flowline
+         instead of multiple ones.
+.. [#f5] Terminus type: ``'Land-terminating'``, ``'Marine-terminating'``,
+         ``'Lake-terminating'``, ``'Dry calving'``, ``'Regenerated'``,
+         ``'Shelf-terminating'``, ``'Not assigned'``. Marine and Lake
+         terminating are classified as "tidewater" in OGGM and cannot advance
+         - they "calve" instead, using a very simple parameterisation.
+.. [#f6] Glacier status: ``'Glacier or ice cap'``, ``'Glacier complex'``,
+         ``'Nominal glacier'``, ``'Not assigned'``. Nominal glaciers fail at
+         the "Glacier Mask" processing step in OGGM.
+.. [#f7] The area of OGGM's flowline glaciers is corrected to the one provided
+         by the RGI, for area conservation and inter-comparison reasons. If
+         you do not want to use the RGI area but the one computed from the
+         shape geometry in the local OGGM map projection instead, set
+         ``cfg.PARAMS['use_rgi_area']`` to ``False``. This is useful when
+         using homemade inventories.
 
 
 Topography data
@@ -305,30 +363,10 @@ respectively). If the chosen spatial resolution is larger than 200 m
     #   print(v)
 
 **Important:** when using these data sources for your OGGM runs, please refer
-to the original data provider of the data! OGGM will add a ``dem_source.txt``
+to the original data provider of the data! OGGM adds a ``dem_source.txt``
 file in each glacier directory specifying how to cite these data. We
-reproduce this information here:
-
-
-SRTM V4
-    Jarvis A., H.I. Reuter, A.  Nelson, E. Guevara, 2008, Hole-filled seamless SRTM data V4,
-    International  Centre for Tropical  Agriculture (CIAT),
-    available  from http://srtm.csi.cgiar.org.
-
-RAMP V2
-    Liu, H., K. C. Jezek, B. Li, and Z. Zhao. 2015.
-    Radarsat Antarctic Mapping Project Digital Elevation Model, Version 2.
-    Boulder, Colorado USA. NASA National Snow and Ice Data Center Distributed Active Archive Center.
-    doi: https://doi.org/10.5067/8JKNEW6BFRVD.
-
-GIMP V1.1
-    Howat, I., A. Negrete, and B. Smith. 2014.
-    The Greenland Ice Mapping Project (GIMP) land classification and surface
-    elevation data sets, The Cryosphere. 8. 1509-1518.
-    https://doi.org/10.5194/tc-8-1509-2014
-
-VIEWFINDER PANORAMAS DEMs
-    There is no recommended citation for these data. Please refer to the website above in case of doubt.
+reproduce this information
+`here <https://github.com/OGGM/oggm/blob/master/oggm/data/dem_sources.txt>`_.
 
 .. warning::
 
@@ -337,7 +375,15 @@ VIEWFINDER PANORAMAS DEMs
     or they are left unnoticed. The importance of reliable topographic data for
     global glacier modelling cannot be emphasized enough, and it is a pity
     that no consistent, global DEM is yet available for scientific use.
+    Visit `rgitools <https://rgitools.readthedocs.io/en/latest/dems.html>`_
+    for a discussion about our current efforts to find "the best" DEMs.
 
+.. note::
+
+    `In this blogpost <https://oggm.org/2019/10/08/dems/>`_ we talk about which
+    requirements a DEM must fulfill to be helpful to OGGM. And we also explain
+    why and how we preprocess certain DEMs before we make them available to the
+    OGGM workflow.
 
 Climate data
 ~~~~~~~~~~~~
@@ -352,19 +398,20 @@ data provided by the Climatic Research Unit of the University of East Anglia.
 **‣ CRU (default)**
 
 If not specified otherwise, OGGM will automatically download and unpack the
-latest dataset from the CRU servers. We recommend to do this before your
-first run. In a python interpreter, type:
+latest dataset from the CRU servers. To download them you can use the
+following convenience functions:
 
 .. code-block:: python
 
-    from oggm import utils
-    utils.get_cru_file(var='tmp')
-    utils.get_cru_file(var='pre')
+    from oggm.shop import cru
+    cru.get_cl_file()
+    cru.get_cru_file(var='tmp')
+    cru.get_cru_file(var='pre')
 
 
 .. warning::
 
-    While the downloaded zip files are ~370mb in size, they are ~5.6Gb large
+    While each downloaded zip file is ~200mb in size, they are ~2.9Gb large
     after decompression!
 
 The raw, coarse (0.5°) dataset is then downscaled to a higher resolution grid
@@ -412,7 +459,7 @@ Mass-balance data
 ~~~~~~~~~~~~~~~~~
 
 In-situ mass-balance data is used by OGGM to calibrate and validate the
-mass-balance model. We reliy on mass-balance observations provided by the
+mass-balance model. We rely on mass-balance observations provided by the
 World Glacier Monitoring Service (`WGMS`_).
 The `Fluctuations of Glaciers (FoG)`_ database contains annual mass-balance
 values for several hundreds of glaciers worldwide. We exclude water-terminating
@@ -420,7 +467,7 @@ glaciers and the time series with less than five years of
 data.
 Since 2017, the WGMS provides a lookup table
 linking the RGI and the WGMS databases. We updated this list for version 6 of
-the RGI, leaving us with 254 mass balance time series. These are not equally
+the RGI, leaving us with 268 mass balance time series. These are not equally
 reparted over the globe:
 
 .. figure:: _static/wgms_rgi_map.png
@@ -436,8 +483,9 @@ have access to the timeseries through the glacier directory:
 
 .. ipython:: python
 
-    gdir = workflow.init_glacier_regions('RGI60-11.00897', from_prepro_level=4,
-                                         prepro_border=10)[0]
+    gdir = workflow.init_glacier_directories('RGI60-11.00897',
+                                             from_prepro_level=4,
+                                             prepro_border=10)[0]
     mb = gdir.get_ref_mb_data()
     @savefig plot_ref_mbdata.png width=100%
     mb[['ANNUAL_BALANCE']].plot(title='WGMS data: Hintereisferner')
@@ -445,4 +493,4 @@ have access to the timeseries through the glacier directory:
 
 .. _WGMS: https://wgms.ch
 .. _Fluctuations of Glaciers (FoG): https://wgms.ch/data_databaseversions/
-.. _GMD Paper: https://www.geosci-model-dev-discuss.net/gmd-2018-9/
+.. _GMD Paper: https://www.geosci-model-dev.net/12/909/2019/

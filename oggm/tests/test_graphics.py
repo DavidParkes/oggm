@@ -4,13 +4,15 @@ import pytest
 import shutil
 
 import os
-import geopandas as gpd
 import matplotlib.pyplot as plt
+
+salem = pytest.importorskip('salem')
+gpd = pytest.importorskip('geopandas')
 
 # Local imports
 import oggm.utils
 from oggm.tests import mpl_image_compare
-from oggm.tests.funcs import init_hef, get_test_dir, patch_url_retrieve_github
+from oggm.tests.funcs import init_hef, get_test_dir
 from oggm import graphics
 from oggm.core import (gis, inversion, climate, centerlines, flowline,
                        massbalance)
@@ -25,16 +27,14 @@ warnings.filterwarnings("ignore", category=UserWarning,
 
 # Globals
 pytestmark = pytest.mark.test_env("graphics")
-_url_retrieve = None
 
 
-def setup_module(module):
-    module._url_retrieve = utils.oggm_urlretrieve
-    oggm.utils._downloads.oggm_urlretrieve = patch_url_retrieve_github
+def setup_module():
+    graphics.set_oggm_cmaps(use_hcl=False)
 
 
-def teardown_module(module):
-    oggm.utils._downloads.oggm_urlretrieve = module._url_retrieve
+def teardown_module():
+    graphics.set_oggm_cmaps()
 
 # ----------------------------------------------------------
 # Lets go
@@ -42,7 +42,7 @@ def teardown_module(module):
 
 @pytest.mark.internet
 @pytest.mark.graphic
-@mpl_image_compare()
+@mpl_image_compare(tolerance=25)
 def test_googlemap():
     fig, ax = plt.subplots()
     gdir = init_hef()
@@ -68,6 +68,17 @@ def test_centerlines():
     fig, ax = plt.subplots()
     gdir = init_hef()
     graphics.plot_centerlines(gdir, ax=ax)
+    fig.tight_layout()
+    return fig
+
+
+@pytest.mark.graphic
+@mpl_image_compare(multi=True)
+def test_raster():
+    fig, ax = plt.subplots()
+    gdir = init_hef()
+    gis.gridded_attributes(gdir)
+    graphics.plot_raster(gdir, var_name='aspect', cmap='twilight', ax=ax)
     fig.tight_layout()
     return fig
 
@@ -148,7 +159,7 @@ def test_multiple_inversion():
     hef_rgi = gpd.read_file(get_demo_file('divides_hef.shp'))
     hef_rgi.loc[0, 'RGIId'] = 'RGI50-11.00897'
 
-    gdirs = workflow.init_glacier_regions(hef_rgi)
+    gdirs = workflow.init_glacier_directories(hef_rgi)
     workflow.gis_prepro_tasks(gdirs)
     workflow.climate_tasks(gdirs)
     workflow.inversion_tasks(gdirs)
@@ -161,7 +172,7 @@ def test_multiple_inversion():
 
 
 @pytest.mark.graphic
-@mpl_image_compare()
+@mpl_image_compare(multi=True)
 def test_modelsection():
 
     gdir = init_hef()
@@ -226,7 +237,7 @@ def test_multiple_models():
     hef_rgi = gpd.read_file(get_demo_file('divides_hef.shp'))
     hef_rgi.loc[0, 'RGIId'] = 'RGI50-11.00897'
 
-    gdirs = workflow.init_glacier_regions(hef_rgi)
+    gdirs = workflow.init_glacier_directories(hef_rgi)
     workflow.gis_prepro_tasks(gdirs)
     workflow.climate_tasks(gdirs)
     workflow.inversion_tasks(gdirs)
@@ -296,7 +307,7 @@ def test_chhota_shigri():
     df['Area'] = df.Area * 1e-6  # cause it was in m2
     df['RGIId'] = ['RGI50-14.15990' + d for d in ['_d01', '_d02']]
 
-    gdirs = workflow.init_glacier_regions(df)
+    gdirs = workflow.init_glacier_directories(df)
     workflow.gis_prepro_tasks(gdirs)
     for gdir in gdirs:
         climate.apparent_mb_from_linear_mb(gdir)
@@ -335,7 +346,7 @@ def test_ice_cap():
     df['Area'] = df.Area * 1e-6  # cause it was in m2
     df['RGIId'] = ['RGI50-05.08389_d{:02d}'.format(d+1) for d in df.index]
 
-    gdirs = workflow.init_glacier_regions(df)
+    gdirs = workflow.init_glacier_directories(df)
     workflow.gis_prepro_tasks(gdirs)
 
     from salem import mercator_grid, Map
@@ -351,6 +362,7 @@ def test_ice_cap():
     return fig
 
 
+@pytest.mark.xfail
 @pytest.mark.graphic
 @mpl_image_compare(multi=True)
 def test_coxe():
@@ -370,7 +382,7 @@ def test_coxe():
     entity = gpd.read_file(hef_file).iloc[0]
 
     gdir = oggm.GlacierDirectory(entity, base_dir=testdir, reset=True)
-    gis.define_glacier_region(gdir, entity=entity)
+    gis.define_glacier_region(gdir)
     gis.glacier_masks(gdir)
     centerlines.compute_centerlines(gdir)
     centerlines.initialize_flowlines(gdir)

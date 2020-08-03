@@ -3,12 +3,11 @@
    Adapted from the Python Packaging Authority template."""
 
 from setuptools import setup, find_packages  # Always prefer setuptools
-import versioneer
 
 
 DISTNAME = 'oggm'
-LICENSE = 'GPLv3+'
-AUTHOR = 'oggm Developers'
+LICENSE = 'BSD-3-Clause'
+AUTHOR = 'OGGM Contributors'
 AUTHOR_EMAIL = 'fabien.maussion@uibk.ac.at'
 URL = 'http://oggm.org'
 CLASSIFIERS = [
@@ -17,12 +16,11 @@ CLASSIFIERS = [
         'Development Status :: 4 - Beta',
         # Indicate who your project is intended for
         'Intended Audience :: Science/Research',
-        'License :: OSI Approved :: GNU General Public License ' +
-        'v3 or later (GPLv3+)',
+        'License :: OSI Approved :: BSD License',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.4',
         'Programming Language :: Python :: 3.5',
         'Programming Language :: Python :: 3.6',
+        'Programming Language :: Python :: 3.7',
     ]
 
 DESCRIPTION = 'Open Global Glacier Model'
@@ -45,34 +43,24 @@ Links
 
 req_packages = ['numpy',
                 'scipy',
-                'pyproj',
                 'pandas',
-                'GDAL',
-                'geopandas',
-                'fiona',
                 'matplotlib>=2.0.0',
-                'scikit-image',
-                'Pillow',
-                'joblib',
-                'netCDF4',
                 'shapely',
-                'rasterio',
-                'configobj',
-                'pytest',
-                'xarray',
-                'progressbar2',
-                'boto3',
                 'requests',
-                'salem']
+                'configobj',
+                'netcdf4',
+                'xarray',
+                ]
 
 
 setup(
     # Project info
     name=DISTNAME,
-    version=versioneer.get_version(),
-    cmdclass=versioneer.get_cmdclass(),
     description=DESCRIPTION,
     long_description=LONG_DESCRIPTION,
+    # Version info
+    setup_requires=['setuptools_scm', 'setuptools_scm_git_archive'],
+    use_scm_version=True,
     # The project's main homepage.
     url=URL,
     # Author details
@@ -99,7 +87,7 @@ setup(
         'console_scripts': [
             'oggm_prepro = oggm.cli.prepro_levels:main',
             'oggm_benchmark = oggm.cli.benchmark:main',
-            'oggm_tdmdem90_login = oggm.cli.tdmdem90_login:main',
+            'oggm_netrc_credentials = oggm.cli.netrc_credentials:cli',
         ],
     },
 )

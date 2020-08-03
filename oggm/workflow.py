@@ -5,7 +5,7 @@ import os
 from shutil import rmtree
 from collections.abc import Sequence
 # External libs
-import multiprocessing as mp
+import multiprocessing
 import numpy as np
 
 # Locals
@@ -38,25 +38,21 @@ def init_mp_pool(reset=False):
     global _mp_pool
     if _mp_pool and not reset:
         return _mp_pool
+
     cfg.CONFIG_MODIFIED = False
     if _mp_pool and reset:
         _mp_pool.terminate()
         _mp_pool = None
+
+    if cfg.PARAMS['use_mp_spawn']:
+        mp = multiprocessing.get_context('spawn')
+    else:
+        mp = multiprocessing
+
     cfg_contents = cfg.pack_config()
     global_lock = mp.Manager().Lock()
+
     mpp = cfg.PARAMS['mp_processes']
-    if mpp == -1:
-        try:
-            mpp = int(os.environ['SLURM_JOB_CPUS_PER_NODE'])
-            log.workflow('Multiprocessing: using slurm allocated '
-                         'processors (N={})'.format(mpp))
-        except KeyError:
-            mpp = mp.cpu_count()
-            log.workflow('Multiprocessing: using all available '
-                         'processors (N={})'.format(mpp))
-    else:
-        log.workflow('Multiprocessing: using the requested number of '
-                     'processors (N={})'.format(mpp))
     _mp_pool = mp.Pool(mpp, initializer=_init_pool_globals,
                        initargs=(cfg_contents, global_lock))
     return _mp_pool
@@ -121,11 +117,8 @@ def execute_entity_task(task, gdirs, **kwargs):
         the glacier directories to process
     """
 
-    # If not iterable it's ok
-    try:
-        len(gdirs)
-    except TypeError:
-        gdirs = [gdirs]
+    # Should be iterable
+    gdirs = utils.tolist(gdirs)
 
     if len(gdirs) == 0:
         return
@@ -186,13 +179,13 @@ def execute_parallel_tasks(gdir, tasks):
         mppool = init_mp_pool(cfg.CONFIG_MODIFIED)
         mppool.map(pc, _tasks, chunksize=1)
     else:
-        for task in _tasks:
-            task()
+        for task, (gd, kw) in _tasks:
+            task(gd, **kw)
 
 
 def gdir_from_prepro(entity, from_prepro_level=None,
                      prepro_border=None, prepro_rgi_version=None,
-                     check_demo_glacier=False):
+                     check_demo_glacier=False, base_url=None):
 
     if prepro_border is None:
         prepro_border = int(cfg.PARAMS['border'])
@@ -203,26 +196,25 @@ def gdir_from_prepro(entity, from_prepro_level=None,
     except AttributeError:
         rid = entity
 
-    demo_url = False
-    if check_demo_glacier:
+    if check_demo_glacier and base_url is None:
         demo_id = utils.demo_glacier_id(rid)
         if demo_id is not None:
             rid = demo_id
             entity = demo_id
-            demo_url = True
+            base_url = utils.DEMO_GDIR_URL
 
     tar_base = utils.get_prepro_gdir(prepro_rgi_version, rid, prepro_border,
-                                     from_prepro_level, demo_url=demo_url)
+                                     from_prepro_level, base_url=base_url)
     from_tar = os.path.join(tar_base.replace('.tar', ''), rid + '.tar.gz')
     return oggm.GlacierDirectory(entity, from_tar=from_tar)
 
 
 def init_glacier_regions(rgidf=None, *, reset=False, force=False,
                          from_prepro_level=None, prepro_border=None,
-                         prepro_rgi_version=None,
+                         prepro_rgi_version=None, prepro_base_url=None,
                          from_tar=False, delete_tar=False,
                          use_demo_glaciers=None):
-    """Initializes the list of Glacier Directories for this run.
+    """DEPRECATED: Initializes the list of Glacier Directories for this run.
 
     This is the very first task to do (always). If the directories are already
     available in the working directory, use them. If not, create new ones.
@@ -247,10 +239,14 @@ def init_glacier_regions(rgidf=None, *, reset=False, force=False,
     prepro_rgi_version : str
         for `from_prepro_level` only: if you want to override the default
         behavior which is to use `cfg.PARAMS['rgi_version']`
+    prepro_base_url : str
+        for `from_prepro_level` only: if you want to override the default
+        URL from which to download the gdirs. Default currently is
+        https://cluster.klima.uni-bremen.de/~oggm/gdirs/oggm_v1.1/
     use_demo_glaciers : bool
         whether to check the demo glaciers for download (faster than the
         standard prepro downloads). The default is to decide whether or
-        not to check based on simple crietria such as glacier list size.
+        not to check based on simple criteria such as glacier list size.
     from_tar : bool, default=False
         extract the gdir data from a tar file. If set to `True`,
         will check for a tar file at the expected location in `base_dir`.
@@ -263,6 +259,13 @@ def init_glacier_regions(rgidf=None, *, reset=False, force=False,
     -------
     gdirs : list of :py:class:`oggm.GlacierDirectory` objects
         the initialised glacier directories
+
+    Notes
+    -----
+    This task is deprecated in favor of the more explicit
+    init_glacier_directories. Indeed, init_glacier_directories is very
+    similar to init_glacier_regions, but it does not process the DEMs:
+    a glacier directory is valid also without DEM.
     """
 
     if reset and not force:
@@ -312,31 +315,176 @@ def init_glacier_regions(rgidf=None, *, reset=False, force=False,
             log.workflow('init_glacier_regions from prepro level {} on '
                          '{} glaciers.'.format(from_prepro_level,
                                                len(entities)))
+            # Read the hash dictionary before we use multiproc
+            if cfg.PARAMS['dl_verify']:
+                utils.get_dl_verify_data('cluster.klima.uni-bremen.de')
             gdirs = execute_entity_task(gdir_from_prepro, entities,
                                         from_prepro_level=from_prepro_level,
                                         prepro_border=prepro_border,
                                         prepro_rgi_version=prepro_rgi_version,
-                                        check_demo_glacier=use_demo_glaciers)
+                                        check_demo_glacier=use_demo_glaciers,
+                                        base_url=prepro_base_url)
         else:
-            # TODO: if necessary this could use multiprocessing as well
-            for entity in entities:
-                gdir = oggm.GlacierDirectory(entity, reset=reset,
-                                             from_tar=from_tar,
-                                             delete_tar=delete_tar)
+            # We can set the intersects file automatically here
+            if (cfg.PARAMS['use_intersects'] and
+                    len(cfg.PARAMS['intersects_gdf']) == 0):
+                rgi_ids = np.unique(np.sort([entity.RGIId for entity in
+                                             entities]))
+                rgi_version = rgi_ids[0].split('-')[0][-2:]
+                fp = utils.get_rgi_intersects_entities(rgi_ids,
+                                                       version=rgi_version)
+                cfg.set_intersects_db(fp)
+
+            gdirs = execute_entity_task(utils.GlacierDirectory, entities,
+                                        reset=reset,
+                                        from_tar=from_tar,
+                                        delete_tar=delete_tar)
+
+            for gdir in gdirs:
                 if not os.path.exists(gdir.get_filepath('dem')):
-                    new_gdirs.append((gdir, dict(entity=entity)))
-                gdirs.append(gdir)
+                    new_gdirs.append(gdir)
 
-    # We can set the intersects file automatically here
-    if (cfg.PARAMS['use_intersects'] and new_gdirs and
-            (len(cfg.PARAMS['intersects_gdf']) == 0)):
-        rgi_ids = np.unique(np.sort([t[0].rgi_id for t in new_gdirs]))
-        rgi_version = new_gdirs[0][0].rgi_version
-        fp = utils.get_rgi_intersects_entities(rgi_ids, version=rgi_version)
-        cfg.set_intersects_db(fp)
+    if len(new_gdirs) > 0:
+        # If not initialized, run the task in parallel
+        execute_entity_task(tasks.define_glacier_region, new_gdirs)
 
-    # If not initialized, run the task in parallel
-    execute_entity_task(tasks.define_glacier_region, new_gdirs)
+    return gdirs
+
+
+def init_glacier_directories(rgidf=None, *, reset=False, force=False,
+                             from_prepro_level=None, prepro_border=None,
+                             prepro_rgi_version=None, prepro_base_url=None,
+                             from_tar=False, delete_tar=False,
+                             use_demo_glaciers=None):
+    """Initializes the list of Glacier Directories for this run.
+
+    This is the very first task to do (always). If the directories are already
+    available in the working directory, use them. If not, create new ones.
+
+    Parameters
+    ----------
+    rgidf : GeoDataFrame or list of ids, optional for pre-computed runs
+        the RGI glacier outlines. If unavailable, OGGM will parse the
+        information from the glacier directories found in the working
+        directory. It is required for new runs.
+    reset : bool
+        delete the existing glacier directories if found.
+    force : bool
+        setting `reset=True` will trigger a yes/no question to the user. Set
+        `force=True` to avoid this.
+    from_prepro_level : int
+        get the gdir data from the official pre-processed pool. See the
+        documentation for more information
+    prepro_border : int
+        for `from_prepro_level` only: if you want to override the default
+        behavior which is to use `cfg.PARAMS['border']`
+    prepro_rgi_version : str
+        for `from_prepro_level` only: if you want to override the default
+        behavior which is to use `cfg.PARAMS['rgi_version']`
+    prepro_base_url : str
+        for `from_prepro_level` only: if you want to override the default
+        URL from which to download the gdirs. Default currently is
+        https://cluster.klima.uni-bremen.de/~fmaussion/gdirs/oggm_v1.1/
+    use_demo_glaciers : bool
+        whether to check the demo glaciers for download (faster than the
+        standard prepro downloads). The default is to decide whether or
+        not to check based on simple criteria such as glacier list size.
+    from_tar : bool, default=False
+        extract the gdir data from a tar file. If set to `True`,
+        will check for a tar file at the expected location in `base_dir`.
+    delete_tar : bool, default=False
+        delete the original tar file after extraction.
+
+    Returns
+    -------
+    gdirs : list of :py:class:`oggm.GlacierDirectory` objects
+        the initialised glacier directories
+
+    Notes
+    -----
+    This task is very similar to init_glacier_regions, with one main
+    difference: it does not process the DEMs for this glacier.
+    Eventually, init_glacier_regions will be deprecated and removed from the
+    codebase.
+    """
+
+    if reset and not force:
+        reset = utils.query_yes_no('Delete all glacier directories?')
+
+    if prepro_border is None:
+        prepro_border = int(cfg.PARAMS['border'])
+
+    if from_prepro_level and prepro_border not in [10, 80, 160, 250]:
+        if 'test' not in utils._downloads.GDIR_URL:
+            raise InvalidParamsError("prepro_border or cfg.PARAMS['border'] "
+                                     "should be one of: 10, 80, 160, 250.")
+
+    # if reset delete also the log directory
+    if reset:
+        fpath = os.path.join(cfg.PATHS['working_dir'], 'log')
+        if os.path.exists(fpath):
+            rmtree(fpath)
+
+    if rgidf is None:
+        # Infer the glacier directories from folders available in working dir
+        if reset:
+            raise ValueError('Cannot use reset without setting rgidf')
+        log.workflow('init_glacier_directories by parsing all available '
+                     'folders (this takes time: if possible, provide rgidf '
+                     'instead).')
+        # The dirs should be there already
+        gl_dir = os.path.join(cfg.PATHS['working_dir'], 'per_glacier')
+        gdirs = []
+        for root, _, files in os.walk(gl_dir):
+            if files and ('outlines.shp' in files or
+                          'outlines.tar.gz' in files):
+                gdirs.append(oggm.GlacierDirectory(os.path.basename(root)))
+    else:
+        # Create glacier directories from input
+        # Check if dataframe or list of str
+        try:
+            entities = []
+            for _, entity in rgidf.iterrows():
+                entities.append(entity)
+        except AttributeError:
+            entities = utils.tolist(rgidf)
+
+        # Check demo
+        if use_demo_glaciers is None:
+            use_demo_glaciers = len(entities) < 100
+
+        if from_prepro_level is not None:
+            log.workflow('init_glacier_directories from prepro level {} on '
+                         '{} glaciers.'.format(from_prepro_level,
+                                               len(entities)))
+            # Read the hash dictionary before we use multiproc
+            if cfg.PARAMS['dl_verify']:
+                utils.get_dl_verify_data('cluster.klima.uni-bremen.de')
+            gdirs = execute_entity_task(gdir_from_prepro, entities,
+                                        from_prepro_level=from_prepro_level,
+                                        prepro_border=prepro_border,
+                                        prepro_rgi_version=prepro_rgi_version,
+                                        check_demo_glacier=use_demo_glaciers,
+                                        base_url=prepro_base_url)
+        else:
+            # We can set the intersects file automatically here
+            if (cfg.PARAMS['use_intersects'] and
+                    len(cfg.PARAMS['intersects_gdf']) == 0):
+                try:
+                    rgi_ids = np.unique(np.sort([entity.RGIId for entity in
+                                                 entities]))
+                    rgi_version = rgi_ids[0].split('-')[0][-2:]
+                    fp = utils.get_rgi_intersects_entities(rgi_ids,
+                                                           version=rgi_version)
+                    cfg.set_intersects_db(fp)
+                except AttributeError:
+                    # List of str
+                    pass
+
+            gdirs = execute_entity_task(utils.GlacierDirectory, entities,
+                                        reset=reset,
+                                        from_tar=from_tar,
+                                        delete_tar=delete_tar)
 
     return gdirs
 
@@ -351,6 +499,7 @@ def gis_prepro_tasks(gdirs):
     """
 
     task_list = [
+        tasks.define_glacier_region,
         tasks.glacier_masks,
         tasks.compute_centerlines,
         tasks.initialize_flowlines,
@@ -374,23 +523,8 @@ def climate_tasks(gdirs):
         the glacier directories to process
     """
 
-    # If not iterable it's ok
-    try:
-        len(gdirs)
-    except TypeError:
-        gdirs = [gdirs]
-
-    # Which climate should we use?
-    if cfg.PARAMS['baseline_climate'] == 'CRU':
-        _process_task = tasks.process_cru_data
-    elif cfg.PARAMS['baseline_climate'] == 'CUSTOM':
-        _process_task = tasks.process_custom_climate_data
-    elif cfg.PARAMS['baseline_climate'] == 'HISTALP':
-        _process_task = tasks.process_histalp_data
-    else:
-        raise ValueError('baseline_climate parameter not understood')
-
-    execute_entity_task(_process_task, gdirs)
+    # Process climate data
+    execute_entity_task(tasks.process_climate_data, gdirs)
 
     # Then, calibration?
     if cfg.PARAMS['run_mb_calibration']:
@@ -409,29 +543,105 @@ def inversion_tasks(gdirs):
     gdirs : list of :py:class:`oggm.GlacierDirectory` objects
         the glacier directories to process
     """
-    # Init
-    execute_entity_task(tasks.prepare_for_inversion, gdirs)
 
-    # Inversion for all glaciers
-    execute_entity_task(tasks.mass_conservation_inversion, gdirs)
+    if cfg.PARAMS['use_kcalving_for_inversion']:
+        # Differentiate between calving and non-calving glaciers
+        gdirs_nc = []
+        gdirs_c = []
+        for gd in gdirs:
+            if gd.is_tidewater:
+                gdirs_c.append(gd)
+            else:
+                gdirs_nc.append(gd)
 
-    # Filter
-    execute_entity_task(tasks.filter_inversion_output, gdirs)
+        if gdirs_nc:
+            execute_entity_task(tasks.prepare_for_inversion, gdirs_nc)
+            execute_entity_task(tasks.mass_conservation_inversion, gdirs_nc)
+            execute_entity_task(tasks.filter_inversion_output, gdirs_nc)
+
+        if gdirs_c:
+            execute_entity_task(tasks.find_inversion_calving, gdirs_c)
+    else:
+        execute_entity_task(tasks.prepare_for_inversion, gdirs)
+        execute_entity_task(tasks.mass_conservation_inversion, gdirs)
+        execute_entity_task(tasks.filter_inversion_output, gdirs)
 
 
-def merge_glacier_tasks(gdirs, main_rgi_ids, glcdf=None,
-                        filename='climate_monthly', input_filesuffix=''):
+def merge_glacier_tasks(gdirs, main_rgi_id=None, return_all=False, buffer=None,
+                        **kwargs):
     """Shortcut function: run all tasks to merge tributaries to a main glacier
-
-    TODO - Automatic search for tributary glaciers
-    TODO - Every tributary should only be used once
 
     Parameters
     ----------
     gdirs : list of :py:class:`oggm.GlacierDirectory`
         all glaciers, main and tributary. Preprocessed and initialised
-    main_rgi_ids: list of str
-        RGI IDs of the main glaciers of interest
+    main_rgi_id: str
+        RGI ID of the main glacier of interest. If None is provided merging
+        will start based uppon the largest glacier
+    return_all : bool
+        if main_rgi_id is given and return_all = False: only the main glaicer
+        is returned
+        if main_rgi_is given and return_all = True, the main glacier and every
+        remaining glacier from the initial gdirs list is returned, possible
+        merged as well.
+    buffer : float
+        buffer around a flowline to first better find an overlap with another
+        flowline. And second assure some distance between the lines at a
+        junction. Will default to `cfg.PARAMS['kbuffer']`.
+    kwargs: keyword argument for the recursive merging
+
+    Returns
+    -------
+    merged_gdirs: list of all merged :py:class:`oggm.GlacierDirectory`
+    """
+
+    if len(gdirs) > 100:
+        raise InvalidParamsError('this could take time! I should include an '
+                                 'optional parameter to ignore this.')
+
+    # sort all glaciers descending by area
+    gdirs.sort(key=lambda x: x.rgi_area_m2, reverse=True)
+
+    # if main glacier is asked, put it in first position
+    if main_rgi_id is not None:
+        gdir_main = [gd for gd in gdirs if gd.rgi_id == main_rgi_id][0]
+        gdirs.remove(gdir_main)
+        gdirs = [gdir_main] + gdirs
+
+    merged_gdirs = []
+    while len(gdirs) > 1:
+        # main glacier is always the first: either given or the largest one
+        gdir_main = gdirs.pop(0)
+        gdir_merged, gdirs = _recursive_merging(gdirs, gdir_main, **kwargs)
+        merged_gdirs.append(gdir_merged)
+
+    # now we have gdirs which contain all the necessary flowlines,
+    # time to clean them up
+    for gdir in merged_gdirs:
+        flowline.clean_merged_flowlines(gdir, buffer=buffer)
+
+    if main_rgi_id is not None and return_all is False:
+        return [gd for gd in merged_gdirs if main_rgi_id in gd.rgi_id][0]
+
+    # add the remaining glacier to the final list
+    merged_gdirs = merged_gdirs + gdirs
+
+    return merged_gdirs
+
+
+def _recursive_merging(gdirs, gdir_main, glcdf=None,
+                       filename='climate_historical', input_filesuffix=''):
+    """ Recursive function to merge all tributary glaciers.
+
+    This function should start with the largest glacier and then be called
+    upon all smaller glaciers.
+
+    Parameters
+    ----------
+    gdirs : list of :py:class:`oggm.GlacierDirectory`
+        all glaciers, main and tributary. Preprocessed and initialised
+    gdir_main: :py:class:`oggm.GlacierDirectory`
+        the current main glacier where the others are merge to
     glcdf: geopandas.GeoDataFrame
         which contains the main glaciers, will be downloaded if None
     filename: str
@@ -441,41 +651,37 @@ def merge_glacier_tasks(gdirs, main_rgi_ids, glcdf=None,
 
     Returns
     -------
-    merged_gdirs: list of merged GlacierDirectories
-
+    merged_gdir: :py:class:`oggm.GlacierDirectory`
+        the mergeed current main glacier
+    gdirs : list of :py:class:`oggm.GlacierDirectory`
+        updated list of glaciers, removed the already merged ones
     """
-    # make sure rgi_ids are iteratable
-    main_rgi_ids = utils.tolist(main_rgi_ids)
+    # find glaciers which intersect with the main
+    tributaries = centerlines.intersect_downstream_lines(gdir_main,
+                                                         candidates=gdirs)
+    if len(tributaries) == 0:
+        # if no tributaries: nothing to do
+        return gdir_main, gdirs
 
-    # split main glaciers from candidates
-    gdirs_main = [gd for gd in gdirs if gd.rgi_id in main_rgi_ids]
+    # seperate those glaciers which are not already found to be a tributary
+    gdirs = [gd for gd in gdirs if gd not in tributaries]
 
-    # find true tributary glaciers
-    tributaries = execute_entity_task(
-        centerlines.intersect_downstream_lines,
-        gdirs_main, candidates=gdirs)
+    gdirs_to_merge = []
 
-    # make one dictionary and a list of all gdirs for further preprocessing
-    tribs_dict = {}
-    gdirs_tribs = []
-    for trb in tributaries:
-        tribs_dict.update(trb)
-        for gd in trb.values():
-            gdirs_tribs += gd
+    for trib in tributaries:
+        # for each tributary: check if we can merge additional glaciers to it
+        merged, gdirs = _recursive_merging(gdirs, trib, glcdf=glcdf,
+                                           filename=filename,
+                                           input_filesuffix=input_filesuffix)
+        gdirs_to_merge.append(merged)
 
-    # check if all tributaries are only used once
-    rgiids = [gd.rgi_id for gd in gdirs_tribs]
-    if not len(np.unique(rgiids)) == len(rgiids):
-        raise RuntimeError('Every tributary glacier should only be used once!')
+    # create merged glacier directory
+    gdir_merged = utils.initialize_merged_gdir(
+        gdir_main, tribs=gdirs_to_merge, glcdf=glcdf, filename=filename,
+        input_filesuffix=input_filesuffix)
 
-    # create merged glacier directories
-    gdirs_merged = execute_entity_task(
-        utils.initialize_merged_gdir, gdirs_main, tribs=tribs_dict,
-        glcdf=glcdf, filename=filename, input_filesuffix=input_filesuffix)
+    flowline.merge_to_one_glacier(gdir_merged, gdirs_to_merge,
+                                  filename=filename,
+                                  input_filesuffix=input_filesuffix)
 
-    # Merge the Tributary glacier flowlines to the main glacier one
-    execute_entity_task(flowline.merge_tributary_flowlines,
-                        gdirs_merged, tribs=tribs_dict,
-                        filename=filename, input_filesuffix=input_filesuffix)
-
-    return gdirs_merged
+    return gdir_merged, gdirs

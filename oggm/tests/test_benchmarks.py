@@ -1,37 +1,27 @@
 # Python imports
 import unittest
-import geopandas as gpd
 import numpy as np
 import os
 import shutil
-import salem
 import xarray as xr
 import pytest
 import oggm
 from scipy import optimize as optimization
 
+salem = pytest.importorskip('salem')
+gpd = pytest.importorskip('geopandas')
+
 # Locals
 import oggm.cfg as cfg
 from oggm import tasks, utils, workflow
 from oggm.workflow import execute_entity_task
-from oggm.tests.funcs import get_test_dir, patch_url_retrieve_github
+from oggm.tests.funcs import get_test_dir
 from oggm.utils import get_demo_file
 from oggm.core import gis, centerlines
 from oggm.core.massbalance import ConstantMassBalance
 
 pytestmark = pytest.mark.test_env("benchmark")
 do_plot = False
-_url_retrieve = None
-
-
-def setup_module(module):
-    module._url_retrieve = utils.oggm_urlretrieve
-    oggm.utils._downloads.oggm_urlretrieve = patch_url_retrieve_github
-
-
-def teardown_module(module):
-    oggm.utils._downloads.oggm_urlretrieve = module._url_retrieve
-
 
 class TestSouthGlacier(unittest.TestCase):
 
@@ -55,11 +45,14 @@ class TestSouthGlacier(unittest.TestCase):
 
         # Init
         cfg.initialize()
+        cfg.PARAMS['use_multiprocessing'] = False
         cfg.PARAMS['use_intersects'] = False
         cfg.PATHS['working_dir'] = self.testdir
         cfg.PATHS['dem_file'] = get_demo_file('dem_SouthGlacier.tif')
-        cfg.PATHS['cru_dir'] = os.path.dirname(cfg.PATHS['dem_file'])
         cfg.PARAMS['border'] = 10
+
+        self.tf = get_demo_file('cru_ts4.01.1901.2016.SouthGlacier.tmp.dat.nc')
+        self.pf = get_demo_file('cru_ts4.01.1901.2016.SouthGlacier.pre.dat.nc')
 
     def tearDown(self):
         self.rm_dir()
@@ -95,10 +88,11 @@ class TestSouthGlacier(unittest.TestCase):
         rgidf = gpd.read_file(get_demo_file('SouthGlacier.shp'))
 
         # Go - initialize working directories
-        gdirs = workflow.init_glacier_regions(rgidf)
+        gdirs = workflow.init_glacier_directories(rgidf)
 
         # Preprocessing tasks
         task_list = [
+            tasks.define_glacier_region,
             tasks.glacier_masks,
             tasks.compute_centerlines,
             tasks.initialize_flowlines,
@@ -106,12 +100,15 @@ class TestSouthGlacier(unittest.TestCase):
             tasks.catchment_intersections,
             tasks.catchment_width_geom,
             tasks.catchment_width_correction,
-            tasks.process_cru_data,
-            tasks.local_t_star,
-            tasks.mu_star_calibration,
         ]
         for task in task_list:
             execute_entity_task(task, gdirs)
+
+        execute_entity_task(tasks.process_cru_data, gdirs,
+                            tmp_file=self.tf,
+                            pre_file=self.pf)
+        execute_entity_task(tasks.local_t_star, gdirs)
+        execute_entity_task(tasks.mu_star_calibration, gdirs)
 
         mbref = salem.GeoTiff(get_demo_file('mb_SouthGlacier.tif'))
         demref = salem.GeoTiff(get_demo_file('dem_SouthGlacier.tif'))
@@ -150,17 +147,18 @@ class TestSouthGlacier(unittest.TestCase):
             plt.legend()
             plt.show()
 
-    def test_inversion(self):
+    def test_inversion_attributes(self):
 
         # Download the RGI file for the run
         # Make a new dataframe of those
         rgidf = gpd.read_file(get_demo_file('SouthGlacier.shp'))
 
         # Go - initialize working directories
-        gdirs = workflow.init_glacier_regions(rgidf)
+        gdirs = workflow.init_glacier_directories(rgidf)
 
         # Preprocessing tasks
         task_list = [
+            tasks.define_glacier_region,
             tasks.glacier_masks,
             tasks.compute_centerlines,
             tasks.initialize_flowlines,
@@ -168,12 +166,97 @@ class TestSouthGlacier(unittest.TestCase):
             tasks.catchment_intersections,
             tasks.catchment_width_geom,
             tasks.catchment_width_correction,
-            tasks.process_cru_data,
-            tasks.local_t_star,
-            tasks.mu_star_calibration,
         ]
         for task in task_list:
             execute_entity_task(task, gdirs)
+
+        execute_entity_task(tasks.process_cru_data, gdirs,
+                            tmp_file=self.tf,
+                            pre_file=self.pf)
+        execute_entity_task(tasks.local_t_star, gdirs)
+        execute_entity_task(tasks.mu_star_calibration, gdirs)
+
+        # Tested tasks
+        task_list = [
+            tasks.gridded_attributes,
+            tasks.gridded_mb_attributes,
+        ]
+        for task in task_list:
+            execute_entity_task(task, gdirs)
+
+        # Check certain things
+        gdir = gdirs[0]
+        with xr.open_dataset(gdir.get_filepath('gridded_data')) as ds:
+
+            # The max catchment area should be area of glacier
+            assert (ds['catchment_area'].max() ==
+                    ds['glacier_mask'].sum() * gdir.grid.dx**2)
+            assert (ds['catchment_area_on_catch'].max() ==
+                    ds['glacier_mask'].sum() * gdir.grid.dx**2)
+
+            # In the lowest parts of the glaciers the data should be equivalent
+            ds_low = ds.isel(y=ds.y < 6741500)
+            np.testing.assert_allclose(ds_low['lin_mb_above_z'],
+                                       ds_low['lin_mb_above_z_on_catch'])
+            np.testing.assert_allclose(ds_low['oggm_mb_above_z'],
+                                       ds_low['oggm_mb_above_z_on_catch'])
+
+        # Build some loose tests based on correlation
+        df = self.get_ref_data(gdir)
+        vns = ['topo',
+               'slope',
+               'aspect',
+               'slope_factor',
+               'dis_from_border',
+               'catchment_area',
+               'catchment_area_on_catch',
+               'lin_mb_above_z',
+               'lin_mb_above_z_on_catch',
+               'oggm_mb_above_z',
+               'oggm_mb_above_z_on_catch',
+               ]
+
+        with xr.open_dataset(gdir.get_filepath('gridded_data')) as ds:
+            for vn in vns:
+                df[vn] = ds[vn].isel(x=('z', df['i']), y=('z', df['j']))
+
+        # Loose tests based on correlations
+        cf = df.corr()
+        assert cf.loc['slope', 'slope_factor'] < -0.9
+        assert cf.loc['slope', 'thick'] < -0.4
+        assert cf.loc['dis_from_border', 'thick'] > 0.2
+        assert cf.loc['oggm_mb_above_z', 'thick'] > 0.5
+        assert cf.loc['lin_mb_above_z', 'thick'] > 0.5
+        assert cf.loc['lin_mb_above_z', 'oggm_mb_above_z'] > 0.95
+
+    def test_inversion(self):
+
+        # Download the RGI file for the run
+        # Make a new dataframe of those
+        rgidf = gpd.read_file(get_demo_file('SouthGlacier.shp'))
+
+        # Go - initialize working directories
+        gdirs = workflow.init_glacier_directories(rgidf)
+
+        # Preprocessing tasks
+        task_list = [
+            tasks.define_glacier_region,
+            tasks.glacier_masks,
+            tasks.compute_centerlines,
+            tasks.initialize_flowlines,
+            tasks.catchment_area,
+            tasks.catchment_intersections,
+            tasks.catchment_width_geom,
+            tasks.catchment_width_correction,
+        ]
+        for task in task_list:
+            execute_entity_task(task, gdirs)
+
+        execute_entity_task(tasks.process_cru_data, gdirs,
+                            tmp_file=self.tf,
+                            pre_file=self.pf)
+        execute_entity_task(tasks.local_t_star, gdirs)
+        execute_entity_task(tasks.mu_star_calibration, gdirs)
 
         # Inversion tasks
         execute_entity_task(tasks.prepare_for_inversion, gdirs)
@@ -227,10 +310,11 @@ class TestSouthGlacier(unittest.TestCase):
         rgidf = gpd.read_file(get_demo_file('SouthGlacier.shp'))
 
         # Go - initialize working directories
-        gdirs = workflow.init_glacier_regions(rgidf)
+        gdirs = workflow.init_glacier_directories(rgidf)
 
         # Preprocessing tasks
         task_list = [
+            tasks.define_glacier_region,
             tasks.glacier_masks,
             tasks.compute_centerlines,
             tasks.initialize_flowlines,
@@ -238,12 +322,15 @@ class TestSouthGlacier(unittest.TestCase):
             tasks.catchment_intersections,
             tasks.catchment_width_geom,
             tasks.catchment_width_correction,
-            tasks.process_cru_data,
-            tasks.local_t_star,
-            tasks.mu_star_calibration,
         ]
         for task in task_list:
             execute_entity_task(task, gdirs)
+
+        execute_entity_task(tasks.process_cru_data, gdirs,
+                            tmp_file=self.tf,
+                            pre_file=self.pf)
+        execute_entity_task(tasks.local_t_star, gdirs)
+        execute_entity_task(tasks.mu_star_calibration, gdirs)
 
         # Reference data
         gdir = gdirs[0]
@@ -305,10 +392,11 @@ class TestSouthGlacier(unittest.TestCase):
         rgidf = gpd.read_file(get_demo_file('SouthGlacier.shp'))
 
         # Go - initialize working directories
-        gdirs = workflow.init_glacier_regions(rgidf)
+        gdirs = workflow.init_glacier_directories(rgidf)
 
         # Preprocessing tasks
         task_list = [
+            tasks.define_glacier_region,
             tasks.glacier_masks,
             tasks.compute_centerlines,
             tasks.initialize_flowlines,
@@ -316,12 +404,15 @@ class TestSouthGlacier(unittest.TestCase):
             tasks.catchment_intersections,
             tasks.catchment_width_geom,
             tasks.catchment_width_correction,
-            tasks.process_cru_data,
-            tasks.local_t_star,
-            tasks.mu_star_calibration,
         ]
         for task in task_list:
             execute_entity_task(task, gdirs)
+
+        execute_entity_task(tasks.process_cru_data, gdirs,
+                            tmp_file=self.tf,
+                            pre_file=self.pf)
+        execute_entity_task(tasks.local_t_star, gdirs)
+        execute_entity_task(tasks.mu_star_calibration, gdirs)
 
         # Inversion tasks
         execute_entity_task(tasks.prepare_for_inversion, gdirs)
@@ -373,7 +464,7 @@ class TestCoxeGlacier(unittest.TestCase):
         entity = gpd.read_file(self.rgi_file).iloc[0]
 
         gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
-        gis.define_glacier_region(gdir, entity=entity)
+        gis.define_glacier_region(gdir)
         gis.glacier_masks(gdir)
         centerlines.compute_centerlines(gdir)
         centerlines.initialize_flowlines(gdir)
@@ -424,3 +515,36 @@ class TestCoxeGlacier(unittest.TestCase):
         assert utils.rmsd(h1, h2) < 0.02  # less than 2% error
         new_area = np.sum(widths * fls[-1].dx * gdir.grid.dx)
         np.testing.assert_allclose(new_area, gdir.rgi_area_m2)
+
+    def test_run(self):
+
+        entity = gpd.read_file(self.rgi_file).iloc[0]
+
+        gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
+        gis.define_glacier_region(gdir)
+        gis.glacier_masks(gdir)
+        centerlines.compute_centerlines(gdir)
+        centerlines.initialize_flowlines(gdir)
+        centerlines.compute_downstream_line(gdir)
+        centerlines.compute_downstream_bedshape(gdir)
+        centerlines.catchment_area(gdir)
+        centerlines.catchment_intersections(gdir)
+        centerlines.catchment_width_geom(gdir)
+        centerlines.catchment_width_correction(gdir)
+
+        # Climate tasks -- only data IO and tstar interpolation!
+        tasks.process_dummy_cru_file(gdir, seed=0)
+        tasks.local_t_star(gdir)
+        tasks.mu_star_calibration(gdir)
+
+        # Inversion tasks
+        tasks.find_inversion_calving(gdir)
+
+        # Final preparation for the run
+        tasks.init_present_time_glacier(gdir)
+
+        # check that calving happens in the real context as well
+        tasks.run_constant_climate(gdir, bias=0, nyears=200,
+                                   temperature_bias=-0.5)
+        with xr.open_dataset(gdir.get_filepath('model_diagnostics')) as ds:
+            assert ds.calving_m3[-1] > 10
