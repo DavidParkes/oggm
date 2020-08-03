@@ -53,17 +53,17 @@ DOM_BORDER = 80
 
 
 class TestInitPresentDayFlowline:
+
     def test_init_present_time_glacier(self, hef_gdir):
+
         gdir = hef_gdir
         init_present_time_glacier(gdir)
 
         fls = gdir.read_pickle('model_flowlines')
-
-        ofl = gdir.read_pickle('inversion_flowlines')[-1]
+        inv = gdir.read_pickle('inversion_output')
 
         assert gdir.rgi_date == 2003
         assert len(fls) == 3
-
         vol = 0.
         area = 0.
         for fl in fls:
@@ -82,22 +82,25 @@ class TestInitPresentDayFlowline:
                    )
 
             assert np.all(fl.widths >= 0)
-            vol += fl.volume_km3
+            vol += fl.volume_m3
             area += fl.area_km2
 
-            if refo == 1:
-                rmsd = utils.rmsd(ofl.widths[:-5] * gdir.grid.dx,
-                                  fl.widths_m[0:len(ofl.widths)-5])
-                assert rmsd < 5.
+        ref_vol = 0.
+        ref_area = 0.
+        for cl in inv:
+            ref_vol += np.sum(cl['volume'])
+            ref_area += np.sum(cl['width'] * fl.dx_meter)
 
-        rtol = 0.02
-        np.testing.assert_allclose(0.573, vol, rtol=rtol)
+        np.testing.assert_allclose(ref_vol, vol)
         np.testing.assert_allclose(6900.0, fls[-1].length_m, atol=101)
-        np.testing.assert_allclose(gdir.rgi_area_km2, area, rtol=rtol)
+        np.testing.assert_allclose(gdir.rgi_area_km2, ref_area * 1e-6)
+        np.testing.assert_allclose(gdir.rgi_area_km2, area)
 
         if do_plot:
-            plt.plot(fls[-1].bed_h)
+            plt.plot(fls[-1].bed_h, color='k')
             plt.plot(fls[-1].surface_h)
+            plt.figure()
+            plt.plot(fls[-1].surface_h - fls[-1].bed_h)
             plt.show()
 
     def test_present_time_glacier_massbalance(self, hef_gdir):
@@ -182,7 +185,7 @@ class TestInitFlowlineOtherGlacier:
         climate.local_t_star(gdir, tstar=1930, bias=0)
         climate.mu_star_calibration(gdir)
         inversion.prepare_for_inversion(gdir)
-        v, ainv = inversion.mass_conservation_inversion(gdir)
+        v = inversion.mass_conservation_inversion(gdir)
         init_present_time_glacier(gdir)
 
         myarea = 0.
@@ -190,7 +193,6 @@ class TestInitFlowlineOtherGlacier:
         for cl in cls:
             myarea += np.sum(cl.widths * cl.dx * gdir.grid.dx**2)
 
-        np.testing.assert_allclose(ainv, gdir.rgi_area_m2, rtol=1e-2)
         np.testing.assert_allclose(myarea, gdir.rgi_area_m2, rtol=1e-2)
 
         myarea = 0.
@@ -1538,7 +1540,6 @@ class TestIO():
                                          setup='inversion')
         inversion.prepare_for_inversion(new_gdir, invert_all_rectangular=True)
         inversion.mass_conservation_inversion(new_gdir)
-        inversion.filter_inversion_output(new_gdir)
         init_present_time_glacier(new_gdir)
         run_constant_climate(new_gdir, nyears=10, bias=0)
         shutil.rmtree(new_dir)
@@ -1665,8 +1666,8 @@ class TestIdealisedInversion():
         inversion_gdir.write_pickle(copy.deepcopy(fls), 'inversion_flowlines')
 
         climate.apparent_mb_from_linear_mb(inversion_gdir)
-        inversion.prepare_for_inversion(inversion_gdir, add_debug_var=True)
-        v, _ = inversion.mass_conservation_inversion(inversion_gdir)
+        inversion.prepare_for_inversion(inversion_gdir)
+        v = inversion.mass_conservation_inversion(inversion_gdir)
 
         assert_allclose(v, model.volume_m3, rtol=0.01)
 
@@ -1680,16 +1681,24 @@ class TestIdealisedInversion():
         slope = - np.gradient(fl.surface_h[pg], fl.dx_meter)
 
         est_h = inversion.sia_thickness(slope, fl.widths_m[pg], flux)
+        est_ho = inversion.sia_thickness_via_optim(slope, fl.widths_m[pg],
+                                                   flux)
         mod_h = fl.thick[pg]
 
         # Test in the middle where slope is not too important
         assert_allclose(est_h[25:75], mod_h[25:75], rtol=0.01)
+        assert_allclose(est_ho[25:75], mod_h[25:75], rtol=0.01)
+        assert_allclose(est_h, est_ho, rtol=0.01)
 
         # OGGM internal flux
         est_h_ofl = inversion.sia_thickness(slope, fl.widths_m[pg], inv_flux)
+        est_ho = inversion.sia_thickness_via_optim(slope, fl.widths_m[pg],
+                                                   inv_flux)
 
         # Test in the middle where slope is not too important
-        assert_allclose(est_h[25:75], mod_h[25:75], rtol=0.01)
+        assert_allclose(est_h_ofl[25:75], mod_h[25:75], rtol=0.02)
+        assert_allclose(est_ho[25:75], mod_h[25:75], rtol=0.02)
+        assert_allclose(est_h_ofl, est_ho, rtol=0.01)
 
         # OK so what's happening here is following: the flux computed in
         # OGGM intern is less good than the real one with the real MB,
@@ -1709,6 +1718,45 @@ class TestIdealisedInversion():
 
         if do_plot:  # pragma: no cover
             self.simple_plot(model, inversion_gdir)
+
+    def test_inversion_trapeze(self, inversion_gdir):
+
+        fls = dummy_trapezoidal_bed(map_dx=inversion_gdir.grid.dx,
+                                    def_lambdas=cfg.PARAMS['trapezoid_lambdas'])
+        mb = LinearMassBalance(2600.)
+
+        model = FluxBasedModel(fls, mb_model=mb, y0=0.)
+        model.run_until_equilibrium()
+
+        fls = []
+        for fl in model.fls:
+            pg = np.where(fl.thick > 0)
+            line = shpg.LineString([fl.line.coords[int(p)] for p in pg[0]])
+            flo = centerlines.Centerline(line, dx=fl.dx,
+                                         surface_h=fl.surface_h[pg])
+            flo.widths = fl.widths[pg]
+            flo.is_rectangular = np.ones(flo.nx).astype(np.bool)
+            fls.append(flo)
+        inversion_gdir.write_pickle(copy.deepcopy(fls), 'inversion_flowlines')
+
+        climate.apparent_mb_from_linear_mb(inversion_gdir)
+
+        # Equations
+        mb_on_z = mb.get_annual_mb(fl.surface_h[pg])
+        flux = np.cumsum(fl.widths_m[pg] * fl.dx_meter * mb_on_z)
+
+        slope = - np.gradient(fl.surface_h[pg], fl.dx_meter)
+        est_ho = inversion.sia_thickness_via_optim(slope, fl.widths_m[pg],
+                                                   flux, shape='trapezoid')
+        mod_h = fl.thick[pg]
+
+        # Test in the middle where slope is not too important
+        assert_allclose(est_ho[25:75], mod_h[25:75], rtol=0.01)
+
+        if do_plot:  # pragma: no cover
+            plt.plot(mod_h)
+            plt.plot(est_ho)
+            plt.show()
 
     def test_inversion_parabolic(self, inversion_gdir):
 
@@ -1730,8 +1778,8 @@ class TestIdealisedInversion():
         inversion_gdir.write_pickle(copy.deepcopy(fls), 'inversion_flowlines')
 
         climate.apparent_mb_from_linear_mb(inversion_gdir)
-        inversion.prepare_for_inversion(inversion_gdir, add_debug_var=True)
-        v, _ = inversion.mass_conservation_inversion(inversion_gdir)
+        inversion.prepare_for_inversion(inversion_gdir)
+        v = inversion.mass_conservation_inversion(inversion_gdir)
         assert_allclose(v, model.volume_m3, rtol=0.01)
 
         inv = inversion_gdir.read_pickle('inversion_output')[-1]
@@ -1751,10 +1799,14 @@ class TestIdealisedInversion():
 
         est_h = inversion.sia_thickness(slope, fl.widths_m[pg], flux,
                                         shape='parabolic')
+        est_ho = inversion.sia_thickness_via_optim(slope, fl.widths_m[pg],
+                                                   flux, shape='parabolic')
         mod_h = fl.thick[pg]
 
         # Test in the middle where slope is not too important
         assert_allclose(est_h[25:75], mod_h[25:75], rtol=0.01)
+        assert_allclose(est_ho[25:75], mod_h[25:75], rtol=0.01)
+        assert_allclose(est_h, est_ho, rtol=0.01)
 
         # OGGM internal flux
         est_h_ofl = inversion.sia_thickness(slope, fl.widths_m[pg], inv_flux)
@@ -1808,7 +1860,7 @@ class TestIdealisedInversion():
 
         climate.apparent_mb_from_linear_mb(inversion_gdir)
         inversion.prepare_for_inversion(inversion_gdir)
-        v, _ = inversion.mass_conservation_inversion(inversion_gdir)
+        v = inversion.mass_conservation_inversion(inversion_gdir)
         assert_allclose(v, model.volume_m3, rtol=0.02)
 
         inv = inversion_gdir.read_pickle('inversion_output')[-1]
@@ -1868,7 +1920,7 @@ class TestIdealisedInversion():
 
         climate.apparent_mb_from_linear_mb(inversion_gdir)
         inversion.prepare_for_inversion(inversion_gdir)
-        v, _ = inversion.mass_conservation_inversion(inversion_gdir)
+        v = inversion.mass_conservation_inversion(inversion_gdir)
         assert_allclose(v, model.volume_m3, rtol=0.03)
 
         inv = inversion_gdir.read_pickle('inversion_output')[-1]
@@ -1925,7 +1977,7 @@ class TestIdealisedInversion():
 
         climate.apparent_mb_from_linear_mb(inversion_gdir)
         inversion.prepare_for_inversion(inversion_gdir)
-        v, _ = inversion.mass_conservation_inversion(inversion_gdir)
+        v = inversion.mass_conservation_inversion(inversion_gdir)
 
         assert_allclose(v, model.volume_m3, rtol=0.05)
         if do_plot:  # pragma: no cover
@@ -1954,7 +2006,7 @@ class TestIdealisedInversion():
 
         climate.apparent_mb_from_linear_mb(inversion_gdir)
         inversion.prepare_for_inversion(inversion_gdir)
-        v, _ = inversion.mass_conservation_inversion(inversion_gdir)
+        v = inversion.mass_conservation_inversion(inversion_gdir)
 
         assert_allclose(v, model.volume_m3, rtol=0.05)
         if do_plot:  # pragma: no cover
@@ -1989,7 +2041,7 @@ class TestIdealisedInversion():
 
         climate.apparent_mb_from_linear_mb(inversion_gdir)
         inversion.prepare_for_inversion(inversion_gdir)
-        v, _ = inversion.mass_conservation_inversion(inversion_gdir)
+        v = inversion.mass_conservation_inversion(inversion_gdir)
 
         assert_allclose(v, model.volume_m3, rtol=0.05)
         if do_plot:  # pragma: no cover
@@ -2027,7 +2079,7 @@ class TestIdealisedInversion():
 
         climate.apparent_mb_from_linear_mb(inversion_gdir)
         inversion.prepare_for_inversion(inversion_gdir)
-        v, _ = inversion.mass_conservation_inversion(inversion_gdir)
+        v = inversion.mass_conservation_inversion(inversion_gdir)
 
         assert_allclose(v, model.volume_m3, rtol=0.05)
         if do_plot:  # pragma: no cover
@@ -2057,7 +2109,7 @@ class TestIdealisedInversion():
 
         climate.apparent_mb_from_linear_mb(inversion_gdir)
         inversion.prepare_for_inversion(inversion_gdir)
-        v, _ = inversion.mass_conservation_inversion(inversion_gdir)
+        v = inversion.mass_conservation_inversion(inversion_gdir)
 
         assert_allclose(v, model.volume_m3, rtol=0.05)
         if do_plot:  # pragma: no cover
@@ -2090,7 +2142,7 @@ class TestIdealisedInversion():
 
         climate.apparent_mb_from_linear_mb(inversion_gdir)
         inversion.prepare_for_inversion(inversion_gdir)
-        v, _ = inversion.mass_conservation_inversion(inversion_gdir)
+        v = inversion.mass_conservation_inversion(inversion_gdir)
 
         assert_allclose(v, model.volume_m3, rtol=0.05)
         if do_plot:  # pragma: no cover
@@ -2127,7 +2179,7 @@ class TestIdealisedInversion():
 
         climate.apparent_mb_from_linear_mb(inversion_gdir)
         inversion.prepare_for_inversion(inversion_gdir)
-        v, _ = inversion.mass_conservation_inversion(inversion_gdir)
+        v = inversion.mass_conservation_inversion(inversion_gdir)
 
         assert_allclose(v, model.volume_m3, rtol=0.05)
         if do_plot:  # pragma: no cover
@@ -2161,7 +2213,7 @@ class TestIdealisedInversion():
 
         climate.apparent_mb_from_linear_mb(inversion_gdir)
         inversion.prepare_for_inversion(inversion_gdir)
-        v, _ = inversion.mass_conservation_inversion(inversion_gdir)
+        v = inversion.mass_conservation_inversion(inversion_gdir)
 
         assert_allclose(v, model.volume_m3, rtol=0.02)
         if do_plot:  # pragma: no cover
@@ -2200,7 +2252,7 @@ class TestIdealisedInversion():
 
         climate.apparent_mb_from_linear_mb(inversion_gdir)
         inversion.prepare_for_inversion(inversion_gdir)
-        v, _ = inversion.mass_conservation_inversion(inversion_gdir)
+        v = inversion.mass_conservation_inversion(inversion_gdir)
 
         assert_allclose(v, model.volume_m3, rtol=0.02)
         if do_plot:  # pragma: no cover
@@ -2241,7 +2293,7 @@ class TestIdealisedInversion():
 
         climate.apparent_mb_from_linear_mb(inversion_gdir)
         inversion.prepare_for_inversion(inversion_gdir)
-        v, _ = inversion.mass_conservation_inversion(inversion_gdir)
+        v = inversion.mass_conservation_inversion(inversion_gdir)
 
         assert_allclose(v, model.volume_m3, rtol=0.02)
         if do_plot:  # pragma: no cover
@@ -2276,7 +2328,7 @@ class TestIdealisedInversion():
 
         climate.apparent_mb_from_linear_mb(inversion_gdir)
         inversion.prepare_for_inversion(inversion_gdir)
-        v, _ = inversion.mass_conservation_inversion(inversion_gdir)
+        v = inversion.mass_conservation_inversion(inversion_gdir)
 
         # expected errors
         assert v > model.volume_m3
@@ -2307,18 +2359,17 @@ class TestIdealisedInversion():
 
         climate.apparent_mb_from_linear_mb(inversion_gdir)
         inversion.prepare_for_inversion(inversion_gdir)
-        v, _ = inversion.mass_conservation_inversion(inversion_gdir)
+        v = inversion.mass_conservation_inversion(inversion_gdir)
 
         assert_allclose(v, model.volume_m3, rtol=0.01)
 
         inv = inversion_gdir.read_pickle('inversion_output')[-1]
-        bed_shape_gl = 4 * inv['thick'] / \
-            (flo.widths * inversion_gdir.grid.dx) ** 2
+        bed_shape_gl = 4*inv['thick']/(flo.widths*inversion_gdir.grid.dx)**2
 
         ithick = inv['thick']
         fls = dummy_parabolic_bed(map_dx=inversion_gdir.grid.dx,
                                   from_other_shape=bed_shape_gl[:-2],
-                                  from_other_bed=sh-ithick)
+                                  from_other_bed=(sh-ithick)[:-2])
         model2 = FluxBasedModel(fls, mb_model=mb, y0=0.)
         model2.run_until_equilibrium()
         assert_allclose(model2.volume_m3, model.volume_m3, rtol=0.01)
@@ -2367,6 +2418,7 @@ def inversion_params(hef_gdir):
 
 @pytest.mark.usefixtures('with_class_wd')
 class TestHEF:
+
     @pytest.mark.slow
     def test_equilibrium(self, hef_gdir, inversion_params):
 
@@ -2384,17 +2436,17 @@ class TestHEF:
         ref_area = model.area_km2
         ref_len = model.fls[-1].length_m
 
-        np.testing.assert_allclose(ref_area, hef_gdir.rgi_area_km2, rtol=0.03)
+        np.testing.assert_allclose(ref_area, hef_gdir.rgi_area_km2)
 
         model.run_until_equilibrium(rate=1e-4)
-        assert model.yr > 50
+        assert model.yr >= 50
         after_vol = model.volume_km3
         after_area = model.area_km2
         after_len = model.fls[-1].length_m
 
-        np.testing.assert_allclose(ref_vol, after_vol, rtol=0.1)
-        np.testing.assert_allclose(ref_area, after_area, rtol=0.03)
-        np.testing.assert_allclose(ref_len, after_len, atol=500.01)
+        np.testing.assert_allclose(ref_vol, after_vol, rtol=0.02)
+        np.testing.assert_allclose(ref_area, after_area, rtol=0.01)
+        np.testing.assert_allclose(ref_len, after_len, atol=100.01)
 
     @pytest.mark.slow
     def test_equilibrium_glacier_wide(self, hef_gdir, inversion_params):
@@ -2415,18 +2467,18 @@ class TestHEF:
         ref_area = model.area_km2
         ref_len = model.fls[-1].length_m
 
-        np.testing.assert_allclose(ref_area, hef_gdir.rgi_area_km2, rtol=0.03)
+        np.testing.assert_allclose(ref_area, hef_gdir.rgi_area_km2)
 
         model.run_until_equilibrium(rate=1e-4)
 
-        assert model.yr > 50
+        assert model.yr >= 50
         after_vol = model.volume_km3
         after_area = model.area_km2
         after_len = model.fls[-1].length_m
 
-        np.testing.assert_allclose(ref_vol, after_vol, rtol=0.1)
-        np.testing.assert_allclose(ref_area, after_area, rtol=0.03)
-        np.testing.assert_allclose(ref_len, after_len, atol=500.01)
+        np.testing.assert_allclose(ref_vol, after_vol, rtol=0.02)
+        np.testing.assert_allclose(ref_area, after_area, rtol=0.01)
+        np.testing.assert_allclose(ref_len, after_len, atol=100.01)
 
     @pytest.mark.slow
     def test_flux_gate_on_hef(self, hef_gdir, inversion_params):
@@ -2462,17 +2514,14 @@ class TestHEF:
                                glen_a=inversion_params['glen_a'])
 
         ref_area = model.area_km2
-        np.testing.assert_allclose(ref_area, hef_gdir.rgi_area_km2, rtol=0.02)
+        np.testing.assert_allclose(ref_area, hef_gdir.rgi_area_km2)
 
         model.run_until_equilibrium()
         assert model.yr > 100
 
         after_vol_1 = model.volume_km3
 
-        _tmp = cfg.PARAMS['mixed_min_shape']
-        cfg.PARAMS['mixed_min_shape'] = 0.001
         init_present_time_glacier(hef_gdir)
-        cfg.PARAMS['mixed_min_shape'] = _tmp
 
         glacier = hef_gdir.read_pickle('model_flowlines')
 
@@ -2483,7 +2532,7 @@ class TestHEF:
 
         ref_vol = model.volume_km3
         ref_area = model.area_km2
-        np.testing.assert_allclose(ref_area, hef_gdir.rgi_area_km2, rtol=0.02)
+        np.testing.assert_allclose(ref_area, hef_gdir.rgi_area_km2)
 
         model.run_until_equilibrium()
         assert model.yr > 100
@@ -2525,7 +2574,7 @@ class TestHEF:
                 len = model.length_m_ts()
                 area = model.area_km2_ts()
                 np.testing.assert_allclose(vol.iloc[0], np.mean(vol),
-                                           rtol=0.1)
+                                           rtol=0.12)
                 np.testing.assert_allclose(area.iloc[0], np.mean(area),
                                            rtol=0.1)
                 if do_plot:
@@ -2934,7 +2983,7 @@ class TestMergedHEF():
         # areas should be quite similar after 10yrs
         assert_allclose(ds_entity.area.isel(time=10).sum(),
                         ds_merged.area.isel(time=10),
-                        rtol=1e-4)
+                        rtol=1e-3)
 
         # After 100yrs, merged one should be smaller as Vernagt1 is slightly
         # flowing into Vernagt2

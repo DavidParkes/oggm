@@ -181,6 +181,21 @@ class TestGIS(unittest.TestCase):
         assert gdirs[0].rgi_id == 'RGI50-11.00897_d01'
         assert gdirs[-1].rgi_id == 'RGI50-11.00897_d03'
 
+    def test_raise_on_duplicate(self):
+
+        hef_rgi = gpd.read_file(get_demo_file('divides_alps.shp'))
+        hef_rgi = hef_rgi.loc[hef_rgi.RGIId == 'RGI50-11.00897']
+
+        # Rename the RGI ID
+        rids = ['RGI60-11.00897', 'RGI60-11.00897_d01', 'RGI60-11.00897']
+        hef_rgi['RGIId'] = rids
+
+        # Just check that things are raised
+        with pytest.raises(InvalidWorkflowError):
+            workflow.init_glacier_directories(hef_rgi)
+        with pytest.raises(InvalidWorkflowError):
+            workflow.init_glacier_directories(rids)
+
     def test_dx_methods(self):
         hef_file = get_demo_file('Hintereisferner_RGI5.shp')
         entity = gpd.read_file(hef_file).iloc[0]
@@ -864,7 +879,7 @@ class TestElevationBandFlowlines(unittest.TestCase):
         climate.local_t_star(gdir, tstar=t_star, bias=bias)
         climate.mu_star_calibration(gdir)
         inversion.prepare_for_inversion(gdir)
-        v1, _ = inversion.mass_conservation_inversion(gdir)
+        v1 = inversion.mass_conservation_inversion(gdir)
         inversion.distribute_thickness_per_altitude(gdir)
         with xr.open_dataset(gdir.get_filepath('gridded_data')) as ds:
             ds1 = ds.load()
@@ -885,13 +900,13 @@ class TestElevationBandFlowlines(unittest.TestCase):
         climate.local_t_star(gdir, tstar=t_star, bias=bias)
         climate.mu_star_calibration(gdir)
         inversion.prepare_for_inversion(gdir)
-        v2, _ = inversion.mass_conservation_inversion(gdir)
+        v2 = inversion.mass_conservation_inversion(gdir)
         inversion.distribute_thickness_per_altitude(gdir)
         with xr.open_dataset(gdir.get_filepath('gridded_data')) as ds:
             ds2 = ds.load()
 
-        # Total volume is different at only 5%
-        np.testing.assert_allclose(v1, v2, rtol=0.06)
+        # Total volume is different at only 10%
+        np.testing.assert_allclose(v1, v2, rtol=0.1)
 
         # And the distributed diff is not too large either
         rms = utils.rmsd(ds1.distributed_thickness, ds2.distributed_thickness)
@@ -916,9 +931,13 @@ class TestElevationBandFlowlines(unittest.TestCase):
         climate.local_t_star(gdir, tstar=t_star, bias=bias)
         climate.mu_star_calibration(gdir)
         inversion.prepare_for_inversion(gdir)
-        v1, _ = inversion.mass_conservation_inversion(gdir)
+        inversion.mass_conservation_inversion(gdir)
+        inversion.filter_inversion_output(gdir)
         flowline.init_present_time_glacier(gdir)
-        flowline.run_random_climate(gdir, nyears=50, y0=1985)
+        model = flowline.run_random_climate(gdir, nyears=50, y0=1985)
+
+        fl = model.fls[-1]
+        assert np.all(fl.is_trapezoid[:30])
 
         with xr.open_dataset(gdir.get_filepath('model_diagnostics')) as ds:
             # it's running and it is retreating
@@ -2160,7 +2179,7 @@ class TestInversion(unittest.TestCase):
         # meanH = 67+-7
         # Volume = 0.573+-0.063
         # maxH = 242+-13
-        inversion.prepare_for_inversion(gdir, add_debug_var=True)
+        inversion.prepare_for_inversion(gdir)
         # Check how many clips:
         cls = gdir.read_pickle('inversion_input')
         nabove = 0
@@ -2175,8 +2194,6 @@ class TestInversion(unittest.TestCase):
             _max = np.max(slope)
             if _max > maxs:
                 maxs = _max
-            if cl['is_last']:
-                self.assertEqual(cl['flux'][-1], 0.)
 
         self.assertTrue(nabove == 0)
         self.assertTrue(np.rad2deg(maxs) < 40.)
@@ -2187,8 +2204,8 @@ class TestInversion(unittest.TestCase):
         fs = 5.7e-20
 
         def to_optimize(x):
-            v, _ = inversion.mass_conservation_inversion(gdir, fs=fs * x[1],
-                                                         glen_a=glen_a * x[0])
+            v = inversion.mass_conservation_inversion(gdir, fs=fs * x[1],
+                                                      glen_a=glen_a * x[0])
             return (v - ref_v)**2
 
         import scipy.optimize as optimization
@@ -2201,9 +2218,9 @@ class TestInversion(unittest.TestCase):
         self.assertTrue(out[1] < 1.1)
         glen_a = glen_a * out[0]
         fs = fs * out[1]
-        v, _ = inversion.mass_conservation_inversion(gdir, fs=fs,
-                                                     glen_a=glen_a,
-                                                     write=True)
+        v = inversion.mass_conservation_inversion(gdir, fs=fs,
+                                                  glen_a=glen_a,
+                                                  write=True)
         np.testing.assert_allclose(ref_v, v)
 
         cls = gdir.read_pickle('inversion_output')
@@ -2214,14 +2231,9 @@ class TestInversion(unittest.TestCase):
             _max = np.max(thick)
             if _max > maxs:
                 maxs = _max
-            if fl.flows_to is None:
-                self.assertEqual(cl['volume'][-1], 0)
-                self.assertEqual(cl['thick'][-1], 0)
 
         np.testing.assert_allclose(242, maxs, atol=40)
 
-        # Filter
-        inversion.filter_inversion_output(gdir)
         maxs = 0.
         v = 0.
         cls = gdir.read_pickle('inversion_output')
@@ -2231,7 +2243,7 @@ class TestInversion(unittest.TestCase):
             if _max > maxs:
                 maxs = _max
             v += np.nansum(cl['volume'])
-        np.testing.assert_allclose(242, maxs, atol=10)
+        np.testing.assert_allclose(242, maxs, atol=25)
         np.testing.assert_allclose(ref_v, v)
 
         # Sanity check - velocities
@@ -2247,7 +2259,7 @@ class TestInversion(unittest.TestCase):
         velocity *= cfg.SEC_IN_YEAR
 
         # Some reference value I just computed - see if other computers agree
-        np.testing.assert_allclose(np.mean(velocity), 37, atol=5)
+        np.testing.assert_allclose(np.mean(velocity[:-1]), 37, atol=5)
 
         inversion.compute_velocities(gdir, fs=fs, glen_a=glen_a)
 
@@ -2259,7 +2271,102 @@ class TestInversion(unittest.TestCase):
         # to the no sliding assumption
         np.testing.assert_allclose(inv['u_surface'][20:60],
                                    inv['u_integrated'][20:60] / 0.8,
-                                   rtol=0.16)
+                                   rtol=0.17)
+
+    def test_invert_hef_from_consensus(self):
+
+        hef_file = get_demo_file('Hintereisferner_RGI5.shp')
+        entity = gpd.read_file(hef_file).iloc[0]
+        entity['RGIId'] = 'RGI60-11.00897'
+        gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
+        gis.define_glacier_region(gdir)
+        gis.glacier_masks(gdir)
+        centerlines.compute_centerlines(gdir)
+        centerlines.initialize_flowlines(gdir)
+        centerlines.catchment_area(gdir)
+        centerlines.catchment_width_geom(gdir)
+        centerlines.catchment_width_correction(gdir)
+        centerlines.compute_downstream_line(gdir)
+        centerlines.compute_downstream_bedshape(gdir)
+        climate.process_custom_climate_data(gdir)
+        mbdf = gdir.get_ref_mb_data()
+        res = climate.t_star_from_refmb(gdir, mbdf=mbdf['ANNUAL_BALANCE'])
+        t_star, bias = res['t_star'], res['bias']
+        climate.local_t_star(gdir, tstar=t_star, bias=bias)
+        climate.mu_star_calibration(gdir)
+        inversion.prepare_for_inversion(gdir)
+        df = workflow.calibrate_inversion_from_consensus_estimate(gdir)
+        np.testing.assert_allclose(df.vol_itmix_m3, df.vol_oggm_m3, rtol=0.01)
+
+    def test_invert_hef_shapes(self):
+
+        hef_file = get_demo_file('Hintereisferner_RGI5.shp')
+        entity = gpd.read_file(hef_file).iloc[0]
+        entity['RGIId'] = 'RGI60-11.00897'
+        gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
+        gis.define_glacier_region(gdir)
+        gis.glacier_masks(gdir)
+        centerlines.compute_centerlines(gdir)
+        centerlines.initialize_flowlines(gdir)
+        centerlines.catchment_area(gdir)
+        centerlines.catchment_width_geom(gdir)
+        centerlines.catchment_width_correction(gdir)
+        climate.process_custom_climate_data(gdir)
+        mbdf = gdir.get_ref_mb_data()
+        res = climate.t_star_from_refmb(gdir, mbdf=mbdf['ANNUAL_BALANCE'])
+        t_star, bias = res['t_star'], res['bias']
+        climate.local_t_star(gdir, tstar=t_star, bias=bias)
+        climate.mu_star_calibration(gdir)
+
+        cfg.PARAMS['inversion_fs'] = 5.7e-20
+        cfg.PARAMS['inversion_glen_a'] = 2.4e-24
+
+        inversion.prepare_for_inversion(gdir,
+                                        invert_with_rectangular=False,
+                                        invert_with_trapezoid=False)
+        vp = inversion.mass_conservation_inversion(gdir)
+
+        inversion.prepare_for_inversion(gdir, invert_all_trapezoid=True)
+        vt1 = inversion.mass_conservation_inversion(gdir)
+
+        cfg.PARAMS['trapezoid_lambdas'] = 0.2
+        inversion.prepare_for_inversion(gdir, invert_all_trapezoid=True)
+        vt2 = inversion.mass_conservation_inversion(gdir)
+
+        inversion.prepare_for_inversion(gdir, invert_all_rectangular=True)
+        vr = inversion.mass_conservation_inversion(gdir)
+
+        np.testing.assert_allclose(vp/vr, 0.75, atol=0.02)
+        np.testing.assert_allclose(vt1/vr, 0.93, atol=0.02)
+        np.testing.assert_allclose(vt2/vr, 0.98, atol=0.01)
+
+    def test_invert_hef_water_level(self):
+
+        hef_file = get_demo_file('Hintereisferner_RGI5.shp')
+        entity = gpd.read_file(hef_file).iloc[0]
+        entity['RGIId'] = 'RGI60-11.00897'
+        gdir = oggm.GlacierDirectory(entity, base_dir=self.testdir)
+        gis.define_glacier_region(gdir)
+        gis.glacier_masks(gdir)
+        centerlines.compute_centerlines(gdir)
+        centerlines.initialize_flowlines(gdir)
+        centerlines.catchment_area(gdir)
+        centerlines.catchment_width_geom(gdir)
+        centerlines.catchment_width_correction(gdir)
+        climate.process_custom_climate_data(gdir)
+        mbdf = gdir.get_ref_mb_data()
+        res = climate.t_star_from_refmb(gdir, mbdf=mbdf['ANNUAL_BALANCE'])
+        t_star, bias = res['t_star'], res['bias']
+        climate.local_t_star(gdir, tstar=t_star, bias=bias)
+        climate.mu_star_calibration(gdir)
+        inversion.prepare_for_inversion(gdir)
+        v = inversion.mass_conservation_inversion(gdir, water_level=10000)
+
+        cls = gdir.read_pickle('inversion_output')
+        v_bwl = np.nansum([np.nansum(fl.get('volume_bwl', 0)) for fl in cls])
+        n_trap = np.sum([np.sum(fl['is_trapezoid']) for fl in cls])
+        np.testing.assert_allclose(v, v_bwl)
+        assert n_trap > 10
 
     def test_invert_hef_from_linear_mb(self):
 
@@ -2281,7 +2388,7 @@ class TestInversion(unittest.TestCase):
         # meanH = 67+-7
         # Volume = 0.573+-0.063
         # maxH = 242+-13
-        inversion.prepare_for_inversion(gdir, add_debug_var=True)
+        inversion.prepare_for_inversion(gdir)
 
         # Check how many clips:
         cls = gdir.read_pickle('inversion_input')
@@ -2297,8 +2404,6 @@ class TestInversion(unittest.TestCase):
             _max = np.max(slope)
             if _max > maxs:
                 maxs = _max
-            if cl['is_last']:
-                self.assertEqual(cl['flux'][-1], 0.)
 
         self.assertTrue(nabove == 0)
         self.assertTrue(np.rad2deg(maxs) < 40.)
@@ -2309,7 +2414,7 @@ class TestInversion(unittest.TestCase):
         fs = 5.7e-20
 
         def to_optimize(x):
-            v, _ = inversion.mass_conservation_inversion(gdir, fs=fs * x[1],
+            v = inversion.mass_conservation_inversion(gdir, fs=fs * x[1],
                                                          glen_a=glen_a * x[0])
             return (v - ref_v)**2
 
@@ -2323,7 +2428,7 @@ class TestInversion(unittest.TestCase):
         self.assertTrue(out[1] < 1.1)
         glen_a = glen_a * out[0]
         fs = fs * out[1]
-        v, _ = inversion.mass_conservation_inversion(gdir, fs=fs,
+        v = inversion.mass_conservation_inversion(gdir, fs=fs,
                                                      glen_a=glen_a,
                                                      write=True)
         np.testing.assert_allclose(ref_v, v)
@@ -2336,14 +2441,7 @@ class TestInversion(unittest.TestCase):
             _max = np.max(thick)
             if _max > maxs:
                 maxs = _max
-            if fl.flows_to is None:
-                self.assertEqual(cl['volume'][-1], 0)
-                self.assertEqual(cl['thick'][-1], 0)
 
-        np.testing.assert_allclose(242, maxs, atol=10)
-
-        # Filter
-        inversion.filter_inversion_output(gdir)
         maxs = 0.
         v = 0.
         cls = gdir.read_pickle('inversion_output')
@@ -2353,7 +2451,7 @@ class TestInversion(unittest.TestCase):
             if _max > maxs:
                 maxs = _max
             v += np.nansum(cl['volume'])
-        np.testing.assert_allclose(242, maxs, atol=10)
+        np.testing.assert_allclose(242, maxs, atol=25)
         np.testing.assert_allclose(ref_v, v)
 
     def test_invert_hef_from_any_mb(self):
@@ -2372,15 +2470,15 @@ class TestInversion(unittest.TestCase):
 
         # Reference
         climate.apparent_mb_from_linear_mb(gdir)
-        inversion.prepare_for_inversion(gdir, add_debug_var=True)
+        inversion.prepare_for_inversion(gdir)
         cls1 = gdir.read_pickle('inversion_input')
-        v1, _ = inversion.mass_conservation_inversion(gdir)
+        v1 = inversion.mass_conservation_inversion(gdir)
         # New should be equivalent
         mb_model = massbalance.LinearMassBalance(ela_h=1800, grad=3)
         climate.apparent_mb_from_any_mb(gdir, mb_model=mb_model,
                                         mb_years=np.arange(30))
-        inversion.prepare_for_inversion(gdir, add_debug_var=True)
-        v2, _ = inversion.mass_conservation_inversion(gdir)
+        inversion.prepare_for_inversion(gdir)
+        v2 = inversion.mass_conservation_inversion(gdir)
         cls2 = gdir.read_pickle('inversion_input')
 
         # Now the tests
@@ -2420,7 +2518,7 @@ class TestInversion(unittest.TestCase):
         def to_optimize(x):
             glen_a = cfg.PARAMS['inversion_glen_a'] * x[0]
             fs = cfg.PARAMS['inversion_fs'] * x[1]
-            v, _ = inversion.mass_conservation_inversion(gdir, fs=fs,
+            v = inversion.mass_conservation_inversion(gdir, fs=fs,
                                                          glen_a=glen_a)
             return (v - ref_v)**2
         import scipy.optimize as optimization
@@ -2429,7 +2527,7 @@ class TestInversion(unittest.TestCase):
                                     tol=1e-1)['x']
         glen_a = cfg.PARAMS['inversion_glen_a'] * out[0]
         fs = cfg.PARAMS['inversion_fs'] * out[1]
-        v, _ = inversion.mass_conservation_inversion(gdir, fs=fs,
+        v = inversion.mass_conservation_inversion(gdir, fs=fs,
                                                      glen_a=glen_a,
                                                      write=True)
         np.testing.assert_allclose(ref_v, v)
@@ -2482,7 +2580,7 @@ class TestInversion(unittest.TestCase):
         def to_optimize(x):
             glen_a = cfg.PARAMS['inversion_glen_a'] * x[0]
             fs = 0.
-            v, _ = inversion.mass_conservation_inversion(gdir, fs=fs,
+            v = inversion.mass_conservation_inversion(gdir, fs=fs,
                                                          glen_a=glen_a)
             return (v - ref_v)**2
 
@@ -2496,7 +2594,7 @@ class TestInversion(unittest.TestCase):
 
         glen_a = cfg.PARAMS['inversion_glen_a'] * out[0]
         fs = 0.
-        v, _ = inversion.mass_conservation_inversion(gdir, fs=fs,
+        v = inversion.mass_conservation_inversion(gdir, fs=fs,
                                                      glen_a=glen_a,
                                                      write=True)
         np.testing.assert_allclose(ref_v, v)
@@ -2509,7 +2607,6 @@ class TestInversion(unittest.TestCase):
             _max = np.max(thick)
             if _max > maxs:
                 maxs = _max
-        np.testing.assert_allclose(242, maxs, atol=55)
 
         # check that its not tooo sensitive to the dx
         cfg.PARAMS['flowline_dx'] = 1.
@@ -2524,8 +2621,8 @@ class TestInversion(unittest.TestCase):
         t_star, bias = res['t_star'], res['bias']
         climate.local_t_star(gdir, tstar=t_star, bias=bias)
         climate.mu_star_calibration(gdir)
-        inversion.prepare_for_inversion(gdir, add_debug_var=True)
-        v, _ = inversion.mass_conservation_inversion(gdir, fs=fs,
+        inversion.prepare_for_inversion(gdir)
+        v = inversion.mass_conservation_inversion(gdir, fs=fs,
                                                      glen_a=glen_a,
                                                      write=True)
 
@@ -2538,7 +2635,6 @@ class TestInversion(unittest.TestCase):
             if _max > maxs:
                 maxs = _max
 
-        np.testing.assert_allclose(242, maxs, atol=41)
         cfg.PARAMS['filter_for_neg_flux'] = True
 
         inversion.compute_velocities(gdir, fs=0, glen_a=glen_a)
@@ -2861,12 +2957,15 @@ class TestGrindelInvert(unittest.TestCase):
             # add to output
             cl_dic = dict(dx=dx, flux=flux, flux_a0=flux_a0, width=widths,
                           hgt=hgt, slope_angle=angle, is_last=True,
-                          is_rectangular=np.zeros(len(flux), dtype=bool))
+                          is_rectangular=np.zeros(len(flux), dtype=bool),
+                          is_trapezoid=np.zeros(len(flux), dtype=bool),
+                          invert_with_trapezoid=False,
+                          )
             towrite.append(cl_dic)
 
         # Write out
         gdir.write_pickle(towrite, 'inversion_input')
-        v, a = inversion.mass_conservation_inversion(gdir, glen_a=glen_a)
+        v = inversion.mass_conservation_inversion(gdir, glen_a=glen_a)
         np.testing.assert_allclose(v, model.volume_m3, rtol=0.01)
 
         cl = gdir.read_pickle('inversion_output')[0]
@@ -2892,8 +2991,7 @@ class TestGrindelInvert(unittest.TestCase):
         climate.local_t_star(gdir, tstar=1975, bias=0.)
         climate.mu_star_calibration(gdir)
         inversion.prepare_for_inversion(gdir)
-        v, a = inversion.mass_conservation_inversion(gdir, glen_a=glen_a)
-        inversion.filter_inversion_output(gdir)
+        v = inversion.mass_conservation_inversion(gdir, glen_a=glen_a)
         flowline.init_present_time_glacier(gdir)
         mb_mod = massbalance.ConstantMassBalance(gdir)
         fls = gdir.read_pickle('model_flowlines')
@@ -3248,7 +3346,7 @@ class TestIdealizedGdir(unittest.TestCase):
         centerlines.catchment_width_correction(gdir)
         climate.apparent_mb_from_linear_mb(gdir)
         inversion.prepare_for_inversion(gdir, invert_all_rectangular=True)
-        v1, _ = inversion.mass_conservation_inversion(gdir)
+        v1 = inversion.mass_conservation_inversion(gdir)
         tt1 = gdir.read_pickle('inversion_input')[0]
         gdir1 = gdir
 
@@ -3261,7 +3359,7 @@ class TestIdealizedGdir(unittest.TestCase):
                                     base_dir=self.testdir)
         climate.apparent_mb_from_linear_mb(gdir)
         inversion.prepare_for_inversion(gdir, invert_all_rectangular=True)
-        v2, _ = inversion.mass_conservation_inversion(gdir)
+        v2 = inversion.mass_conservation_inversion(gdir)
 
         tt2 = gdir.read_pickle('inversion_input')[0]
         np.testing.assert_allclose(tt1['width'], tt2['width'])

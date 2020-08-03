@@ -40,6 +40,16 @@ Breaking changes
 - The order of the tasks applied to  the preprocessed levels has
   changed, climate data comes in later (:pull:`1038`).
   By `Fabien Maussion <https://github.com/fmaussion>`_
+- The inversion tasks now can invert for trapezoid shapes (:pull:`1045`). This
+  has non-trivial consequences for the model workflow. First and foremost,
+  the decision about using a trapezoid bed (instead of parabolic when the
+  parabola is too "flat") is taken *at the inversion step* and not afterwards.
+  The forward model and the inversion are therefore much more consistent.
+  Furthermore, the task `filter_inversion_output` was simplified to take the
+  estimated downstream bedshapes into account and now preserves glacier area,
+  not volume. This also is a step towards more physical consistency between
+  inverse and forward model.
+  By `Fabien Maussion <https://github.com/fmaussion>`_
 
 Enhancements
 ~~~~~~~~~~~~
@@ -57,6 +67,10 @@ Enhancements
   (:pull:`1040`). The corresponding tasks are
   :py:func:`tasks.elevation_band_flowline` and
   :py:func:`tasks.fixed_dx_elevation_band_flowline`.
+  By `Fabien Maussion <https://github.com/fmaussion>`_
+- Added a `calibrate_inversion_from_consensus_estimate` global task which
+  calibrates Glen A so that the volume of glaciers in a selection is
+  matched (:pull:`1043`).
   By `Fabien Maussion <https://github.com/fmaussion>`_
 
 

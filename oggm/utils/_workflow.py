@@ -2501,7 +2501,9 @@ class GlacierDirectory(object):
         if err is None:
             line += 'SUCCESS'
         else:
-            line += err.__class__.__name__ + ': {}'.format(err)
+            line += err.__class__.__name__ + ': {}'.format(err)\
+
+        line = line.replace('\n', ' ')
 
         count = 0
         while count < 5:
@@ -2539,7 +2541,7 @@ class GlacierDirectory(object):
             lines = logfile.readlines()
 
         lines = [l.replace('\n', '') for l in lines
-                 if task_name == l.split(';')[1]]
+                 if ';' in l and (task_name == l.split(';')[1])]
         if lines:
             # keep only the last log
             return lines[-1].split(';')[-1]
@@ -2747,8 +2749,8 @@ def initialize_merged_gdir(main, tribs=[], glcdf=None,
     shutil.copyfile(main.get_filepath('local_mustar'),
                     os.path.join(merged.dir, mufile))
     # I think I need the climate_info only for the main glacier
-    shutil.copyfile(main.get_filepath('climate_info'),
-                    merged.get_filepath('climate_info'))
+    climateinfo = main.read_json('climate_info')
+    merged.write_json(climateinfo, 'climate_info')
 
     # reproject the flowlines to the new grid
     for nr, fl in reversed(list(enumerate(mfls))):
